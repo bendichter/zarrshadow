@@ -73,6 +73,7 @@ def generate_rfs(
         with h5py.File(hdf5_url_or_path, "r") as opened:
             _process_group(opened, "", refs, hdf5_url_or_path, opened)
 
+    _add_dtype_attrs(refs)
     rfs = {"refs": refs, "version": 1}
     _apply_templates(rfs)
     return rfs
@@ -119,6 +120,11 @@ def _process_group(
 
     # Build group zarr.json
     attrs = _collect_attrs(item, h5f=h5f, label=path or "(root)")
+
+    # hdmf-zarr stores the root .specloc as a plain path, not a reference
+    specloc = attrs.get(".specloc")
+    if not path and isinstance(specloc, dict) and "_REFERENCE" in specloc:
+        attrs[".specloc"] = specloc["_REFERENCE"]["path"].lstrip("/")
 
     # Collect _LINKS for any child soft links (unified convention)
     links = _collect_child_links(item, h5f)
@@ -670,6 +676,28 @@ def _add_inline_ref(refs: dict, key: str, data: bytes) -> None:
             refs[key] = data.decode("ascii")
         except UnicodeDecodeError:
             refs[key] = "base64:" + base64.b64encode(data).decode("ascii")
+
+
+def _add_dtype_attrs(refs: dict) -> None:
+    """Set the _DTYPE attribute on every non-compound array, as hdmf-zarr does.
+
+    Values follow hdmf-zarr: the numpy type name for numeric arrays and "str"
+    for strings. Compound arrays carry their fields in the structured
+    data_type and get no _DTYPE. Arrays that already have one (object
+    references) are left alone.
+    """
+    for key, val in refs.items():
+        if not (key == "zarr.json" or key.endswith("/zarr.json")):
+            continue
+        meta = json.loads(val)
+        if meta.get("node_type") != "array":
+            continue
+        data_type = meta["data_type"]
+        attrs = meta.setdefault("attributes", {})
+        if not isinstance(data_type, str) or "_DTYPE" in attrs:
+            continue
+        attrs["_DTYPE"] = "str" if data_type == "string" else data_type
+        refs[key] = json.dumps(meta, separators=(",", ":"))
 
 
 def _apply_templates(rfs: dict) -> None:
