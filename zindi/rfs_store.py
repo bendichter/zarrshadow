@@ -8,6 +8,7 @@ It handles:
 - DANDI URL resolution (redirects + auth)
 - Retry with exponential backoff
 - Chunk padding for contiguous HDF5 datasets
+- Chunk indexes for arrays with many chunks (see chunk_index.py)
 
 Ported from lindi's LindiReferenceFileSystemStore, adapted for zarr v3.
 """
@@ -27,6 +28,7 @@ import requests
 from zarr.abc.store import ByteRequest, Store
 from zarr.core.buffer import Buffer, BufferPrototype, default_buffer_prototype
 
+from .chunk_index import ChunkIndex
 from .url_resolver import resolve_url
 
 
@@ -53,7 +55,8 @@ class RfsStore(Store):
         Parameters
         ----------
         rfs : dict
-            Reference file system dict with "refs" key, and optional "templates".
+            Reference file system dict with "refs" key, and optional
+            "templates" and "chunk_indexes".
         local_cache : LocalCache or None
             Optional local cache for persisting remote chunk data on disk.
         merge_gap : int
@@ -74,6 +77,12 @@ class RfsStore(Store):
         self._executor = ThreadPoolExecutor(max_workers=32)
         self._session = requests.Session()
         self._session.headers["User-Agent"] = "Mozilla/5.0"
+        self._indexes = {
+            path: ChunkIndex(entry["url"], entry["index"])
+            for path, entry in rfs.get("chunk_indexes", {}).items()
+        }
+        self._children: dict[str, set[str]] | None = None
+        self._array_meta: dict[str, dict | None] = {}
         self._is_open = True
 
     # -- Abstract method implementations --
@@ -122,18 +131,15 @@ class RfsStore(Store):
         # Group remote refs by resolved URL for merging
         url_groups: dict[str, list[tuple[int, int, int, str]]] = {}  # url -> [(item_idx, offset, length, key)]
 
-        for i, (key, byte_range) in enumerate(items):
-            if byte_range is not None or key not in self.rfs["refs"]:
+        # Resolving may read chunk index blocks, which blocks, so run it off the event loop
+        resolved = await loop.run_in_executor(
+            self._executor, lambda: [self._resolve(key) for key, _ in items]
+        )
+        for i, ((key, byte_range), ref) in enumerate(zip(items, resolved)):
+            if byte_range is not None or not (isinstance(ref, list) and len(ref) == 3):
                 non_remote_indices.append(i)
                 continue
-            ref = self.rfs["refs"][key]
-            if not (isinstance(ref, list) and len(ref) == 3):
-                non_remote_indices.append(i)
-                continue
-            url_or_path = ref[0]
-            if "{{" in url_or_path and "}}" in url_or_path and "templates" in self.rfs:
-                for tkey, tval in self.rfs["templates"].items():
-                    url_or_path = url_or_path.replace("{{" + tkey + "}}", tval)
+            url_or_path = self._expand_templates(ref[0])
             if not (url_or_path.startswith("http://") or url_or_path.startswith("https://")):
                 non_remote_indices.append(i)
                 continue
@@ -214,7 +220,7 @@ class RfsStore(Store):
             uncached_end = max(r[1] + r[2] for r in uncached)
 
             # Fetch the merged range
-            raw = _read_bytes_from_url(url, uncached_start, uncached_end - uncached_start, session=self._store._session)
+            raw = _read_bytes_from_url(url, uncached_start, uncached_end - uncached_start, session=self._session)
 
             # Split and deliver individual chunks
             for item_idx, offset, length, key in uncached:
@@ -240,7 +246,10 @@ class RfsStore(Store):
         return results
 
     async def exists(self, key: str) -> bool:
-        return key in self.rfs["refs"]
+        if key in self.rfs["refs"]:
+            return True
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._executor, self._resolve, key) is not None
 
     async def set(self, key: str, value: Buffer) -> None:
         raise NotImplementedError("RfsStore is read-only")
@@ -251,38 +260,88 @@ class RfsStore(Store):
     async def list(self) -> AsyncIterator[str]:
         for key in self.rfs["refs"]:
             yield key
+        for path, index in self._indexes.items():
+            for coords, _, _ in index.iter_chunks():
+                yield f"{path}/c/" + "/".join(map(str, coords))
 
     async def list_prefix(self, prefix: str) -> AsyncIterator[str]:
-        for key in self.rfs["refs"]:
+        async for key in self.list():
             if key.startswith(prefix):
                 yield key
 
     async def list_dir(self, prefix: str) -> AsyncIterator[str]:
-        if prefix and not prefix.endswith("/"):
-            prefix = prefix + "/"
-        prefix_len = len(prefix)
-        seen: set[str] = set()
-        for key in self.rfs["refs"]:
-            if not key.startswith(prefix):
-                continue
-            remainder = key[prefix_len:]
-            if "/" in remainder:
-                # It's inside a subdirectory; yield the directory name
-                subdir = remainder.split("/")[0]
-                if subdir not in seen:
-                    seen.add(subdir)
-                    yield subdir
-            else:
-                yield remainder
+        prefix = prefix.strip("/")
+        indexed = self._indexed_chunk_prefix(prefix)
+        if indexed is not None:
+            # Inside an indexed array's chunk directory: list chunk coordinates
+            path, parts = indexed
+            depth = len(parts)
+            seen: set[str] = set()
+            for coords, _, _ in self._indexes[path].iter_chunks():
+                if tuple(map(str, coords[:depth])) == parts and depth < len(coords):
+                    name = str(coords[depth])
+                    if name not in seen:
+                        seen.add(name)
+                        yield name
+            return
+        for name in sorted(self._get_children().get(prefix, ())):
+            yield name
+
+    def _get_children(self) -> dict[str, set[str]]:
+        """Map each directory prefix to its immediate children, built once."""
+        if self._children is None:
+            children: dict[str, set[str]] = {}
+            keys = list(self.rfs["refs"]) + [f"{path}/c" for path in self._indexes]
+            for key in keys:
+                parts = key.split("/")
+                for i in range(len(parts)):
+                    children.setdefault("/".join(parts[:i]), set()).add(parts[i])
+            self._children = children
+        return self._children
+
+    def _indexed_chunk_prefix(self, prefix: str) -> tuple[str, tuple[str, ...]] | None:
+        """If prefix is <indexed array>/c[/...], return (array path, coordinate parts)."""
+        for path in self._indexes:
+            chunk_dir = f"{path}/c"
+            if prefix == chunk_dir or prefix.startswith(chunk_dir + "/"):
+                rest = prefix[len(chunk_dir) + 1:]
+                return path, tuple(rest.split("/")) if rest else ()
+        return None
 
     # -- Core data resolution --
 
+    def _resolve(self, key: str) -> Any:
+        """Return the ref for key: inline str/dict, [url, offset, size], or None.
+
+        Chunks of indexed arrays are looked up in their chunk index.
+        """
+        ref = self.rfs["refs"].get(key)
+        if ref is not None or not self._indexes:
+            return ref
+        path, sep, coords_str = key.rpartition("/c/")
+        index = self._indexes.get(path) if sep else None
+        if index is None:
+            return None
+        try:
+            coords = tuple(int(c) for c in coords_str.split("/"))
+        except ValueError:
+            return None
+        hit = index.lookup(coords)
+        if hit is None:
+            return None
+        return [index.url, hit[0], hit[1]]
+
+    def _expand_templates(self, url_or_path: str) -> str:
+        if "{{" in url_or_path and "}}" in url_or_path and "templates" in self.rfs:
+            for tkey, tval in self.rfs["templates"].items():
+                url_or_path = url_or_path.replace("{{" + tkey + "}}", tval)
+        return url_or_path
+
     def _get_bytes(self, key: str) -> bytes | None:
         """Resolve a key to bytes, handling all reference types."""
-        if key not in self.rfs["refs"]:
+        x = self._resolve(key)
+        if x is None:
             return None
-
-        x = self.rfs["refs"][key]
 
         if isinstance(x, str):
             if x.startswith("base64:"):
@@ -294,12 +353,7 @@ class RfsStore(Store):
         elif isinstance(x, list):
             if len(x) != 3:
                 raise ValueError(f"Reference list for {key} must have 3 elements")
-            url_or_path, offset, length = x[0], x[1], x[2]
-
-            # Expand templates
-            if "{{" in url_or_path and "}}" in url_or_path and "templates" in self.rfs:
-                for tkey, tval in self.rfs["templates"].items():
-                    url_or_path = url_or_path.replace("{{" + tkey + "}}", tval)
+            url_or_path, offset, length = self._expand_templates(x[0]), x[1], x[2]
 
             is_url = url_or_path.startswith("http://") or url_or_path.startswith("https://")
 
@@ -362,15 +416,12 @@ class RfsStore(Store):
         array_path = "/".join(parts[:c_idx])
         meta_key = f"{array_path}/zarr.json" if array_path else "zarr.json"
 
-        if meta_key not in self.rfs["refs"]:
-            return None
-
-        meta_bytes = self._get_bytes(meta_key)
-        if meta_bytes is None:
-            return None
-        meta = json.loads(meta_bytes)
-
-        if meta.get("node_type") != "array":
+        if meta_key not in self._array_meta:
+            meta_bytes = self._get_bytes(meta_key) if meta_key in self.rfs["refs"] else None
+            meta = json.loads(meta_bytes) if meta_bytes is not None else None
+            self._array_meta[meta_key] = meta if meta and meta.get("node_type") == "array" else None
+        meta = self._array_meta[meta_key]
+        if meta is None:
             return None
 
         chunk_shape = meta.get("chunk_grid", {}).get("configuration", {}).get("chunk_shape")

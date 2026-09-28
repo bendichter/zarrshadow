@@ -74,16 +74,37 @@ With hdmf-zarr 0.14.0 or later, pass the store to `NWBZarrIO`:
 
 ```python
 from hdmf_zarr import NWBZarrIO
-from zindi.rfs_store import RfsStore
-import json
+from zindi import RfsStore, load_rfs
 
-with open("example.zindi.json") as f:
-    rfs = json.load(f)
-
-with NWBZarrIO(RfsStore(rfs), mode="r") as io:
+with NWBZarrIO(RfsStore(load_rfs("example.zindi.json")), mode="r") as io:
     nwbfile = io.read()
     print(nwbfile.acquisition)
 ```
+
+## Files with many chunks
+
+A long electrophysiology recording can have millions of chunks. Listing each one in the JSON makes a file of hundreds of megabytes that has to be downloaded and parsed before anything can be read. For this reason, `generate_rfs` gives any array with more than `chunk_index_threshold` chunks (default 1000) a chunk index in place of individual refs. The index is a `uint64` array shaped like the chunk grid plus a last axis of length 2, holding `(offset, nbytes)` for each chunk, the same layout as the Zarr v3 sharding index. Chunks that were never written hold `2**64 - 1`.
+
+Write to a path that does not end in `.json` to get a directory:
+
+```python
+rfs = generate_rfs(url)
+write_rfs(rfs, "example.zindi")
+root = open_rfs("example.zindi")  # also accepts a URL to the directory
+```
+
+```
+example.zindi/
+├── refs.json                       # metadata, small arrays, and chunk refs for arrays under the threshold
+└── index/                          # one zarr v3 array per indexed array
+    └── acquisition/ElectricalSeries/data/
+        ├── zarr.json
+        └── c/...
+```
+
+Opening the directory reads only `refs.json`. The index arrays are split into blocks of about 65,536 chunks and compressed with Blosc (zstd with byte shuffle), and a block is read the first time a chunk it covers is requested. They are ordinary Zarr arrays, so any Zarr library, including zarrita.js, can read them. For a synthetic NWB file with 2 million chunks, the directory is 0.8 MB against 176 MB for the single JSON, and `NWBZarrIO.read()` takes 0.04 s against 1.5 s.
+
+Writing to a path ending in `.json` still produces a single file, with every chunk listed in `refs`. Pass `chunk_index_threshold=None` to `generate_rfs` to list every chunk in memory as well.
 
 ## DANDI support
 
@@ -156,6 +177,8 @@ zindi/
 ├── generate_rfs.py          # HDF5 → Zarr v3 reference file system
 ├── open_rfs.py              # Open RFS as zarr.Group
 ├── rfs_store.py             # Zarr v3 Store backed by reference file system
+├── chunk_index.py           # Byte-range indexes for arrays with many chunks
+├── http_store.py            # Read-only zarr Store over HTTP, for remote index arrays
 ├── remfile.py               # File-like HTTP reader optimized for h5py
 ├── h5_filters_to_codecs.py  # HDF5 filters → Zarr v3 codec pipeline
 ├── h5_chunk_utils.py        # HDF5 chunk byte range utilities
@@ -168,7 +191,7 @@ zindi/
 ```
 Remote HDF5 file
     ↓ (h5py + Remfile: read metadata and chunk layout)
-JSON reference file system (.zindi.json)
+Reference file system (.zindi.json, or .zindi/ directory with chunk indexes)
     ↓ (RfsStore: zarr v3 Store implementation)
 zarr.Group (read-only, chunks fetched on demand)
     ↓ (hdmf_zarr.NWBZarrIO)
