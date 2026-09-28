@@ -16,7 +16,7 @@ When you open this JSON, Zindi provides a zarr v3 `Store` that fetches chunks on
 
 [Lindi](https://github.com/NeurodataWithoutBorders/lindi) does something similar but targets Zarr v2 and creates an h5py-like shim object for use with `pynwb.NWBHDF5IO`.
 
-Zindi instead produces a proper Zarr v3 store, following the [unified convention](https://github.com/NeurodataWithoutBorders/lindi/issues/125) that aligns Lindi and hdmf-zarr. The goal is to read NWB files via `pynwb.NWBZarrIO` (once hdmf-zarr completes its [Zarr v3 migration](https://github.com/hdmf-dev/hdmf-zarr/issues/335)), eliminating the h5py shim layer.
+Zindi instead produces a proper Zarr v3 store, following the [unified convention](https://github.com/NeurodataWithoutBorders/lindi/issues/125) that aligns Lindi and hdmf-zarr. hdmf-zarr adopted this convention in its Zarr v3 release (0.14.0), so a Zindi store can be read with `hdmf_zarr.NWBZarrIO` directly, without an h5py shim layer.
 
 ## Installation
 
@@ -68,6 +68,23 @@ rfs = generate_rfs(
 write_rfs(rfs, "data.zindi.json")
 ```
 
+### Read as an NWB file with hdmf-zarr
+
+With hdmf-zarr 0.14.0 or later, pass the store to `NWBZarrIO`:
+
+```python
+from hdmf_zarr import NWBZarrIO
+from zindi.rfs_store import RfsStore
+import json
+
+with open("example.zindi.json") as f:
+    rfs = json.load(f)
+
+with NWBZarrIO(RfsStore(rfs), mode="r") as io:
+    nwbfile = io.read()
+    print(nwbfile.acquisition)
+```
+
 ## DANDI support
 
 Zindi handles DANDI API URLs automatically. The DANDI URL (which returns a 302 redirect to a presigned S3 URL) is resolved transparently, with the presigned URL cached for 10 minutes.
@@ -89,9 +106,12 @@ The generated JSON follows the [unified Zarr v3 convention](https://github.com/h
 | Groups | `zarr.json` with `node_type: "group"` |
 | Arrays | `zarr.json` with `node_type: "array"`, codecs pipeline |
 | Scalars | Zero-dimensional array: `shape: []`, `chunk_shape: []`, single chunk keyed `c` |
+| Dataset dtype | `_DTYPE` attribute on non-compound arrays: the numpy type name (e.g. `"float64"`), `"str"` for strings, `"object_reference"` for references |
 | Soft links | `_LINKS` list on parent group: `[{"name", "source", "path"}]` |
+| References in datasets | `_DTYPE: "object_reference"` with target paths as strings; compound reference fields listed in `_REFERENCE_FIELDS` |
+| Spec location | Root `.specloc` attribute holds the plain path `"specifications"` |
 | References in attrs | `{"_REFERENCE": {"source": ".", "path": "/target"}}` |
-| NaN/Inf in attrs | Encoded as `"NaN"`, `"Infinity"`, `"-Infinity"` strings |
+| NaN/Inf in attrs | Written as the float tokens `NaN`, `Infinity`, `-Infinity`, as zarr-python does |
 | Strings | `data_type: "string"` with `vlen-utf8` codec |
 
 ## Local chunk caching
@@ -151,7 +171,7 @@ Remote HDF5 file
 JSON reference file system (.zindi.json)
     ↓ (RfsStore: zarr v3 Store implementation)
 zarr.Group (read-only, chunks fetched on demand)
-    ↓ (future: NWBZarrIO)
+    ↓ (hdmf_zarr.NWBZarrIO)
 pynwb NWBFile
 ```
 
@@ -162,4 +182,3 @@ This is v0.1 — the following are not yet implemented:
 - Nested compound dtypes (structs within structs)
 - Cross-file object references (same-file references are supported)
 - External array links (`_EXTERNAL_ARRAY_LINK`)
-- Integration with `NWBZarrIO` (requires hdmf-zarr Zarr v3 migration)

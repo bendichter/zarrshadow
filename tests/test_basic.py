@@ -393,6 +393,24 @@ class TestBasicRoundtrip:
         assert meta_scalar["chunk_grid"]["configuration"]["chunk_shape"] == []
         assert "acquisition/ref_scalar/c" in self.rfs["refs"]
 
+    def test_dtype_attr(self):
+        """Non-compound arrays carry _DTYPE the way hdmf-zarr writes it."""
+        expected = {
+            "acquisition/timeseries": "float64",
+            "acquisition/indices": "int32",
+            "acquisition/small": "float64",
+            "acquisition/scalar_int": "int64",
+            "acquisition/name": "str",
+            "acquisition/labels": "str",
+            "acquisition/mask": "bool",
+        }
+        for path, dtype in expected.items():
+            meta = json.loads(self.rfs["refs"][f"{path}/zarr.json"])
+            assert meta["attributes"]["_DTYPE"] == dtype, path
+
+        meta = json.loads(self.rfs["refs"]["acquisition/compound_chunked/zarr.json"])
+        assert "_DTYPE" not in meta["attributes"]
+
     def test_compound_with_references(self):
         """Compound dataset with reference field round-trips correctly."""
         root = open_rfs(self.rfs)
