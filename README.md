@@ -102,7 +102,40 @@ example.zindi/
         └── c/...
 ```
 
-Opening the directory reads only `refs.json`. The index arrays are split into blocks of about 65,536 chunks and compressed with Blosc (zstd with byte shuffle), and a block is read the first time a chunk it covers is requested. They are ordinary Zarr arrays, so any Zarr library, including zarrita.js, can read them. For a synthetic NWB file with 2 million chunks, the directory is 0.8 MB against 176 MB for the single JSON, and `NWBZarrIO.read()` takes 0.04 s against 1.5 s.
+Opening the directory reads only `refs.json`. Each index is itself an ordinary Zarr array, chunked so that one index chunk holds the entries for about 65,536 data chunks and compressed with Blosc (zstd with byte shuffle). An index chunk is read the first time any data chunk it covers is requested, and recent index chunks are kept in memory. Because they are plain Zarr arrays, any Zarr library, including zarrita.js, can read them. For a synthetic NWB file with 2 million chunks, the directory is 0.8 MB against 176 MB for the single JSON, and `NWBZarrIO.read()` takes 0.04 s against 1.5 s.
+
+### Example
+
+This file from DANDI has an `ElectricalSeries` of 495,184,000 samples by 160 channels (int16 at 20 kHz, about 6.9 hours). The HDF5 file stores it in chunks of 241,790 samples by 1 channel, about 12 seconds of one channel each, so its chunk grid is 2,048 by 160, or 327,680 data chunks.
+
+```python
+rfs = generate_rfs("https://api.dandiarchive.org/api/assets/5a9cc6f1-aeaf-46cc-aae7-ea27960236ea/download/")
+write_rfs(rfs, "example.zindi")
+```
+
+In the single JSON, those 327,680 data chunks are 327,680 entries in `refs`. In the directory, they are one index array at `index/acquisition/ElectricalSeries/data`:
+
+| | Data array | Index array |
+|---|---|---|
+| Shape | (495,184,000, 160) | (2,048, 160, 2) |
+| Chunk shape | (241,790, 1) | (409, 160, 2) |
+| Number of chunks | 327,680 | 6 |
+| Each chunk holds | 12 s of one channel (483,580 bytes before gzip) | `(offset, nbytes)` for 409 × 160 data chunks (about 1 MB before compression) |
+
+Each index chunk covers 409 rows of the data chunk grid for all 160 channels, which is the first 82 minutes of the recording for index chunk 0, the next 82 minutes for index chunk 1, and so on.
+
+To read one second starting one hour in on channel 17:
+
+```python
+root = open_rfs("example.zindi")
+data = root["acquisition/ElectricalSeries/data"][72_000_000:72_020_000, 17]
+```
+
+1. Samples 72,000,000 to 72,019,999 fall in row 297 of the data chunk grid (297 × 241,790 = 71,811,630), so zarr asks the store for data chunk `acquisition/ElectricalSeries/data/c/297/17`.
+2. The store finds that `(297, 17)` is in index chunk `(0, 0, 0)`, since 297 // 409 = 0, and reads `index/acquisition/ElectricalSeries/data/c/0/0/0`. This is the only index read, and later reads in the first 82 minutes reuse it from memory.
+3. Entry `[297, 17]` of that index chunk gives the byte offset and size of the data chunk in the HDF5 file, and the store fetches those bytes with one HTTP range request.
+
+Reading the same second on all 160 channels needs data chunks `c/297/0` through `c/297/159`, which all sit in the same index chunk, so it still reads one index chunk and then fetches 160 data chunks.
 
 Writing to a path ending in `.json` still produces a single file, with every chunk listed in `refs`. Pass `chunk_index_threshold=None` to `generate_rfs` to list every chunk in memory as well.
 
