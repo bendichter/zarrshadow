@@ -339,6 +339,10 @@ class RfsStore(Store):
     def _get_padded_size(self, key: str, data: bytes) -> int | None:
         """Check if a chunk needs padding (final chunk in contiguous dataset).
 
+        Only uncompressed chunks are padded. A compressed chunk is shorter than
+        its decoded size by design, and zeros appended to it break codecs that
+        read to the end of their input (fletcher32, zstd).
+
         In zarr v3, chunk keys look like: path/c/0/1/2
         """
         parts = key.split("/")
@@ -371,6 +375,8 @@ class RfsStore(Store):
         meta = json.loads(meta_bytes)
 
         if meta.get("node_type") != "array":
+            return None
+        if any(codec.get("name") != "bytes" for codec in meta.get("codecs", [])):
             return None
 
         chunk_shape = meta.get("chunk_grid", {}).get("configuration", {}).get("chunk_shape")
