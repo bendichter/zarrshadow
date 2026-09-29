@@ -12,6 +12,10 @@ Zindi reads the metadata and chunk layout of an HDF5 file (local or remote) and 
 
 When you open this JSON, Zindi provides a zarr v3 `Store` that fetches chunks on demand from the remote HDF5 file using HTTP Range requests. No data is copied — the original file is the source of truth.
 
+![A zindi reference file system copies Zarr metadata and small datasets out of the HDF5 file and stores each chunk as a pointer into it](docs/images/store-contents.svg)
+
+The metadata and small datasets are copied into the JSON when it is generated. Each chunk is a `[url, offset, size]` pointer into the original file and is fetched with an HTTP range request when it is read. The strip on the right enlarges the first 0.8 MB of the 103 GB file, where `c/0/0` begins right after 10 KB of HDF5 headers. The rest of the file holds more chunks, with more headers and heaps spread through it.
+
 ## How it relates to Lindi
 
 [Lindi](https://github.com/NeurodataWithoutBorders/lindi) does something similar but targets Zarr v2 and creates an h5py-like shim object for use with `pynwb.NWBHDF5IO`.
@@ -93,14 +97,9 @@ write_rfs(rfs, "example.zindi")
 root = open_rfs("example.zindi")  # also accepts a URL to the directory
 ```
 
-```
-example.zindi/
-├── refs.json                       # metadata, small arrays, and chunk refs for arrays under the threshold
-└── index/                          # one zarr v3 array per indexed array
-    └── acquisition/ElectricalSeries/data/
-        ├── zarr.json
-        └── c/...
-```
+![The same file as a single JSON and as a directory, with the chunk refs of large arrays moved into index arrays](docs/images/json-vs-directory.svg)
+
+This is the DANDI file from the example below in both forms. The 327,680 chunk refs of the `ElectricalSeries` are two thirds of the single JSON, and the whole 48.4 MB is read when it is opened. In the directory, the four arrays with more than 1,000 chunks become index arrays, and opening reads only `refs.json`.
 
 Opening the directory reads only `refs.json`. Each index is itself an ordinary Zarr array, chunked so that one index chunk holds the entries for about 65,536 data chunks and compressed with Blosc (zstd with byte shuffle). An index chunk is read the first time any data chunk it covers is requested, and recent index chunks are kept in memory. Because they are plain Zarr arrays, any Zarr library, including zarrita.js, can read them. For a synthetic NWB file with 2 million chunks, the directory is 0.8 MB against 176 MB for the single JSON, and `NWBZarrIO.read()` takes 0.04 s against 1.5 s.
 
@@ -113,16 +112,7 @@ rfs = generate_rfs("https://api.dandiarchive.org/api/assets/5a9cc6f1-aeaf-46cc-a
 write_rfs(rfs, "example.zindi")
 ```
 
-In the single JSON, those 327,680 data chunks are 327,680 entries in `refs`. In the directory, they are one index array at `index/acquisition/ElectricalSeries/data`:
-
-| | Data array | Index array |
-|---|---|---|
-| Shape | (495,184,000, 160) | (2,048, 160, 2) |
-| Chunk shape | (241,790, 1) | (409, 160, 2) |
-| Number of chunks | 327,680 | 6 |
-| Each chunk holds | 12 s of one channel (483,580 bytes before gzip) | `(offset, nbytes)` for 409 × 160 data chunks (about 1 MB before compression) |
-
-Each index chunk covers 409 rows of the data chunk grid for all 160 channels, which is the first 82 minutes of the recording for index chunk 0, the next 82 minutes for index chunk 1, and so on.
+In the single JSON, those 327,680 data chunks are 327,680 entries in `refs`. In the directory, they are one index array at `index/acquisition/ElectricalSeries/data` with shape (2,048, 160, 2), chunked as (409, 160, 2), so it has 6 index chunks of about 320 KB each after compression. Each index chunk covers 409 rows of the data chunk grid for all 160 channels, which is the first 82 minutes of the recording for index chunk 0, the next 82 minutes for index chunk 1, and so on.
 
 To read one second starting one hour in on channel 17:
 
@@ -130,6 +120,10 @@ To read one second starting one hour in on channel 17:
 root = open_rfs("example.zindi")
 data = root["acquisition/ElectricalSeries/data"][72_000_000:72_020_000, 17]
 ```
+
+![Reading data chunk c/297/17: row 297 falls in index chunk 0, entry [297, 17] gives the byte range, and one range request fetches it](docs/images/index-lookup.svg)
+
+The circled numbers match the steps below. The drawing is not to scale: each of the 2,048 rows of the chunk grid would be a fraction of a pixel, and the last index chunk, which covers only 3 rows, is drawn larger than it is.
 
 1. Samples 72,000,000 to 72,019,999 fall in row 297 of the data chunk grid (297 × 241,790 = 71,811,630), so zarr asks the store for data chunk `acquisition/ElectricalSeries/data/c/297/17`.
 2. The store finds that `(297, 17)` is in index chunk `(0, 0, 0)`, since 297 // 409 = 0, and reads `index/acquisition/ElectricalSeries/data/c/0/0/0`. This is the only index read, and later reads in the first 82 minutes reuse it from memory.
