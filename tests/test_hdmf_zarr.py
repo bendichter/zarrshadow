@@ -56,7 +56,7 @@ def nwb_path(tmp_path_factory):
     return str(path)
 
 
-@pytest.fixture(scope="module", params=["refs", "chunk_index", "directory"])
+@pytest.fixture(scope="module", params=["refs", "chunk_index", "directory", "contiguous_gen"])
 def nwb_pair(request, nwb_path, tmp_path_factory):
     """Yield the file as read by NWBHDF5IO and by NWBZarrIO over the zindi RFS.
 
@@ -65,6 +65,10 @@ def nwb_pair(request, nwb_path, tmp_path_factory):
     """
     if request.param == "refs":
         rfs = generate_rfs(nwb_path)
+    elif request.param == "contiguous_gen":
+        # linked/timestamps is a contiguous 240 KB dataset; split it into gen slabs
+        rfs = generate_rfs(nwb_path, contiguous_chunk_bytes=16 * 1024)
+        assert any(g["key"].startswith("acquisition/linked/timestamps/") for g in rfs["gen"])
     else:
         rfs = generate_rfs(nwb_path, chunk_index_threshold=10)
         assert "acquisition/ElectricalSeries/data" in rfs["indexes"]

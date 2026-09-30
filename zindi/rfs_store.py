@@ -9,6 +9,7 @@ It handles:
 - Retry with exponential backoff
 - Chunk padding for contiguous HDF5 datasets
 - Chunk indexes for arrays with many chunks (see chunk_index.py)
+- kerchunk "gen" entries, evaluated when a key is requested (see gen.py)
 
 Ported from lindi's LindiReferenceFileSystemStore, adapted for zarr v3.
 """
@@ -29,6 +30,7 @@ from zarr.abc.store import ByteRequest, Store
 from zarr.core.buffer import Buffer, BufferPrototype, default_buffer_prototype
 
 from .chunk_index import ChunkIndex
+from .gen import Generator
 from .sources import SourceChangedError, SourceChecker
 from .url_resolver import resolve_url
 
@@ -58,7 +60,7 @@ class RfsStore(Store):
         ----------
         rfs : dict
             Reference file system dict with "refs" key, and optional
-            "templates" and "indexes".
+            "templates", "gen", "indexes", and "sources".
         local_cache : LocalCache or None
             Optional local cache for persisting remote chunk data on disk.
         merge_gap : int
@@ -87,6 +89,7 @@ class RfsStore(Store):
             path: ChunkIndex(entry["url"], entry["index"])
             for path, entry in rfs.get("indexes", {}).items()
         }
+        self._generators = [Generator(entry, rfs.get("templates", {})) for entry in rfs.get("gen", [])]
         self._children: dict[str, set[str]] | None = None
         self._array_meta: dict[str, dict | None] = {}
         self._is_open = True
@@ -275,6 +278,9 @@ class RfsStore(Store):
         for path, index in self._indexes.items():
             for coords, _, _ in index.iter_chunks():
                 yield f"{path}/c/" + "/".join(map(str, coords))
+        for generator in self._generators:
+            for key, _ in generator.items():
+                yield key
 
     async def list_prefix(self, prefix: str) -> AsyncIterator[str]:
         async for key in self.list():
@@ -296,7 +302,14 @@ class RfsStore(Store):
                         seen.add(name)
                         yield name
             return
-        for name in sorted(self._get_children().get(prefix, ())):
+        names = set(self._get_children().get(prefix, ()))
+        for generator in self._generators:
+            # Enumerate generated keys only when listing inside a generated directory
+            if (prefix + "/").startswith(generator.static_prefix) and "/" in generator.static_prefix:
+                for key, _ in generator.items():
+                    if key.startswith(prefix + "/"):
+                        names.add(key[len(prefix) + 1 :].split("/")[0])
+        for name in sorted(names):
             yield name
 
     def _get_children(self) -> dict[str, set[str]]:
@@ -304,6 +317,7 @@ class RfsStore(Store):
         if self._children is None:
             children: dict[str, set[str]] = {}
             keys = list(self.rfs["refs"]) + [f"{path}/c" for path in self._indexes]
+            keys += [g.static_prefix.rsplit("/", 1)[0] for g in self._generators if "/" in g.static_prefix]
             for key in keys:
                 parts = key.split("/")
                 for i in range(len(parts)):
@@ -325,23 +339,27 @@ class RfsStore(Store):
     def _resolve(self, key: str) -> Any:
         """Return the ref for key: inline str/dict, [url, offset, size], or None.
 
-        Chunks of indexed arrays are looked up in their chunk index.
+        Keys are looked up in refs, then in the chunk index of their array,
+        then in the gen entries.
         """
         ref = self.rfs["refs"].get(key)
-        if ref is not None or not self._indexes:
+        if ref is not None:
             return ref
-        path, sep, coords_str = key.rpartition("/c/")
-        index = self._indexes.get(path) if sep else None
-        if index is None:
-            return None
-        try:
-            coords = tuple(int(c) for c in coords_str.split("/"))
-        except ValueError:
-            return None
-        hit = index.lookup(coords)
-        if hit is None:
-            return None
-        return [index.url, hit[0], hit[1]]
+        if self._indexes:
+            path, sep, coords_str = key.rpartition("/c/")
+            index = self._indexes.get(path) if sep else None
+            if index is not None:
+                try:
+                    coords = tuple(int(c) for c in coords_str.split("/"))
+                except ValueError:
+                    return None
+                hit = index.lookup(coords)
+                return None if hit is None else [index.url, hit[0], hit[1]]
+        for generator in self._generators:
+            ref = generator.lookup(key)
+            if ref is not None:
+                return ref
+        return None
 
     def _expand_templates(self, url_or_path: str) -> str:
         if "{{" in url_or_path and "}}" in url_or_path and "templates" in self.rfs:

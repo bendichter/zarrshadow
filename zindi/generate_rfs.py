@@ -31,6 +31,7 @@ from .h5_chunk_utils import (
     get_byte_range_for_contiguous_dataset,
     get_max_num_chunks,
 )
+from .gen import Generator
 from .h5_filters_to_codecs import h5_filters_to_codec_pipeline
 from .sources import describe_source
 
@@ -41,6 +42,7 @@ def generate_rfs(
     local_hdf5_path: str | None = None,
     h5f: h5py.File | None = None,
     chunk_index_threshold: int | None = 1000,
+    contiguous_chunk_bytes: int | None = 4 * 2**20,
     record_sources: bool = True,
 ) -> dict:
     """Generate a zarr v3 reference file system from an HDF5 file.
@@ -63,6 +65,11 @@ def generate_rfs(
         Arrays with more chunks than this get a chunk index (a numpy array of
         byte ranges, see ``zindi.chunk_index``) in place of one ref per chunk.
         None lists every chunk in refs.
+    contiguous_chunk_bytes : int or None
+        A contiguous (unchunked) HDF5 dataset larger than this is presented as
+        chunks of about this many bytes along its first axis, described by one
+        "gen" entry, so reading part of it does not fetch all of it. None keeps
+        each contiguous dataset as a single chunk. Default 4 MiB.
     record_sources : bool
         Record the size and, for remote files, the ETag of each file the
         references point into, under "sources", so readers can detect a file
@@ -74,11 +81,18 @@ def generate_rfs(
     dict
         A reference file system dict with keys "refs" and "version", and
         "indexes" mapping array paths to {"url", "index"} when any array is
-        indexed, in which case "version" is 2.
+        indexed, and "gen" when any contiguous dataset is split. Either makes
+        "version" 2.
     """
     refs: dict[str, Any] = {}
     indexes: dict[str, dict] = {}
-    opts = {"indexes": indexes, "chunk_index_threshold": chunk_index_threshold}
+    gens: list[dict] = []
+    opts = {
+        "indexes": indexes,
+        "chunk_index_threshold": chunk_index_threshold,
+        "gen": gens,
+        "contiguous_chunk_bytes": contiguous_chunk_bytes,
+    }
 
     if h5f is not None:
         _process_group(h5f, "", refs, hdf5_url_or_path, h5f, **opts)
@@ -96,9 +110,11 @@ def generate_rfs(
             _process_group(opened, "", refs, hdf5_url_or_path, opened, **opts)
 
     _add_dtype_attrs(refs)
-    rfs: dict[str, Any] = {"refs": refs, "version": 2 if indexes else 1}
+    rfs: dict[str, Any] = {"refs": refs, "version": 2 if (indexes or gens) else 1}
     if indexes:
         rfs["indexes"] = indexes
+    if gens:
+        rfs["gen"] = gens
     if record_sources:
         rfs["sources"] = _describe_sources(rfs)
     _apply_templates(rfs)
@@ -118,7 +134,7 @@ def write_rfs(rfs: dict, output_path: str) -> None:
     """
     if output_path.endswith(".json"):
         with open(output_path, "w") as f:
-            json.dump(_expand_indexes(rfs), f, indent=2, sort_keys=True)
+            json.dump(_to_version1(rfs), f, indent=2, sort_keys=True)
         return
 
     refs_json = os.path.join(output_path, "refs.json")
@@ -153,10 +169,14 @@ def write_rfs(rfs: dict, output_path: str) -> None:
         arr[...] = data
 
 
-def _expand_indexes(rfs: dict) -> dict:
-    """Return a version 1 copy of rfs with every indexed chunk listed in refs."""
-    indexes = rfs.get("indexes")
-    if not indexes:
+def _to_version1(rfs: dict) -> dict:
+    """Return a version 1 copy of rfs with every indexed or generated chunk listed in refs.
+
+    fsspec skips "gen" entries unless asked not to, so they are expanded too.
+    """
+    indexes = rfs.get("indexes", {})
+    gens = rfs.get("gen", [])
+    if not indexes and not gens:
         return rfs
     templates = rfs.get("templates", {})
 
@@ -172,7 +192,10 @@ def _expand_indexes(rfs: dict) -> dict:
     for path, entry in indexes.items():
         for coords, offset, nbytes in ChunkIndex(entry["url"], entry["index"]).iter_chunks():
             refs[f"{path}/c/" + "/".join(map(str, coords))] = [entry["url"], offset, nbytes]
-    out = {k: v for k, v in rfs.items() if k not in ("indexes", "templates", "refs")}
+    for entry in gens:
+        for key, ref in Generator(entry, templates).items():
+            refs[key] = ref
+    out = {k: v for k, v in rfs.items() if k not in ("indexes", "gen", "templates", "refs")}
     out["version"] = 1
     out["refs"] = refs
     _apply_templates(out)
@@ -260,6 +283,8 @@ def _process_dataset(
     *,
     indexes: dict,
     chunk_index_threshold: int | None,
+    gen: list,
+    contiguous_chunk_bytes: int | None,
 ) -> None:
     """Process an HDF5 dataset, adding zarr v3 array metadata and chunk refs."""
     attrs = _collect_attrs(ds, h5f=h5f, label=path)
@@ -279,7 +304,10 @@ def _process_dataset(
     codec_pipeline = h5_filters_to_codec_pipeline(ds)
 
     # Determine chunks
-    chunks = list(ds.chunks) if ds.chunks else list(ds.shape)
+    if ds.chunks:
+        chunks = list(ds.chunks)
+    else:
+        chunks = _contiguous_chunk_shape(ds.shape, ds.dtype.itemsize, contiguous_chunk_bytes)
     # Zarr doesn't allow zero-size chunks
     chunks = [max(c, 1) for c in chunks]
 
@@ -315,7 +343,7 @@ def _process_dataset(
 
     # Add chunk references
     if np.prod(ds.shape) > 0:
-        _add_chunk_refs(ds, path, refs, url, indexes, chunk_index_threshold)
+        _add_chunk_refs(ds, path, refs, url, indexes, chunk_index_threshold, gen, chunks)
 
 
 def _process_inline_dataset(
@@ -521,8 +549,10 @@ def _add_chunk_refs(
     url: str,
     indexes: dict,
     chunk_index_threshold: int | None,
+    gen: list,
+    chunk_shape: list[int],
 ) -> None:
-    """Add chunk references, or a chunk index, for a non-inline dataset."""
+    """Add chunk references, a chunk index, or a gen entry for a non-inline dataset."""
     if ds.chunks is not None:
         # Chunked dataset
         chunk_size = ds.chunks
@@ -550,10 +580,50 @@ def _add_chunk_refs(
         apply_to_all_chunk_info(ds, store_chunk_info)
         pbar.close()
     else:
-        # Contiguous dataset - single chunk
+        # Contiguous dataset: one chunk, or equal slabs along the first axis
         byte_offset, byte_count = get_byte_range_for_contiguous_dataset(ds)
-        chunk_key = f"{path}/{_chunk_key(ds.ndim)}"
-        refs[chunk_key] = [url, byte_offset, byte_count]
+        if ds.ndim == 0 or chunk_shape[0] >= ds.shape[0]:
+            refs[f"{path}/{_chunk_key(ds.ndim)}"] = [url, byte_offset, byte_count]
+            return
+        slab = chunk_shape[0] * int(np.prod(ds.shape[1:])) * ds.dtype.itemsize
+        n_slabs = -(-ds.shape[0] // chunk_shape[0])
+        # Every chunk a reader decodes must be full size. A short last slab is
+        # read at full length when the file extends that far: zarr discards the
+        # part of an edge chunk past the end of the array. Only a dataset that
+        # ends within one slab of the end of the file keeps a short last ref,
+        # which RfsStore pads.
+        last = byte_offset + (n_slabs - 1) * slab
+        full_last = ds.shape[0] % chunk_shape[0] == 0 or last + slab <= ds.file.id.get_filesize()
+        n_generated = n_slabs if full_last else n_slabs - 1
+        rest = "/0" * (ds.ndim - 1)
+        if n_generated:
+            gen.append({
+                "key": f"{path}/c/{{{{i}}}}{rest}",
+                "url": url,
+                "offset": f"{{{{{byte_offset} + i * {slab}}}}}",
+                "length": str(slab),
+                "dimensions": {"i": {"stop": n_generated}},
+            })
+        if not full_last:
+            refs[f"{path}/c/{n_slabs - 1}{rest}"] = [url, last, byte_offset + byte_count - last]
+
+
+def _contiguous_chunk_shape(
+    shape: tuple[int, ...], itemsize: int, target_bytes: int | None
+) -> list[int]:
+    """Chunk shape for presenting a contiguous dataset: whole, or slabs along axis 0."""
+    shape_list = list(shape)
+    if target_bytes is None or not shape_list:
+        return shape_list
+    row_bytes = itemsize * int(np.prod(shape_list[1:]))
+    if row_bytes == 0 or row_bytes * shape_list[0] <= target_bytes:
+        return shape_list
+    rows = max(1, target_bytes // row_bytes)
+    # Prefer a slab height that divides the first axis, so no slab is short
+    for candidate in range(rows, rows // 2, -1):
+        if shape_list[0] % candidate == 0:
+            return [candidate] + shape_list[1:]
+    return [rows] + shape_list[1:]
 
 
 def _add_chunk_index(
@@ -831,6 +901,7 @@ def _describe_sources(rfs: dict) -> dict:
     """Size and ETag of every file the refs and indexes point into."""
     urls = {val[0] for val in rfs["refs"].values() if isinstance(val, list) and len(val) == 3}
     urls |= {entry["url"] for entry in rfs.get("indexes", {}).values()}
+    urls |= {entry["url"] for entry in rfs.get("gen", [])}
     sources = {}
     for url in sorted(urls):
         try:
