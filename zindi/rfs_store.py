@@ -35,6 +35,30 @@ from .sources import SourceChangedError, SourceChecker
 from .url_resolver import resolve_url
 
 
+_imagecodecs_registered = False
+
+
+def _register_imagecodecs_if_needed(refs: dict) -> None:
+    """Register the imagecodecs Zarr codecs that TIFF references may use."""
+    global _imagecodecs_registered
+    if _imagecodecs_registered:
+        return
+    if not any(
+        isinstance(v, str) and '"imagecodecs_' in v
+        for k, v in refs.items()
+        if k == "zarr.json" or k.endswith("/zarr.json")
+    ):
+        return
+    try:
+        import imagecodecs.zarr
+    except ImportError as e:
+        raise ImportError(
+            "These references use imagecodecs codecs (from a TIFF file); install imagecodecs to read them"
+        ) from e
+    imagecodecs.zarr.register_codecs()
+    _imagecodecs_registered = True
+
+
 class RfsStore(Store):
     """A read-only zarr v3 Store backed by a reference file system dict.
 
@@ -83,6 +107,7 @@ class RfsStore(Store):
         self._max_merge_size = max_merge_size
         self._executor = ThreadPoolExecutor(max_workers=32)
         self._sources = SourceChecker(rfs.get("sources", {}), enabled=validate_sources)
+        _register_imagecodecs_if_needed(rfs["refs"])
         self._session = requests.Session()
         self._session.headers["User-Agent"] = "Mozilla/5.0"
         self._indexes = {

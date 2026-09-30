@@ -102,3 +102,21 @@ def test_inline_chunks():
 
     builder.add_inline_chunk("note", [], b"plain text")
     assert builder.refs["note/c"] == "plain text"
+
+
+def test_add_chunks_picks_compact_form():
+    builder = RfsBuilder()
+    # Evenly spaced along the first axis: one gen entry
+    evenly = {(i, 0): (100 + i * 64, 64) for i in range(5)}
+    assert builder.add_chunks("a", [5, 1], "f.bin", evenly) == "strided"
+    assert builder.gen[-1]["dimensions"] == {"i": {"stop": 5}}
+    # Uneven spacing, or more than one chunk across: refs, or an index when there are many
+    uneven = {(i, 0): (100 + i * i * 64, 64) for i in range(5)}
+    assert builder.add_chunks("b", [5, 1], "f.bin", uneven) == "refs"
+    assert builder.refs["b/c/3/0"] == ["f.bin", 676, 64]
+    grid = {(i, j): (i * 1000 + j * 10, 10) for i in range(4) for j in range(3)}
+    assert builder.add_chunks("c", [4, 3], "f.bin", grid, index_threshold=10) == "index"
+    assert builder.indexes["c"]["index"][2, 1].tolist() == [2010, 10]
+    # A missing chunk stops the strided form
+    gap = {(i, 0): (i * 64, 64) for i in range(5) if i != 2}
+    assert builder.add_chunks("d", [5, 1], "f.bin", gap) == "refs"
