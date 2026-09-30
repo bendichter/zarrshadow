@@ -448,7 +448,7 @@ class TestBasicRoundtrip:
 
     def test_write_and_read_json(self):
         """RFS can be written to JSON and read back."""
-        from zindi.generate_rfs import write_rfs
+        from zindi import write_rfs
 
         json_path = f"{self.tmpdir}/test.zindi.json"
         write_rfs(self.rfs, json_path)

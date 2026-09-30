@@ -184,6 +184,23 @@ Reading the same second on all 160 channels needs data chunks `c/297/0` through 
 
 Pass `chunk_index_threshold=None` to `generate_rfs` to list every chunk in `refs` in memory as well.
 
+## Other File Formats
+
+`generate_rfs` is the generator for HDF5. Everything after it (the store, the directory format, chunk indexes, `gen`, and source checks) works for any format, and a generator for another format builds the same references with `RfsBuilder`. For a raw binary recording with 16 interleaved `int16` channels after a 12-byte header:
+
+```python
+from zindi import RfsBuilder, open_rfs, write_rfs
+
+builder = RfsBuilder()
+builder.add_group("")
+builder.add_array("data", shape=[10_000, 16], data_type="int16", chunk_shape=[1000, 16])
+builder.add_strided_chunks("data", ndim=2, url="raw.bin", start=12, stride=32_000, length=32_000, count=10)
+rfs = builder.build()
+write_rfs(rfs, "raw.zindi")
+```
+
+`add_chunk` adds one chunk at a time, `add_index` adds all the chunks of a large array as an index array, `add_strided_chunks` adds evenly spaced chunks as a `gen` entry, and `add_inline_chunk` stores small data in the references themselves.
+
 ## DANDI support
 
 Zindi handles DANDI API URLs automatically. The DANDI URL (which returns a 302 redirect to a presigned S3 URL) is resolved transparently, with the presigned URL cached for 10 minutes.
@@ -252,7 +269,8 @@ Set `merge_gap=0` to disable merging and fetch every chunk individually.
 
 ```
 zindi/
-├── generate_rfs.py          # HDF5 → Zarr v3 reference file system
+├── builder.py               # RfsBuilder and write_rfs, independent of the source format
+├── hdf5.py                  # HDF5 → reference file system, through RfsBuilder
 ├── open_rfs.py              # Open RFS as zarr.Group
 ├── rfs_store.py             # Zarr v3 Store backed by reference file system
 ├── chunk_index.py           # Byte-range indexes for arrays with many chunks

@@ -1,15 +1,11 @@
 """Tests for detecting whether HDF5 reports offsets relative to the userblock."""
 
-import importlib
-
 import h5py
 import numpy as np
 import pytest
 
 from zindi import generate_rfs, open_rfs
-
-# zindi.generate_rfs is also the name of the function the package exports
-gr = importlib.import_module("zindi.generate_rfs")
+from zindi import hdf5 as gr
 
 USERBLOCK = 512
 
