@@ -103,6 +103,57 @@ This is the DANDI file from the example below in both forms. The 327,680 chunk r
 
 Opening the directory reads only `refs.json`. Each index is itself an ordinary Zarr array, chunked so that one index chunk holds the entries for about 65,536 data chunks and compressed with Blosc (zstd with byte shuffle). An index chunk is read the first time any data chunk it covers is requested, and recent index chunks are kept in memory. Because they are plain Zarr arrays, any Zarr library, including zarrita.js, can read them. For a synthetic NWB file with 2 million chunks, the directory is 0.8 MB against 176 MB for the single JSON, and `NWBZarrIO.read()` takes 0.04 s against 1.5 s.
 
+### The refs.json Format
+
+`refs.json` is a [kerchunk reference file](https://fsspec.github.io/kerchunk/spec.html) with Zarr v3 keys and a few additions. For the file in the example below it looks like this, shortened:
+
+```json
+{
+  "version": 2,
+  "templates": {"u0": "https://api.dandiarchive.org/api/assets/5a9cc6f1-aeaf-46cc-aae7-ea27960236ea/download/"},
+  "refs": {
+    "zarr.json": "{\"zarr_format\":3,\"node_type\":\"group\",...}",
+    "acquisition/ElectricalSeries/data/zarr.json": "{\"shape\":[495184000,160],...}",
+    "acquisition/Video: Rat08-20130708-02-run/timestamps/c/0": ["{{u0}}", 73293974410, 3559],
+    "session_description/c": "base64:AQAAAK4DAABUaGUgY29uc29saWRhdGlvbi..."
+  },
+  "indexes": {
+    "acquisition/ElectricalSeries/data": {
+      "url": "https://api.dandiarchive.org/api/assets/5a9cc6f1-aeaf-46cc-aae7-ea27960236ea/download/",
+      "index": "index/acquisition/ElectricalSeries/data"
+    }
+  },
+  "sources": {
+    "https://api.dandiarchive.org/api/assets/5a9cc6f1-aeaf-46cc-aae7-ea27960236ea/download/": {
+      "size": 102986180753,
+      "etag": "\"b885aa8ec05afd3337ae440e35249431-1535\""
+    }
+  }
+}
+```
+
+`refs` holds the Zarr metadata, small datasets, and a `[url, offset, size]` entry for each chunk of an array with at most 1,000 chunks. For each larger array, `indexes` gives the file its chunks are in and the path of its index array, relative to `refs.json`. There is nothing in between: a reader looks up the array in `indexes`, opens that Zarr array, and reads the index chunk it needs. `gen` and `sources` are described below.
+
+A directory that uses `indexes` or `gen` is marked `"version": 2`, so readers that only know version 1 of the kerchunk format refuse it instead of returning fill values for the chunks they cannot find. Writing to a path ending in `.json` produces a version 1 file with every chunk listed in `refs`, which any kerchunk reader can open.
+
+### Contiguous Datasets
+
+HDF5 stores a dataset that was written without chunking as one contiguous block. As a single Zarr chunk, reading any part of it would fetch all of it. `generate_rfs` presents a contiguous dataset larger than `contiguous_chunk_bytes` (default 4 MiB) as slabs along its first axis, described by one kerchunk `gen` entry such as this one:
+
+```json
+{"key": "acquisition/timestamps/c/{{i}}", "url": "{{u0}}", "offset": "{{2048 + i * 4194304}}", "length": "4194304", "dimensions": {"i": {"stop": 58}}}
+```
+
+zindi computes a slab's offset when that chunk is requested. The slab height divides the first axis when a divisor is close to the target, so every slab has the same length. When none does, the last slab is read at full length, and zarr discards the part past the end of the array.
+
+### Detecting Changed Files
+
+A reference is a URL and a byte range, so it would return wrong data without any error if the file it points into were replaced. `generate_rfs` records each file's size and, for remote files, its ETag under `sources`. For DANDI assets these come from the asset metadata, whose `dandi:dandi-etag` is the ETag S3 reports. When reading, zindi sends `If-Match` with every range request so that the server refuses it if the file has changed, compares the total size the server reports, and checks the size of local files. Any mismatch raises `SourceChangedError`. Pass `validate_sources=False` to `open_rfs` to turn the checks off.
+
+### MATLAB Files
+
+MATLAB `.mat` files saved with `-v7.3` are HDF5 files with a 512-byte userblock in front, and zindi reads them like any other HDF5 file. HDF5 1.14 and later report chunk offsets from the start of the file, but HDF5 1.10 reports them from the end of the userblock, so `generate_rfs` checks one stored block against the file and corrects the offsets if needed. zindi presents the data as HDF5 stores it: arrays are transposed relative to MATLAB, `char` arrays are UTF-16 codes, and cell arrays are references into `#refs#`. [matzarr](https://github.com/catalystneuro/matzarr) reads the same files from MATLAB with MATLAB semantics.
+
 ### Example
 
 This file from DANDI has an `ElectricalSeries` of 495,184,000 samples by 160 channels (int16 at 20 kHz, about 6.9 hours). The HDF5 file stores it in chunks of 241,790 samples by 1 channel, about 12 seconds of one channel each, so its chunk grid is 2,048 by 160, or 327,680 data chunks.
@@ -126,12 +177,12 @@ data = root["acquisition/ElectricalSeries/data"][72_000_000:72_020_000, 17]
 The circled numbers match the steps below. The drawing is not to scale: each of the 2,048 rows of the chunk grid would be a fraction of a pixel, and the last index chunk, which covers only 3 rows, is drawn larger than it is.
 
 1. Samples 72,000,000 to 72,019,999 fall in row 297 of the data chunk grid (297 × 241,790 = 71,811,630), so zarr asks the store for data chunk `acquisition/ElectricalSeries/data/c/297/17`.
-2. The store finds that `(297, 17)` is in index chunk `(0, 0, 0)`, since 297 // 409 = 0, and reads `index/acquisition/ElectricalSeries/data/c/0/0/0`. This is the only index read, and later reads in the first 82 minutes reuse it from memory.
+2. The chunk is not in `refs`, but the array is in `indexes`, which points to the index array at `index/acquisition/ElectricalSeries/data`. `(297, 17)` is in index chunk `(0, 0, 0)`, since 297 // 409 = 0, so the store reads `index/acquisition/ElectricalSeries/data/c/0/0/0`. This is the only index read, and later reads in the first 82 minutes reuse it from memory.
 3. Entry `[297, 17]` of that index chunk gives the byte offset and size of the data chunk in the HDF5 file, and the store fetches those bytes with one HTTP range request.
 
 Reading the same second on all 160 channels needs data chunks `c/297/0` through `c/297/159`, which all sit in the same index chunk, so it still reads one index chunk and then fetches 160 data chunks.
 
-Writing to a path ending in `.json` still produces a single file, with every chunk listed in `refs`. Pass `chunk_index_threshold=None` to `generate_rfs` to list every chunk in memory as well.
+Pass `chunk_index_threshold=None` to `generate_rfs` to list every chunk in `refs` in memory as well.
 
 ## DANDI support
 
@@ -205,6 +256,8 @@ zindi/
 ├── open_rfs.py              # Open RFS as zarr.Group
 ├── rfs_store.py             # Zarr v3 Store backed by reference file system
 ├── chunk_index.py           # Byte-range indexes for arrays with many chunks
+├── gen.py                   # Lazy evaluation of kerchunk gen entries
+├── sources.py               # Recording source files and detecting changes
 ├── http_store.py            # Read-only zarr Store over HTTP, for remote index arrays
 ├── remfile.py               # File-like HTTP reader optimized for h5py
 ├── h5_filters_to_codecs.py  # HDF5 filters → Zarr v3 codec pipeline
