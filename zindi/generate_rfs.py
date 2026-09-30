@@ -16,7 +16,7 @@ import json
 import os
 import shutil
 import warnings
-from typing import Any
+from typing import Any, Callable
 
 import h5py
 import numpy as np
@@ -94,20 +94,24 @@ def generate_rfs(
         "contiguous_chunk_bytes": contiguous_chunk_bytes,
     }
 
+    def process(opened: h5py.File, raw_source: str) -> None:
+        opts["offset_shift"] = _detect_offset_shift(opened, _raw_reader(raw_source))
+        _process_group(opened, "", refs, hdf5_url_or_path, opened, **opts)
+
     if h5f is not None:
-        _process_group(h5f, "", refs, hdf5_url_or_path, h5f, **opts)
+        process(h5f, hdf5_url_or_path)
     elif local_hdf5_path is not None:
         with h5py.File(local_hdf5_path, "r") as opened:
-            _process_group(opened, "", refs, hdf5_url_or_path, opened, **opts)
+            process(opened, local_hdf5_path)
     elif hdf5_url_or_path.startswith("http://") or hdf5_url_or_path.startswith("https://"):
         from .remfile import ZindiRemfile
 
         remf = ZindiRemfile(hdf5_url_or_path)
         with h5py.File(remf, "r") as opened:
-            _process_group(opened, "", refs, hdf5_url_or_path, opened, **opts)
+            process(opened, hdf5_url_or_path)
     else:
         with h5py.File(hdf5_url_or_path, "r") as opened:
-            _process_group(opened, "", refs, hdf5_url_or_path, opened, **opts)
+            process(opened, hdf5_url_or_path)
 
     _add_dtype_attrs(refs)
     rfs: dict[str, Any] = {"refs": refs, "version": 2 if (indexes or gens) else 1}
@@ -285,6 +289,7 @@ def _process_dataset(
     chunk_index_threshold: int | None,
     gen: list,
     contiguous_chunk_bytes: int | None,
+    offset_shift: int,
 ) -> None:
     """Process an HDF5 dataset, adding zarr v3 array metadata and chunk refs."""
     attrs = _collect_attrs(ds, h5f=h5f, label=path)
@@ -343,7 +348,7 @@ def _process_dataset(
 
     # Add chunk references
     if np.prod(ds.shape) > 0:
-        _add_chunk_refs(ds, path, refs, url, indexes, chunk_index_threshold, gen, chunks)
+        _add_chunk_refs(ds, path, refs, url, indexes, chunk_index_threshold, gen, chunks, offset_shift)
 
 
 def _process_inline_dataset(
@@ -551,14 +556,18 @@ def _add_chunk_refs(
     chunk_index_threshold: int | None,
     gen: list,
     chunk_shape: list[int],
+    offset_shift: int = 0,
 ) -> None:
-    """Add chunk references, a chunk index, or a gen entry for a non-inline dataset."""
+    """Add chunk references, a chunk index, or a gen entry for a non-inline dataset.
+
+    offset_shift is added to every byte offset h5py reports (see _detect_offset_shift).
+    """
     if ds.chunks is not None:
         # Chunked dataset
         chunk_size = ds.chunks
         num_chunks = get_max_num_chunks(shape=ds.shape, chunk_size=chunk_size)
         if chunk_index_threshold is not None and num_chunks > chunk_index_threshold:
-            _add_chunk_index(ds, path, url, indexes, num_chunks)
+            _add_chunk_index(ds, path, url, indexes, num_chunks, offset_shift)
             return
         pbar = tqdm(
             total=num_chunks,
@@ -574,7 +583,7 @@ def _add_chunk_refs(
             # zarr v3 chunk key: c/<idx0>/<idx1>/...
             indices = [str(a // b) for a, b in zip(chunk_offset, chunk_size)]
             chunk_key = f"{path}/c/" + "/".join(indices)
-            refs[chunk_key] = [url, byte_offset, byte_count]
+            refs[chunk_key] = [url, byte_offset + offset_shift, byte_count]
             pbar.update()
 
         apply_to_all_chunk_info(ds, store_chunk_info)
@@ -582,6 +591,7 @@ def _add_chunk_refs(
     else:
         # Contiguous dataset: one chunk, or equal slabs along the first axis
         byte_offset, byte_count = get_byte_range_for_contiguous_dataset(ds)
+        byte_offset += offset_shift
         if ds.ndim == 0 or chunk_shape[0] >= ds.shape[0]:
             refs[f"{path}/{_chunk_key(ds.ndim)}"] = [url, byte_offset, byte_count]
             return
@@ -632,6 +642,7 @@ def _add_chunk_index(
     url: str,
     indexes: dict,
     num_chunks: int,
+    offset_shift: int = 0,
 ) -> None:
     """Record a dataset's chunk byte ranges in an index array."""
     chunk_size = ds.chunks
@@ -641,13 +652,78 @@ def _add_chunk_index(
     def for_each_chunk(set_chunk: Any) -> None:
         def store_chunk_info(chunk_info: Any) -> None:
             coords = tuple(a // b for a, b in zip(chunk_info.chunk_offset, chunk_size))
-            set_chunk(coords, chunk_info.byte_offset, chunk_info.size)
+            set_chunk(coords, chunk_info.byte_offset + offset_shift, chunk_info.size)
             pbar.update()
 
         apply_to_all_chunk_info(ds, store_chunk_info)
 
     indexes[path] = {"url": url, "index": build_index(grid_shape, for_each_chunk)}
     pbar.close()
+
+
+def _raw_reader(path_or_url: str) -> Callable[[int, int], bytes]:
+    """Read raw bytes from the HDF5 file, bypassing h5py."""
+    from .rfs_store import _read_bytes_from_url_or_path
+
+    return lambda offset, length: _read_bytes_from_url_or_path(path_or_url, offset, length)
+
+
+def _first_stored_block(h5f: h5py.File) -> tuple[int, bytes] | None:
+    """The offset h5py reports for some stored data, and the bytes it holds there.
+
+    Uses the first chunk of the first chunked dataset with any chunks written,
+    or else the start of the first contiguous dataset with storage.
+    """
+    contiguous: tuple[int, bytes] | None = None
+    found: tuple[int, bytes] | None = None
+
+    def visit(name: str, obj: Any) -> Any:
+        nonlocal contiguous, found
+        if not isinstance(obj, h5py.Dataset) or obj.size == 0 or obj.dtype.kind in "OV":
+            return None
+        if obj.chunks is not None:
+            try:
+                info = obj.id.get_chunk_info(0)
+            except Exception:
+                return None
+            if info.byte_offset is None:
+                return None
+            _, raw = obj.id.read_direct_chunk(info.chunk_offset)
+            found = (info.byte_offset, bytes(raw[:64]))
+            return True  # stop visiting
+        if contiguous is None and obj.id.get_offset() is not None:
+            first = obj[:8] if obj.ndim == 1 else obj[(0,) * (obj.ndim - 1)][:8]
+            contiguous = (obj.id.get_offset(), np.asarray(first).tobytes())
+        return None
+
+    h5f.visititems(visit)
+    return found or contiguous
+
+
+def _detect_offset_shift(h5f: h5py.File, read_bytes: Callable[[int, int], bytes]) -> int:
+    """How far to shift the byte offsets h5py reports to get file offsets.
+
+    A file with a userblock (MATLAB v7.3 files have 512 bytes) is laid out
+    after it. HDF5 1.14 and later report absolute file offsets, but HDF5 1.10
+    reports offsets relative to the superblock, which puts every reference
+    off by the size of the userblock. Instead of relying on the library
+    version, read one stored block at the reported offset and with the
+    userblock added, and keep whichever matches what h5py reads.
+    """
+    userblock = h5f.userblock_size
+    if not userblock:
+        return 0
+    block = _first_stored_block(h5f)
+    if block is None:
+        return 0
+    offset, expected = block
+    for shift in (0, userblock):
+        if read_bytes(offset + shift, len(expected)) == expected:
+            return shift
+    raise RuntimeError(
+        f"Byte offsets reported by HDF5 do not match the file, with or without the "
+        f"{userblock}-byte userblock; chunk references would be wrong"
+    )
 
 
 # ---------------------------------------------------------------------------
