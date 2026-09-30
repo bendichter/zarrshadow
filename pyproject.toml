@@ -22,7 +22,11 @@ tiff = [
     "tifffile>=2025.1.1",
     "imagecodecs",
 ]
+neo = [
+    "neo>=0.14",
+]
 dev = [
+    "neo>=0.14",
     "pytest",
     "pynwb",
     "hdmf-zarr>=0.14.0",
