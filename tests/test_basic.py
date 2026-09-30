@@ -123,6 +123,17 @@ def _create_test_hdf5(path: str) -> None:
         )
         g.create_dataset("compound_with_refs", data=cpd_ref_data)
 
+        # Compressed chunks followed by a checksum, as MATLAB v7.3 files written
+        # by hdf5storage have. The last chunk is partial.
+        g.create_dataset(
+            "checksummed",
+            data=np.random.randn(2500),
+            chunks=(1000,),
+            shuffle=True,
+            compression="gzip",
+            fletcher32=True,
+        )
+
 
 class TestBasicRoundtrip:
     """Test generating and reading back RFS."""
@@ -410,6 +421,13 @@ class TestBasicRoundtrip:
 
         meta = json.loads(self.rfs["refs"]["acquisition/compound_chunked/zarr.json"])
         assert "_DTYPE" not in meta["attributes"]
+
+    def test_compressed_chunks_with_checksum(self):
+        """Compressed chunks are read unpadded, so fletcher32 verifies."""
+        root = open_rfs(self.rfs)
+        with h5py.File(self.h5_path, "r") as f:
+            expected = f["acquisition/checksummed"][:]
+        np.testing.assert_array_equal(root["acquisition/checksummed"][:], expected)
 
     def test_compound_with_references(self):
         """Compound dataset with reference field round-trips correctly."""
