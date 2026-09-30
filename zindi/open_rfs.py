@@ -23,6 +23,7 @@ def open_rfs(
     local_cache: Any = None,
     merge_gap: int = 256 * 1024,
     max_merge_size: int = 50 * 1024 * 1024,
+    validate_sources: bool = True,
 ) -> zarr.Group:
     """Open a reference file system as a zarr v3 Group.
 
@@ -40,6 +41,9 @@ def open_rfs(
         request. Default 256 KB.
     max_merge_size : int
         Maximum size in bytes for a single merged HTTP request. Default 50 MB.
+    validate_sources : bool
+        Raise SourceChangedError if a file the references point into has
+        changed since they were generated. Default True.
 
     Returns
     -------
@@ -52,7 +56,11 @@ def open_rfs(
     assert isinstance(rfs, dict)
 
     store = RfsStore(
-        rfs, local_cache=local_cache, merge_gap=merge_gap, max_merge_size=max_merge_size
+        rfs,
+        local_cache=local_cache,
+        merge_gap=merge_gap,
+        max_merge_size=max_merge_size,
+        validate_sources=validate_sources,
     )
     return zarr.open_group(store, mode="r", zarr_format=3)
 

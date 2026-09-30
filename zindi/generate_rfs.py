@@ -15,6 +15,7 @@ import base64
 import json
 import os
 import shutil
+import warnings
 from typing import Any
 
 import h5py
@@ -31,6 +32,7 @@ from .h5_chunk_utils import (
     get_max_num_chunks,
 )
 from .h5_filters_to_codecs import h5_filters_to_codec_pipeline
+from .sources import describe_source
 
 
 def generate_rfs(
@@ -39,6 +41,7 @@ def generate_rfs(
     local_hdf5_path: str | None = None,
     h5f: h5py.File | None = None,
     chunk_index_threshold: int | None = 1000,
+    record_sources: bool = True,
 ) -> dict:
     """Generate a zarr v3 reference file system from an HDF5 file.
 
@@ -60,6 +63,11 @@ def generate_rfs(
         Arrays with more chunks than this get a chunk index (a numpy array of
         byte ranges, see ``zindi.chunk_index``) in place of one ref per chunk.
         None lists every chunk in refs.
+    record_sources : bool
+        Record the size and, for remote files, the ETag of each file the
+        references point into, under "sources", so readers can detect a file
+        that has changed since. For DANDI assets these come from the asset
+        metadata. Default True.
 
     Returns
     -------
@@ -91,6 +99,8 @@ def generate_rfs(
     rfs: dict[str, Any] = {"refs": refs, "version": 2 if indexes else 1}
     if indexes:
         rfs["indexes"] = indexes
+    if record_sources:
+        rfs["sources"] = _describe_sources(rfs)
     _apply_templates(rfs)
     return rfs
 
@@ -815,6 +825,19 @@ def _add_dtype_attrs(refs: dict) -> None:
             continue
         attrs["_DTYPE"] = "str" if data_type == "string" else data_type
         refs[key] = json.dumps(meta, separators=(",", ":"))
+
+
+def _describe_sources(rfs: dict) -> dict:
+    """Size and ETag of every file the refs and indexes point into."""
+    urls = {val[0] for val in rfs["refs"].values() if isinstance(val, list) and len(val) == 3}
+    urls |= {entry["url"] for entry in rfs.get("indexes", {}).values()}
+    sources = {}
+    for url in sorted(urls):
+        try:
+            sources[url] = describe_source(url)
+        except Exception as e:
+            warnings.warn(f"Could not describe source {url}: {e}")
+    return sources
 
 
 def _apply_templates(rfs: dict) -> None:

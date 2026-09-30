@@ -3,6 +3,7 @@ from .local_cache import LocalCache
 from .open_rfs import load_rfs, open_rfs
 from .remfile import ZindiRemfile
 from .rfs_store import RfsStore
+from .sources import SourceChangedError
 from .url_resolver import add_url_resolver
 
 __all__ = [
@@ -13,5 +14,6 @@ __all__ = [
     "LocalCache",
     "ZindiRemfile",
     "RfsStore",
+    "SourceChangedError",
     "add_url_resolver",
 ]

@@ -54,16 +54,18 @@ def _is_dandi_url(url: str) -> bool:
     )
 
 
-def _resolve_dandi_url(url: str) -> str:
-    """Resolve a DANDI API URL to a presigned S3 URL."""
-    headers: dict[str, str] = {}
+def dandi_auth_headers(url: str) -> dict[str, str]:
+    """Authorization header for a DANDI API URL, if an API key is set."""
     if url.startswith("https://api.dandiarchive.org/api/"):
         api_key = os.environ.get("DANDI_API_KEY")
-        if api_key:
-            headers["Authorization"] = f"token {api_key}"
     elif url.startswith("https://api.sandbox.dandiarchive.org/"):
         api_key = os.environ.get("DANDI_SANDBOX_API_KEY")
-        if api_key:
-            headers["Authorization"] = f"token {api_key}"
-    resp = requests.head(url, allow_redirects=True, headers=headers)
+    else:
+        api_key = None
+    return {"Authorization": f"token {api_key}"} if api_key else {}
+
+
+def _resolve_dandi_url(url: str) -> str:
+    """Resolve a DANDI API URL to a presigned S3 URL."""
+    resp = requests.head(url, allow_redirects=True, headers=dandi_auth_headers(url))
     return str(resp.url)
