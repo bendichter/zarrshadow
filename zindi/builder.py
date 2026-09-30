@@ -151,6 +151,48 @@ class RfsBuilder:
             dimensions={"i": {"stop": int(count)}},
         )
 
+    def add_chunks(
+        self,
+        path: str,
+        grid_shape: Sequence[int],
+        url: str,
+        chunks: dict[tuple[int, ...], tuple[int, int]],
+        *,
+        index_threshold: int | None = 1000,
+    ) -> str:
+        """All of an array's chunks in one file, stored in the most compact form.
+
+        chunks maps chunk coordinates to (offset, length); missing coordinates
+        are chunks that were never written. Chunks that are evenly spaced along
+        the first axis, with every other axis a single chunk, become one gen
+        entry; more than index_threshold chunks become an index array; anything
+        else becomes one ref per chunk. Returns "strided", "index", or "refs".
+        """
+        grid = [int(g) for g in grid_shape]
+        n = len(chunks)
+        if n > 1 and n == grid[0] and all(g == 1 for g in grid[1:]):
+            rest = (0,) * (len(grid) - 1)
+            spans = [chunks.get((i, *rest)) for i in range(n)]
+            if all(spans):
+                offsets = [s[0] for s in spans]
+                lengths = {s[1] for s in spans}
+                strides = {b - a for a, b in zip(offsets, offsets[1:])}
+                if len(lengths) == 1 and len(strides) == 1:
+                    self.add_strided_chunks(
+                        path, ndim=len(grid), url=url, start=offsets[0],
+                        stride=strides.pop(), length=lengths.pop(), count=n,
+                    )
+                    return "strided"
+        if index_threshold is not None and n > index_threshold:
+            index = np.full((*grid, 2), MISSING, dtype=np.uint64)
+            for coords, (offset, length) in chunks.items():
+                index[coords] = (offset, length)
+            self.add_index(path, url, index)
+            return "index"
+        for coords, (offset, length) in chunks.items():
+            self.add_chunk(path, coords, url, offset, length)
+        return "refs"
+
     # -- Result --
 
     def build(self, *, record_sources: bool = True) -> dict:

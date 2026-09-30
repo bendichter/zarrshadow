@@ -18,8 +18,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+tiff = [
+    "tifffile>=2025.1.1",
+    "imagecodecs",
+]
 dev = [
     "pytest",
     "pynwb",
     "hdmf-zarr>=0.14.0",
+    "tifffile>=2025.1.1",
+    "imagecodecs",
 ]

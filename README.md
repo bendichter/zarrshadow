@@ -184,6 +184,19 @@ Reading the same second on all 160 channels needs data chunks `c/297/0` through 
 
 Pass `chunk_index_threshold=None` to `generate_rfs` to list every chunk in `refs` in memory as well.
 
+## TIFF Files
+
+`generate_rfs_tiff` builds references for a TIFF file with [tifffile](https://github.com/cgohlke/tifffile), which handles strips and tiles, multi-page series, and OME and other pyramids. Install it with `pip install zindi[tiff]`.
+
+```python
+from zindi import generate_rfs_tiff, open_rfs
+
+root = open_rfs(generate_rfs_tiff("stack.ome.tif"))
+frame = root["0"][100]      # series 0; a pyramid has its levels at "0/0", "0/1", ...
+```
+
+Series `i` is stored at path `"i"`, the layout bioformats2raw uses for OME-Zarr. The pages of an uncompressed stack are usually evenly spaced in the file, and then the whole series is one `gen` entry. TIFF deflate and zstd chunks are ordinary zlib and zstd streams, so they get the standard `numcodecs.zlib` and `zstd` codecs, which any Zarr library can decode. Other compressions, such as LZW, JPEG, and the horizontal predictor, use the Zarr codecs from imagecodecs, which zindi registers when it opens such a file. Other readers need imagecodecs too, and browser readers do not have them. Strips that do not divide the image evenly are read one page at a time when the pages are uncompressed and stored in one piece.
+
 ## Other File Formats
 
 `generate_rfs` is the generator for HDF5. Everything after it (the store, the directory format, chunk indexes, `gen`, and source checks) works for any format, and a generator for another format builds the same references with `RfsBuilder`. For a raw binary recording with 16 interleaved `int16` channels after a 12-byte header:
@@ -271,6 +284,7 @@ Set `merge_gap=0` to disable merging and fetch every chunk individually.
 zindi/
 ├── builder.py               # RfsBuilder and write_rfs, independent of the source format
 ├── hdf5.py                  # HDF5 → reference file system, through RfsBuilder
+├── tiff.py                  # TIFF → reference file system, through tifffile and RfsBuilder
 ├── open_rfs.py              # Open RFS as zarr.Group
 ├── rfs_store.py             # Zarr v3 Store backed by reference file system
 ├── chunk_index.py           # Byte-range indexes for arrays with many chunks
