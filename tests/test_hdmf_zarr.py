@@ -67,7 +67,7 @@ def nwb_pair(request, nwb_path, tmp_path_factory):
         rfs = generate_rfs(nwb_path)
     else:
         rfs = generate_rfs(nwb_path, chunk_index_threshold=10)
-        assert "acquisition/ElectricalSeries/data" in rfs["chunk_indexes"]
+        assert "acquisition/ElectricalSeries/data" in rfs["indexes"]
     if request.param == "directory":
         out = str(tmp_path_factory.mktemp("rfs") / "test.zindi")
         write_rfs(rfs, out)

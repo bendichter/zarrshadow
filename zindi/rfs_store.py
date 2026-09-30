@@ -56,7 +56,7 @@ class RfsStore(Store):
         ----------
         rfs : dict
             Reference file system dict with "refs" key, and optional
-            "templates" and "chunk_indexes".
+            "templates" and "indexes".
         local_cache : LocalCache or None
             Optional local cache for persisting remote chunk data on disk.
         merge_gap : int
@@ -79,7 +79,7 @@ class RfsStore(Store):
         self._session.headers["User-Agent"] = "Mozilla/5.0"
         self._indexes = {
             path: ChunkIndex(entry["url"], entry["index"])
-            for path, entry in rfs.get("chunk_indexes", {}).items()
+            for path, entry in rfs.get("indexes", {}).items()
         }
         self._children: dict[str, set[str]] | None = None
         self._array_meta: dict[str, dict | None] = {}

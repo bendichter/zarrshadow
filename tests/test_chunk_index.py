@@ -46,16 +46,16 @@ def rfs(h5_path):
 
 
 def test_indexed_arrays_have_no_chunk_refs(rfs):
-    assert set(rfs["chunk_indexes"]) == {"series", "matrix", "sparse"}
+    assert set(rfs["indexes"]) == {"series", "matrix", "sparse"}
     assert not any(k.startswith(("series/c/", "matrix/c/", "sparse/c/")) for k in rfs["refs"])
     assert any(k.startswith("small/c/") for k in rfs["refs"])
 
 
 def test_index_contents(rfs):
-    index = rfs["chunk_indexes"]["matrix"]["index"]
+    index = rfs["indexes"]["matrix"]["index"]
     assert index.shape == (30, 4, 2)
     assert index.dtype == np.uint64
-    sparse = rfs["chunk_indexes"]["sparse"]["index"]
+    sparse = rfs["indexes"]["sparse"]["index"]
     written = sparse[:, 0] != MISSING
     assert written.sum() == 11
     assert written[10:20].all() and written[90]
@@ -63,7 +63,7 @@ def test_index_contents(rfs):
 
 def test_threshold_none_lists_every_chunk(h5_path):
     rfs = generate_rfs(h5_path, chunk_index_threshold=None)
-    assert "chunk_indexes" not in rfs
+    assert "indexes" not in rfs
     assert sum(k.startswith("series/c/") for k in rfs["refs"]) == 500
 
 
@@ -96,11 +96,15 @@ def test_directory_layout(rfs, tmp_path):
     write_rfs(rfs, out)
     with open(os.path.join(out, "refs.json")) as f:
         header = json.load(f)
-    assert header["chunk_indexes"]["series"] == {"url": rfs["chunk_indexes"]["series"]["url"]}
+    assert header["version"] == 2
+    assert header["indexes"]["series"] == {
+        "url": rfs["indexes"]["series"]["url"],
+        "index": "index/series",
+    }
     arr = zarr.open_array(os.path.join(out, "index"), path="matrix", mode="r")
     assert arr.shape == (30, 4, 2)
     assert arr.chunks == (30, 4, 2)
-    np.testing.assert_array_equal(arr[...], rfs["chunk_indexes"]["matrix"]["index"])
+    np.testing.assert_array_equal(arr[...], rfs["indexes"]["matrix"]["index"])
     # Rewriting replaces the index arrays
     write_rfs(rfs, out)
 
@@ -165,3 +169,13 @@ def test_open_directory_over_http(rfs, h5_path, tmp_path):
         np.testing.assert_array_equal(root["matrix"][...], expected["matrix"])
     finally:
         server.shutdown()
+
+
+def test_index_path_must_stay_inside_directory(rfs, tmp_path):
+    out = tmp_path / "test.zindi"
+    write_rfs(rfs, str(out))
+    header = json.loads((out / "refs.json").read_text())
+    header["indexes"]["series"]["index"] = "../elsewhere/series"
+    (out / "refs.json").write_text(json.dumps(header))
+    with pytest.raises(ValueError, match="relative to refs.json"):
+        open_rfs(str(out))

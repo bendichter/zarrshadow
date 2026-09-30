@@ -65,12 +65,12 @@ def generate_rfs(
     -------
     dict
         A reference file system dict with keys "refs" and "version", and
-        "chunk_indexes" mapping array paths to {"url", "index"} when any array
-        is indexed.
+        "indexes" mapping array paths to {"url", "index"} when any array is
+        indexed, in which case "version" is 2.
     """
     refs: dict[str, Any] = {}
-    chunk_indexes: dict[str, dict] = {}
-    opts = {"chunk_indexes": chunk_indexes, "chunk_index_threshold": chunk_index_threshold}
+    indexes: dict[str, dict] = {}
+    opts = {"indexes": indexes, "chunk_index_threshold": chunk_index_threshold}
 
     if h5f is not None:
         _process_group(h5f, "", refs, hdf5_url_or_path, h5f, **opts)
@@ -88,9 +88,9 @@ def generate_rfs(
             _process_group(opened, "", refs, hdf5_url_or_path, opened, **opts)
 
     _add_dtype_attrs(refs)
-    rfs: dict[str, Any] = {"refs": refs, "version": 1}
-    if chunk_indexes:
-        rfs["chunk_indexes"] = chunk_indexes
+    rfs: dict[str, Any] = {"refs": refs, "version": 2 if indexes else 1}
+    if indexes:
+        rfs["indexes"] = indexes
     _apply_templates(rfs)
     return rfs
 
@@ -98,15 +98,17 @@ def generate_rfs(
 def write_rfs(rfs: dict, output_path: str) -> None:
     """Write a reference file system to disk.
 
-    A path ending in ".json" writes a single JSON file in which every chunk of
-    an indexed array is listed in refs. Any other path writes a directory
-    holding refs.json and, for each chunk index, a zarr v3 array under
-    index/<array path>. Opening the directory reads only refs.json; index
-    blocks are read when chunks are requested.
+    A path ending in ".json" writes a single version 1 reference file in which
+    every chunk of an indexed array is listed in refs, readable by any kerchunk
+    reader. Any other path writes a directory holding refs.json and, for each
+    chunk index, a zarr v3 array under index/<array path>. The "indexes" entry
+    in refs.json gives that path, relative to refs.json, and the file is marked
+    version 2 so that readers without index support refuse it. Opening the
+    directory reads only refs.json; index chunks are read when needed.
     """
     if output_path.endswith(".json"):
         with open(output_path, "w") as f:
-            json.dump(_expand_chunk_indexes(rfs), f, indent=2, sort_keys=True)
+            json.dump(_expand_indexes(rfs), f, indent=2, sort_keys=True)
         return
 
     refs_json = os.path.join(output_path, "refs.json")
@@ -117,15 +119,16 @@ def write_rfs(rfs: dict, output_path: str) -> None:
         shutil.rmtree(index_dir)
     os.makedirs(output_path, exist_ok=True)
 
-    chunk_indexes = rfs.get("chunk_indexes", {})
-    header = {k: v for k, v in rfs.items() if k != "chunk_indexes"}
-    if chunk_indexes:
-        header["chunk_indexes"] = {p: {"url": e["url"]} for p, e in chunk_indexes.items()}
+    indexes = rfs.get("indexes", {})
+    header = {k: v for k, v in rfs.items() if k != "indexes"}
+    if indexes:
+        header["version"] = 2
+        header["indexes"] = {p: {"url": e["url"], "index": f"index/{p}"} for p, e in indexes.items()}
     with open(refs_json, "w") as f:
         json.dump(header, f, indent=2, sort_keys=True)
 
     store = zarr.storage.LocalStore(index_dir)
-    for path, entry in chunk_indexes.items():
+    for path, entry in indexes.items():
         data = np.asarray(ChunkIndex(entry["url"], entry["index"]).array[...])
         arr = zarr.create_array(
             store,
@@ -140,10 +143,10 @@ def write_rfs(rfs: dict, output_path: str) -> None:
         arr[...] = data
 
 
-def _expand_chunk_indexes(rfs: dict) -> dict:
-    """Return a copy of rfs with every indexed chunk listed in refs."""
-    chunk_indexes = rfs.get("chunk_indexes")
-    if not chunk_indexes:
+def _expand_indexes(rfs: dict) -> dict:
+    """Return a version 1 copy of rfs with every indexed chunk listed in refs."""
+    indexes = rfs.get("indexes")
+    if not indexes:
         return rfs
     templates = rfs.get("templates", {})
 
@@ -156,10 +159,11 @@ def _expand_chunk_indexes(rfs: dict) -> dict:
         key: [expand(val[0]), val[1], val[2]] if isinstance(val, list) and len(val) == 3 else val
         for key, val in rfs["refs"].items()
     }
-    for path, entry in chunk_indexes.items():
+    for path, entry in indexes.items():
         for coords, offset, nbytes in ChunkIndex(entry["url"], entry["index"]).iter_chunks():
             refs[f"{path}/c/" + "/".join(map(str, coords))] = [entry["url"], offset, nbytes]
-    out = {k: v for k, v in rfs.items() if k not in ("chunk_indexes", "templates", "refs")}
+    out = {k: v for k, v in rfs.items() if k not in ("indexes", "templates", "refs")}
+    out["version"] = 1
     out["refs"] = refs
     _apply_templates(out)
     return out
@@ -244,7 +248,7 @@ def _process_dataset(
     url: str,
     h5f: h5py.File,
     *,
-    chunk_indexes: dict,
+    indexes: dict,
     chunk_index_threshold: int | None,
 ) -> None:
     """Process an HDF5 dataset, adding zarr v3 array metadata and chunk refs."""
@@ -301,7 +305,7 @@ def _process_dataset(
 
     # Add chunk references
     if np.prod(ds.shape) > 0:
-        _add_chunk_refs(ds, path, refs, url, chunk_indexes, chunk_index_threshold)
+        _add_chunk_refs(ds, path, refs, url, indexes, chunk_index_threshold)
 
 
 def _process_inline_dataset(
@@ -505,7 +509,7 @@ def _add_chunk_refs(
     path: str,
     refs: dict,
     url: str,
-    chunk_indexes: dict,
+    indexes: dict,
     chunk_index_threshold: int | None,
 ) -> None:
     """Add chunk references, or a chunk index, for a non-inline dataset."""
@@ -514,7 +518,7 @@ def _add_chunk_refs(
         chunk_size = ds.chunks
         num_chunks = get_max_num_chunks(shape=ds.shape, chunk_size=chunk_size)
         if chunk_index_threshold is not None and num_chunks > chunk_index_threshold:
-            _add_chunk_index(ds, path, url, chunk_indexes, num_chunks)
+            _add_chunk_index(ds, path, url, indexes, num_chunks)
             return
         pbar = tqdm(
             total=num_chunks,
@@ -546,7 +550,7 @@ def _add_chunk_index(
     ds: h5py.Dataset,
     path: str,
     url: str,
-    chunk_indexes: dict,
+    indexes: dict,
     num_chunks: int,
 ) -> None:
     """Record a dataset's chunk byte ranges in an index array."""
@@ -562,7 +566,7 @@ def _add_chunk_index(
 
         apply_to_all_chunk_info(ds, store_chunk_info)
 
-    chunk_indexes[path] = {"url": url, "index": build_index(grid_shape, for_each_chunk)}
+    indexes[path] = {"url": url, "index": build_index(grid_shape, for_each_chunk)}
     pbar.close()
 
 

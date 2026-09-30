@@ -60,8 +60,9 @@ def open_rfs(
 def load_rfs(location: str) -> dict:
     """Load an RFS dict from a JSON file or RFS directory, local or remote.
 
-    For a directory, chunk indexes are not read here. Each "chunk_indexes"
-    entry gets an "index" callable that opens the index array on first use.
+    For a directory, chunk indexes are not read here. Each "indexes" entry's
+    "index" path, relative to refs.json, is replaced by a callable that opens the
+    index array on first use.
     """
     is_url = location.startswith(("http://", "https://"))
     if location.endswith(".json"):
@@ -69,17 +70,26 @@ def load_rfs(location: str) -> dict:
 
     base = location.rstrip("/")
     rfs = _read_json(f"{base}/refs.json", is_url)
-    chunk_indexes = rfs.get("chunk_indexes")
-    if chunk_indexes:
+    indexes = rfs.get("indexes")
+    if indexes:
         if is_url:
             from .http_store import HttpStore
 
-            index_store: Any = HttpStore(f"{base}/index")
+            index_store: Any = HttpStore(base)
         else:
-            index_store = zarr.storage.LocalStore(os.path.join(base, "index"), read_only=True)
-        for path, entry in chunk_indexes.items():
-            entry["index"] = lambda p=path: zarr.open_array(index_store, path=p, mode="r")
+            index_store = zarr.storage.LocalStore(base, read_only=True)
+        for path, entry in indexes.items():
+            index_path = _check_relative_path(entry["index"])
+            entry["index"] = lambda p=index_path: zarr.open_array(index_store, path=p, mode="r")
     return rfs
+
+
+def _check_relative_path(path: str) -> str:
+    """Refuse index paths that would leave the directory holding refs.json."""
+    parts = path.split("/")
+    if path.startswith("/") or ".." in parts or "://" in path:
+        raise ValueError(f"index path must be relative to refs.json: {path!r}")
+    return path
 
 
 def _read_json(location: str, is_url: bool) -> dict:
