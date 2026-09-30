@@ -1,10 +1,13 @@
 """Generate a zarr v3 reference file system (RFS) from an HDF5 file.
 
-The RFS is a JSON-serializable dict that describes the HDF5 file's group/array
-hierarchy using zarr v3 metadata, with chunk references pointing to byte ranges
-in the original HDF5 file. This allows zarr to read HDF5 data without copying.
+This is zindi's generator for HDF5, including NWB files and MATLAB v7.3 .mat
+files. It walks the file with h5py and describes it through RfsBuilder: Zarr
+v3 metadata for every group and array, small datasets inline, and the byte
+range of every chunk in the original file, so zarr reads the data without
+copying it.
 
-The RFS follows the unified convention from:
+HDF5 features that Zarr lacks (links, object references, compound types,
+scalars) follow the unified convention shared with hdmf-zarr:
   https://github.com/NeurodataWithoutBorders/lindi/issues/125
   https://github.com/hdmf-dev/hdmf-zarr/issues/335
 """
@@ -13,27 +16,23 @@ from __future__ import annotations
 
 import base64
 import json
-import os
-import shutil
-import warnings
 from typing import Any, Callable
 
 import h5py
 import numpy as np
-import zarr
 from tqdm import tqdm
-from zarr.codecs import BloscCodec
 
 from .attr_conversion import h5_attr_to_zarr
-from .chunk_index import MISSING, ChunkIndex, build_index, index_block_shape
+from .builder import DEFAULT_CODECS, RfsBuilder
+from .chunk_index import build_index
 from .h5_chunk_utils import (
     apply_to_all_chunk_info,
     get_byte_range_for_contiguous_dataset,
     get_max_num_chunks,
 )
-from .gen import Generator
 from .h5_filters_to_codecs import h5_filters_to_codec_pipeline
-from .sources import describe_source
+
+STRING_CODECS = [{"name": "vlen-utf8", "configuration": {}}]
 
 
 def generate_rfs(
@@ -84,19 +83,15 @@ def generate_rfs(
         indexed, and "gen" when any contiguous dataset is split. Either makes
         "version" 2.
     """
-    refs: dict[str, Any] = {}
-    indexes: dict[str, dict] = {}
-    gens: list[dict] = []
-    opts = {
-        "indexes": indexes,
+    builder = RfsBuilder()
+    opts: dict[str, Any] = {
         "chunk_index_threshold": chunk_index_threshold,
-        "gen": gens,
         "contiguous_chunk_bytes": contiguous_chunk_bytes,
     }
 
     def process(opened: h5py.File, raw_source: str) -> None:
         opts["offset_shift"] = _detect_offset_shift(opened, _raw_reader(raw_source))
-        _process_group(opened, "", refs, hdf5_url_or_path, opened, **opts)
+        _process_group(opened, "", builder, hdf5_url_or_path, opened, **opts)
 
     if h5f is not None:
         process(h5f, hdf5_url_or_path)
@@ -113,134 +108,30 @@ def generate_rfs(
         with h5py.File(hdf5_url_or_path, "r") as opened:
             process(opened, hdf5_url_or_path)
 
-    _add_dtype_attrs(refs)
-    rfs: dict[str, Any] = {"refs": refs, "version": 2 if (indexes or gens) else 1}
-    if indexes:
-        rfs["indexes"] = indexes
-    if gens:
-        rfs["gen"] = gens
-    if record_sources:
-        rfs["sources"] = _describe_sources(rfs)
-    _apply_templates(rfs)
-    return rfs
-
-
-def write_rfs(rfs: dict, output_path: str) -> None:
-    """Write a reference file system to disk.
-
-    A path ending in ".json" writes a single version 1 reference file in which
-    every chunk of an indexed array is listed in refs, readable by any kerchunk
-    reader. Any other path writes a directory holding refs.json and, for each
-    chunk index, a zarr v3 array under index/<array path>. The "indexes" entry
-    in refs.json gives that path, relative to refs.json, and the file is marked
-    version 2 so that readers without index support refuse it. Opening the
-    directory reads only refs.json; index chunks are read when needed.
-    """
-    if output_path.endswith(".json"):
-        with open(output_path, "w") as f:
-            json.dump(_to_version1(rfs), f, indent=2, sort_keys=True)
-        return
-
-    refs_json = os.path.join(output_path, "refs.json")
-    if os.path.isdir(output_path) and os.listdir(output_path) and not os.path.exists(refs_json):
-        raise FileExistsError(f"{output_path} exists and is not a zindi RFS directory")
-    index_dir = os.path.join(output_path, "index")
-    if os.path.isdir(index_dir):
-        shutil.rmtree(index_dir)
-    os.makedirs(output_path, exist_ok=True)
-
-    indexes = rfs.get("indexes", {})
-    header = {k: v for k, v in rfs.items() if k != "indexes"}
-    if indexes:
-        header["version"] = 2
-        header["indexes"] = {p: {"url": e["url"], "index": f"index/{p}"} for p, e in indexes.items()}
-    with open(refs_json, "w") as f:
-        json.dump(header, f, indent=2, sort_keys=True)
-
-    store = zarr.storage.LocalStore(index_dir)
-    for path, entry in indexes.items():
-        data = np.asarray(ChunkIndex(entry["url"], entry["index"]).array[...])
-        arr = zarr.create_array(
-            store,
-            name=path,
-            shape=data.shape,
-            dtype="uint64",
-            chunks=(*index_block_shape(data.shape[:-1]), 2),
-            fill_value=int(MISSING),
-            compressors=BloscCodec(cname="zstd", clevel=5, shuffle="shuffle", typesize=8),
-            zarr_format=3,
-        )
-        arr[...] = data
-
-
-def _to_version1(rfs: dict) -> dict:
-    """Return a version 1 copy of rfs with every indexed or generated chunk listed in refs.
-
-    fsspec skips "gen" entries unless asked not to, so they are expanded too.
-    """
-    indexes = rfs.get("indexes", {})
-    gens = rfs.get("gen", [])
-    if not indexes and not gens:
-        return rfs
-    templates = rfs.get("templates", {})
-
-    def expand(url: str) -> str:
-        for key, value in templates.items():
-            url = url.replace("{{" + key + "}}", value)
-        return url
-
-    refs = {
-        key: [expand(val[0]), val[1], val[2]] if isinstance(val, list) and len(val) == 3 else val
-        for key, val in rfs["refs"].items()
-    }
-    for path, entry in indexes.items():
-        for coords, offset, nbytes in ChunkIndex(entry["url"], entry["index"]).iter_chunks():
-            refs[f"{path}/c/" + "/".join(map(str, coords))] = [entry["url"], offset, nbytes]
-    for entry in gens:
-        for key, ref in Generator(entry, templates).items():
-            refs[key] = ref
-    out = {k: v for k, v in rfs.items() if k not in ("indexes", "gen", "templates", "refs")}
-    out["version"] = 1
-    out["refs"] = refs
-    _apply_templates(out)
-    return out
+    _add_dtype_attrs(builder.refs)
+    return builder.build(record_sources=record_sources)
 
 
 # ---------------------------------------------------------------------------
-# Internal: recursive group/dataset processing
+# Walking the file
 # ---------------------------------------------------------------------------
-
-
-def _chunk_key(ndim: int) -> str:
-    """Build the zarr v3 chunk key for the first chunk of an array.
-
-    A zero-dimensional array has a single chunk keyed "c". An array with
-    ndim dimensions keys its first chunk "c/0/.../0" with one index per
-    dimension.
-    """
-    if ndim == 0:
-        return "c"
-    return "c/" + "/".join(["0"] * ndim)
 
 
 def _process_group(
     item: h5py.Group,
     path: str,
-    refs: dict,
+    builder: RfsBuilder,
     url: str,
     h5f: h5py.File,
     **opts: Any,
 ) -> None:
-    """Process an HDF5 group, adding zarr v3 metadata to refs."""
-    # Check for soft link - if so, record in parent's _LINKS and skip children
+    """Add a group's metadata, then its children."""
+    # A soft link is recorded in its parent's _LINKS; don't recurse into the target
     if path:
         link = h5f.get("/" + path, getlink=True)
         if isinstance(link, h5py.SoftLink):
-            # Soft links are handled via _LINKS on the parent group
-            # (added by the parent's processing). Don't recurse into the target.
             return
 
-    # Build group zarr.json
     attrs = _collect_attrs(item, h5f=h5f, label=path or "(root)")
 
     # hdmf-zarr stores the root .specloc as a plain path, not a reference
@@ -248,374 +139,195 @@ def _process_group(
     if not path and isinstance(specloc, dict) and "_REFERENCE" in specloc:
         attrs[".specloc"] = specloc["_REFERENCE"]["path"].lstrip("/")
 
-    # Collect _LINKS for any child soft links (unified convention)
     links = _collect_child_links(item, h5f)
     if links:
         attrs["_LINKS"] = links
 
-    group_meta = {
-        "zarr_format": 3,
-        "node_type": "group",
-        "attributes": attrs,
-    }
-    meta_key = f"{path}/zarr.json" if path else "zarr.json"
-    refs[meta_key] = json.dumps(group_meta, separators=(",", ":"))
+    builder.add_group(path, attrs)
 
-    # Process children
     for name in item.keys():
         child_path = f"{path}/{name}" if path else name
-
-        # Check if this child is a soft link
-        child_link = h5f.get("/" + child_path, getlink=True)
-        if isinstance(child_link, h5py.SoftLink):
-            # Already recorded in parent _LINKS; skip
-            continue
-
+        if isinstance(h5f.get("/" + child_path, getlink=True), h5py.SoftLink):
+            continue  # already recorded in _LINKS
         child = item[name]
         if isinstance(child, h5py.Group):
-            _process_group(child, child_path, refs, url, h5f, **opts)
+            _process_group(child, child_path, builder, url, h5f, **opts)
         elif isinstance(child, h5py.Dataset):
-            _process_dataset(child, child_path, refs, url, h5f, **opts)
+            _process_dataset(child, child_path, builder, url, h5f, **opts)
 
 
 def _process_dataset(
     ds: h5py.Dataset,
     path: str,
-    refs: dict,
+    builder: RfsBuilder,
     url: str,
     h5f: h5py.File,
     *,
-    indexes: dict,
     chunk_index_threshold: int | None,
-    gen: list,
     contiguous_chunk_bytes: int | None,
     offset_shift: int,
 ) -> None:
-    """Process an HDF5 dataset, adding zarr v3 array metadata and chunk refs."""
+    """Add a dataset's metadata and chunk locations, or its data inline."""
     attrs = _collect_attrs(ds, h5f=h5f, label=path)
 
-    shape = list(ds.shape)
-    dtype = ds.dtype
-    is_scalar = ds.ndim == 0
-
-    # Determine if this should be inlined
-    inline = _should_inline(ds)
-
-    if inline:
-        _process_inline_dataset(ds, path, refs, attrs, is_scalar, h5f)
+    if _should_inline(ds):
+        _process_inline_dataset(ds, path, builder, attrs, h5f)
         return
 
-    # Build codec pipeline
-    codec_pipeline = h5_filters_to_codec_pipeline(ds)
-
-    # Determine chunks
     if ds.chunks:
         chunks = list(ds.chunks)
     else:
         chunks = _contiguous_chunk_shape(ds.shape, ds.dtype.itemsize, contiguous_chunk_bytes)
-    # Zarr doesn't allow zero-size chunks
-    chunks = [max(c, 1) for c in chunks]
+    chunks = [max(c, 1) for c in chunks]  # Zarr doesn't allow zero-size chunks
 
-    # Zarr v3 data_type
-    if dtype.kind == "V" and dtype.fields is not None:
-        # Compound dtype — zarr v3's structured data_type carries field info natively
-        data_type = _compound_dtype_to_zarr_v3(dtype)
-        fill_value = _encode_compound_fill_value(dtype)
+    if ds.dtype.kind == "V" and ds.dtype.fields is not None:
+        # Compound: zarr v3's structured data_type carries the fields
+        data_type: str | dict = _compound_dtype_to_zarr_v3(ds.dtype)
+        fill_value = _encode_compound_fill_value(ds.dtype)
     else:
-        data_type = _numpy_dtype_to_zarr_v3(dtype)
-        fill_value = _encode_fill_value(ds.fillvalue, dtype)
+        data_type = _numpy_dtype_to_zarr_v3(ds.dtype)
+        fill_value = _encode_fill_value(ds.fillvalue, ds.dtype)
 
-    array_meta: dict[str, Any] = {
-        "zarr_format": 3,
-        "node_type": "array",
-        "shape": shape,
-        "data_type": data_type,
-        "chunk_grid": {
-            "name": "regular",
-            "configuration": {"chunk_shape": chunks},
-        },
-        "chunk_key_encoding": {
-            "name": "default",
-            "configuration": {"separator": "/"},
-        },
-        "fill_value": fill_value,
-        "codecs": codec_pipeline,
-        "attributes": attrs,
-        "storage_transformers": [],
-    }
-
-    refs[f"{path}/zarr.json"] = json.dumps(array_meta, separators=(",", ":"))
-
-    # Add chunk references
+    builder.add_array(
+        path,
+        shape=ds.shape,
+        data_type=data_type,
+        chunk_shape=chunks,
+        codecs=h5_filters_to_codec_pipeline(ds),
+        fill_value=fill_value,
+        attributes=attrs,
+    )
     if np.prod(ds.shape) > 0:
-        _add_chunk_refs(ds, path, refs, url, indexes, chunk_index_threshold, gen, chunks, offset_shift)
+        _add_chunk_refs(ds, path, builder, url, chunk_index_threshold, chunks, offset_shift)
 
 
 def _process_inline_dataset(
     ds: h5py.Dataset,
     path: str,
-    refs: dict,
+    builder: RfsBuilder,
     attrs: dict,
-    is_scalar: bool,
     h5f: h5py.File,
 ) -> None:
-    """Process a small dataset by inlining its data."""
+    """Store a small dataset, string data, or references in the RFS itself."""
     data = ds[()]
+    origin = [0] * ds.ndim
 
-    if is_scalar:
-        shape = []
+    def add_strings(strings: list[str], shape: list[int]) -> None:
+        builder.add_array(
+            path, shape=shape, data_type="string", chunk_shape=shape,
+            codecs=STRING_CODECS, fill_value="", attributes=attrs,
+        )
+        builder.add_inline_chunk(path, origin, _encode_vlen_utf8(strings))
+
+    if ds.ndim == 0:
         if isinstance(data, h5py.Reference):
-            # Scalar object reference — store target path as plain string
+            # Scalar object reference: the target path as a string
             attrs["_DTYPE"] = "object_reference"
-            target = h5f[data]
-            array_meta = _make_string_array_meta(shape, attrs)
-            refs[f"{path}/zarr.json"] = json.dumps(array_meta, separators=(",", ":"))
-            chunk_bytes = _encode_vlen_utf8([target.name])
-            chunk_key = _chunk_key(len(shape))
-            refs[f"{path}/{chunk_key}"] = (
-                "base64:" + base64.b64encode(chunk_bytes).decode("ascii")
-            )
+            add_strings([h5f[data].name], [])
             return
         if isinstance(data, bytes):
             data = data.decode("utf-8")
         if isinstance(data, str):
-            # String scalar
-            array_meta = _make_string_array_meta(shape, attrs)
-            refs[f"{path}/zarr.json"] = json.dumps(array_meta, separators=(",", ":"))
-            chunk_bytes = _encode_vlen_utf8([data])
-            chunk_key = _chunk_key(len(shape))
-            refs[f"{path}/{chunk_key}"] = (
-                "base64:" + base64.b64encode(chunk_bytes).decode("ascii")
-            )
+            add_strings([data], [])
             return
-        else:
-            data = np.asarray(data)
+        data = np.asarray(data)
     else:
         if h5py.check_dtype(ref=ds.dtype) == h5py.Reference:
-            # Object reference array — store target paths as plain strings
-            data = ds[...]
-            path_strs = []
-            for item in np.nditer(data, flags=["refs_ok"]):
+            # Object reference array: target paths as strings
+            paths = []
+            for item in np.nditer(ds[...], flags=["refs_ok"]):
                 val = item.item()
-                if isinstance(val, h5py.Reference):
-                    target = h5f[val]
-                    path_strs.append(target.name)
-                else:
-                    path_strs.append("")
-
-            shape = list(ds.shape)
+                paths.append(h5f[val].name if isinstance(val, h5py.Reference) else "")
             attrs["_DTYPE"] = "object_reference"
-            array_meta = _make_string_array_meta(shape, attrs)
-            refs[f"{path}/zarr.json"] = json.dumps(array_meta, separators=(",", ":"))
-
-            chunk_bytes = _encode_vlen_utf8(path_strs)
-            chunk_key = _chunk_key(ds.ndim)
-            refs[f"{path}/{chunk_key}"] = (
-                "base64:" + base64.b64encode(chunk_bytes).decode("ascii")
-            )
+            add_strings(paths, list(ds.shape))
             return
 
         if ds.dtype.kind in ("O", "U", "S"):
-            # String array
-            data = ds[...]
-            str_data = []
-            for item in np.nditer(data, flags=["refs_ok"]):
+            strings = []
+            for item in np.nditer(ds[...], flags=["refs_ok"]):
                 val = item.item()
                 if isinstance(val, bytes):
                     val = val.decode("utf-8")
-                str_data.append(str(val) if val is not None else "")
-
-            shape = list(ds.shape)
-            array_meta = _make_string_array_meta(shape, attrs)
-            refs[f"{path}/zarr.json"] = json.dumps(array_meta, separators=(",", ":"))
-
-            chunk_bytes = _encode_vlen_utf8(str_data)
-            chunk_key = _chunk_key(ds.ndim)
-            refs[f"{path}/{chunk_key}"] = (
-                "base64:" + base64.b64encode(chunk_bytes).decode("ascii")
-            )
+                strings.append(str(val) if val is not None else "")
+            add_strings(strings, list(ds.shape))
             return
 
-    # Compound inline data
     if ds.dtype.kind == "V" and ds.dtype.fields is not None:
-        shape = list(data.shape)
+        # Compound: reference fields become path strings
         dtype = data.dtype
-
-        # Check for reference fields — resolve to path strings
         ref_fields = _get_reference_fields(dtype)
         if ref_fields:
             data, dtype = _resolve_compound_references(data, dtype, ref_fields, h5f)
             attrs["_REFERENCE_FIELDS"] = ref_fields
-
-        data_type = _compound_dtype_to_zarr_v3(dtype)
+        data_type: str | dict = _compound_dtype_to_zarr_v3(dtype)
         fill_value = _encode_compound_fill_value(dtype)
+    else:
+        dtype = data.dtype
+        data_type = _numpy_dtype_to_zarr_v3(dtype)
+        fill_value = _encode_fill_value(ds.fillvalue, dtype)
 
-        codec_pipeline = [
-            {"name": "bytes", "configuration": {"endian": "little"}}
-        ]
-
-        array_meta: dict[str, Any] = {
-            "zarr_format": 3,
-            "node_type": "array",
-            "shape": shape,
-            "data_type": data_type,
-            "chunk_grid": {
-                "name": "regular",
-                "configuration": {"chunk_shape": shape},
-            },
-            "chunk_key_encoding": {
-                "name": "default",
-                "configuration": {"separator": "/"},
-            },
-            "fill_value": fill_value,
-            "codecs": codec_pipeline,
-            "attributes": attrs,
-            "storage_transformers": [],
-        }
-
-        refs[f"{path}/zarr.json"] = json.dumps(array_meta, separators=(",", ":"))
-
-        # Ensure little-endian byte order
-        if dtype.byteorder == ">":
-            data = data.astype(dtype.newbyteorder("<"))
-        chunk_bytes = data.tobytes()
-        chunk_key = _chunk_key(len(shape))
-        _add_inline_ref(refs, f"{path}/{chunk_key}", chunk_bytes)
-        return
-
-    # Numeric inline data
     shape = list(data.shape)
-    dtype = data.dtype
-    data_type = _numpy_dtype_to_zarr_v3(dtype)
-    fill_value = _encode_fill_value(ds.fillvalue, dtype)
-
-    codec_pipeline = [
-        {"name": "bytes", "configuration": {"endian": "little"}}
-    ]
-
-    array_meta: dict[str, Any] = {
-        "zarr_format": 3,
-        "node_type": "array",
-        "shape": shape,
-        "data_type": data_type,
-        "chunk_grid": {
-            "name": "regular",
-            "configuration": {"chunk_shape": shape},
-        },
-        "chunk_key_encoding": {
-            "name": "default",
-            "configuration": {"separator": "/"},
-        },
-        "fill_value": fill_value,
-        "codecs": codec_pipeline,
-        "attributes": attrs,
-        "storage_transformers": [],
-    }
-
-    refs[f"{path}/zarr.json"] = json.dumps(array_meta, separators=(",", ":"))
-
-    # Inline the chunk data
-    # Ensure little-endian byte order
+    builder.add_array(
+        path, shape=shape, data_type=data_type, chunk_shape=shape,
+        codecs=DEFAULT_CODECS, fill_value=fill_value, attributes=attrs,
+    )
     if dtype.byteorder == ">":
         data = data.astype(dtype.newbyteorder("<"))
-    chunk_bytes = data.tobytes()
-    chunk_key = _chunk_key(len(shape))
-    _add_inline_ref(refs, f"{path}/{chunk_key}", chunk_bytes)
-
-
-def _make_string_array_meta(shape: list[int], attrs: dict) -> dict:
-    """Create zarr v3 array metadata for a string array."""
-    return {
-        "zarr_format": 3,
-        "node_type": "array",
-        "shape": shape,
-        "data_type": "string",
-        "chunk_grid": {
-            "name": "regular",
-            "configuration": {"chunk_shape": shape},
-        },
-        "chunk_key_encoding": {
-            "name": "default",
-            "configuration": {"separator": "/"},
-        },
-        "fill_value": "",
-        "codecs": [
-            {"name": "vlen-utf8", "configuration": {}},
-        ],
-        "attributes": attrs,
-        "storage_transformers": [],
-    }
+    builder.add_inline_chunk(path, [0] * len(shape), data.tobytes())
 
 
 def _add_chunk_refs(
     ds: h5py.Dataset,
     path: str,
-    refs: dict,
+    builder: RfsBuilder,
     url: str,
-    indexes: dict,
     chunk_index_threshold: int | None,
-    gen: list,
     chunk_shape: list[int],
     offset_shift: int = 0,
 ) -> None:
-    """Add chunk references, a chunk index, or a gen entry for a non-inline dataset.
+    """Add a dataset's chunk locations: one ref each, a chunk index, or strided slabs.
 
     offset_shift is added to every byte offset h5py reports (see _detect_offset_shift).
     """
     if ds.chunks is not None:
-        # Chunked dataset
         chunk_size = ds.chunks
         num_chunks = get_max_num_chunks(shape=ds.shape, chunk_size=chunk_size)
         if chunk_index_threshold is not None and num_chunks > chunk_index_threshold:
-            _add_chunk_index(ds, path, url, indexes, num_chunks, offset_shift)
+            _add_chunk_index(ds, path, builder, url, num_chunks, offset_shift)
             return
-        pbar = tqdm(
-            total=num_chunks,
-            desc=f"Chunk refs for {path}",
-            leave=True,
-            delay=2,
-        )
+        pbar = tqdm(total=num_chunks, desc=f"Chunk refs for {path}", leave=True, delay=2)
 
         def store_chunk_info(chunk_info: Any) -> None:
-            chunk_offset = chunk_info.chunk_offset
-            byte_offset = chunk_info.byte_offset
-            byte_count = chunk_info.size
-            # zarr v3 chunk key: c/<idx0>/<idx1>/...
-            indices = [str(a // b) for a, b in zip(chunk_offset, chunk_size)]
-            chunk_key = f"{path}/c/" + "/".join(indices)
-            refs[chunk_key] = [url, byte_offset + offset_shift, byte_count]
+            coords = [a // b for a, b in zip(chunk_info.chunk_offset, chunk_size)]
+            builder.add_chunk(path, coords, url, chunk_info.byte_offset + offset_shift, chunk_info.size)
             pbar.update()
 
         apply_to_all_chunk_info(ds, store_chunk_info)
         pbar.close()
-    else:
-        # Contiguous dataset: one chunk, or equal slabs along the first axis
-        byte_offset, byte_count = get_byte_range_for_contiguous_dataset(ds)
-        byte_offset += offset_shift
-        if ds.ndim == 0 or chunk_shape[0] >= ds.shape[0]:
-            refs[f"{path}/{_chunk_key(ds.ndim)}"] = [url, byte_offset, byte_count]
-            return
-        slab = chunk_shape[0] * int(np.prod(ds.shape[1:])) * ds.dtype.itemsize
-        n_slabs = -(-ds.shape[0] // chunk_shape[0])
-        # Every chunk a reader decodes must be full size. A short last slab is
-        # read at full length when the file extends that far: zarr discards the
-        # part of an edge chunk past the end of the array. Only a dataset that
-        # ends within one slab of the end of the file keeps a short last ref,
-        # which RfsStore pads.
-        last = byte_offset + (n_slabs - 1) * slab
-        full_last = ds.shape[0] % chunk_shape[0] == 0 or last + slab <= ds.file.id.get_filesize()
-        n_generated = n_slabs if full_last else n_slabs - 1
-        rest = "/0" * (ds.ndim - 1)
-        if n_generated:
-            gen.append({
-                "key": f"{path}/c/{{{{i}}}}{rest}",
-                "url": url,
-                "offset": f"{{{{{byte_offset} + i * {slab}}}}}",
-                "length": str(slab),
-                "dimensions": {"i": {"stop": n_generated}},
-            })
-        if not full_last:
-            refs[f"{path}/c/{n_slabs - 1}{rest}"] = [url, last, byte_offset + byte_count - last]
+        return
+
+    # Contiguous dataset: one chunk, or equal slabs along the first axis
+    byte_offset, byte_count = get_byte_range_for_contiguous_dataset(ds)
+    byte_offset += offset_shift
+    origin = [0] * ds.ndim
+    if ds.ndim == 0 or chunk_shape[0] >= ds.shape[0]:
+        builder.add_chunk(path, origin, url, byte_offset, byte_count)
+        return
+    slab = chunk_shape[0] * int(np.prod(ds.shape[1:])) * ds.dtype.itemsize
+    n_slabs = -(-ds.shape[0] // chunk_shape[0])
+    # Every chunk a reader decodes must be full size. A short last slab is
+    # read at full length when the file extends that far: zarr discards the
+    # part of an edge chunk past the end of the array. Only a dataset that
+    # ends within one slab of the end of the file keeps a short last ref,
+    # which RfsStore pads.
+    last = byte_offset + (n_slabs - 1) * slab
+    full_last = ds.shape[0] % chunk_shape[0] == 0 or last + slab <= ds.file.id.get_filesize()
+    builder.add_strided_chunks(
+        path, ndim=ds.ndim, url=url, start=byte_offset, stride=slab, length=slab,
+        count=n_slabs if full_last else n_slabs - 1,
+    )
+    if not full_last:
+        builder.add_chunk(path, [n_slabs - 1] + origin[1:], url, last, byte_offset + byte_count - last)
 
 
 def _contiguous_chunk_shape(
@@ -639,8 +351,8 @@ def _contiguous_chunk_shape(
 def _add_chunk_index(
     ds: h5py.Dataset,
     path: str,
+    builder: RfsBuilder,
     url: str,
-    indexes: dict,
     num_chunks: int,
     offset_shift: int = 0,
 ) -> None:
@@ -657,8 +369,13 @@ def _add_chunk_index(
 
         apply_to_all_chunk_info(ds, store_chunk_info)
 
-    indexes[path] = {"url": url, "index": build_index(grid_shape, for_each_chunk)}
+    builder.add_index(path, url, build_index(grid_shape, for_each_chunk))
     pbar.close()
+
+
+# ---------------------------------------------------------------------------
+# Byte offsets in files with a userblock
+# ---------------------------------------------------------------------------
 
 
 def _raw_reader(path_or_url: str) -> Callable[[int, int], bytes]:
@@ -727,7 +444,7 @@ def _detect_offset_shift(h5f: h5py.File, read_bytes: Callable[[int, int], bytes]
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Attributes, links, and types
 # ---------------------------------------------------------------------------
 
 
@@ -815,7 +532,7 @@ def _compound_dtype_to_zarr_v3(dtype: np.dtype) -> dict:
     for field_name in dtype.names:
         field_dtype = dtype[field_name]
         if field_dtype.kind == "S":
-            zarr_type = {
+            zarr_type: str | dict = {
                 "name": "null_terminated_bytes",
                 "configuration": {"length_bytes": field_dtype.itemsize},
             }
@@ -940,17 +657,6 @@ def _encode_vlen_utf8(strings: list[str]) -> bytes:
     return b"".join(parts)
 
 
-def _add_inline_ref(refs: dict, key: str, data: bytes) -> None:
-    """Add inline data to refs, base64-encoding if needed."""
-    if data.startswith(b"base64:"):
-        refs[key] = "base64:" + base64.b64encode(data).decode("ascii")
-    else:
-        try:
-            refs[key] = data.decode("ascii")
-        except UnicodeDecodeError:
-            refs[key] = "base64:" + base64.b64encode(data).decode("ascii")
-
-
 def _add_dtype_attrs(refs: dict) -> None:
     """Set the _DTYPE attribute on every non-compound array, as hdmf-zarr does.
 
@@ -971,50 +677,3 @@ def _add_dtype_attrs(refs: dict) -> None:
             continue
         attrs["_DTYPE"] = "str" if data_type == "string" else data_type
         refs[key] = json.dumps(meta, separators=(",", ":"))
-
-
-def _describe_sources(rfs: dict) -> dict:
-    """Size and ETag of every file the refs and indexes point into."""
-    urls = {val[0] for val in rfs["refs"].values() if isinstance(val, list) and len(val) == 3}
-    urls |= {entry["url"] for entry in rfs.get("indexes", {}).values()}
-    urls |= {entry["url"] for entry in rfs.get("gen", [])}
-    sources = {}
-    for url in sorted(urls):
-        try:
-            sources[url] = describe_source(url)
-        except Exception as e:
-            warnings.warn(f"Could not describe source {url}: {e}")
-    return sources
-
-
-def _apply_templates(rfs: dict) -> None:
-    """Replace frequently-used URLs with template placeholders."""
-    refs = rfs["refs"]
-    url_counts: dict[str, int] = {}
-    for val in refs.values():
-        if isinstance(val, list) and len(val) == 3:
-            url = val[0]
-            url_counts[url] = url_counts.get(url, 0) + 1
-
-    templates: dict[str, str] = {}
-    template_idx = 0
-    for url, count in url_counts.items():
-        if count >= 5:
-            template_key = f"u{template_idx}"
-            templates[template_key] = url
-            template_idx += 1
-
-    if not templates:
-        return
-
-    # Build reverse lookup
-    url_to_template = {url: key for key, url in templates.items()}
-
-    # Replace URLs with template references
-    for ref_key, val in refs.items():
-        if isinstance(val, list) and len(val) == 3:
-            url = val[0]
-            if url in url_to_template:
-                val[0] = "{{" + url_to_template[url] + "}}"
-
-    rfs["templates"] = templates
