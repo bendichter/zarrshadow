@@ -13,19 +13,27 @@ from __future__ import annotations
 
 import base64
 import json
-from typing import Any
+import os
+import shutil
+import warnings
+from typing import Any, Callable
 
 import h5py
 import numpy as np
+import zarr
 from tqdm import tqdm
+from zarr.codecs import BloscCodec
 
 from .attr_conversion import h5_attr_to_zarr
+from .chunk_index import MISSING, ChunkIndex, build_index, index_block_shape
 from .h5_chunk_utils import (
     apply_to_all_chunk_info,
     get_byte_range_for_contiguous_dataset,
     get_max_num_chunks,
 )
+from .gen import Generator
 from .h5_filters_to_codecs import h5_filters_to_codec_pipeline
+from .sources import describe_source
 
 
 def generate_rfs(
@@ -33,6 +41,9 @@ def generate_rfs(
     *,
     local_hdf5_path: str | None = None,
     h5f: h5py.File | None = None,
+    chunk_index_threshold: int | None = 1000,
+    contiguous_chunk_bytes: int | None = 4 * 2**20,
+    record_sources: bool = True,
 ) -> dict:
     """Generate a zarr v3 reference file system from an HDF5 file.
 
@@ -50,39 +61,149 @@ def generate_rfs(
     h5f : h5py.File or None
         An already-open h5py.File object. If provided, it is used directly
         and neither hdf5_url_or_path nor local_hdf5_path are opened.
+    chunk_index_threshold : int or None
+        Arrays with more chunks than this get a chunk index (a numpy array of
+        byte ranges, see ``zindi.chunk_index``) in place of one ref per chunk.
+        None lists every chunk in refs.
+    contiguous_chunk_bytes : int or None
+        A contiguous (unchunked) HDF5 dataset larger than this is presented as
+        chunks of about this many bytes along its first axis, described by one
+        "gen" entry, so reading part of it does not fetch all of it. None keeps
+        each contiguous dataset as a single chunk. Default 4 MiB.
+    record_sources : bool
+        Record the size and, for remote files, the ETag of each file the
+        references point into, under "sources", so readers can detect a file
+        that has changed since. For DANDI assets these come from the asset
+        metadata. Default True.
 
     Returns
     -------
     dict
-        A reference file system dict with keys "refs" and "version".
+        A reference file system dict with keys "refs" and "version", and
+        "indexes" mapping array paths to {"url", "index"} when any array is
+        indexed, and "gen" when any contiguous dataset is split. Either makes
+        "version" 2.
     """
     refs: dict[str, Any] = {}
+    indexes: dict[str, dict] = {}
+    gens: list[dict] = []
+    opts = {
+        "indexes": indexes,
+        "chunk_index_threshold": chunk_index_threshold,
+        "gen": gens,
+        "contiguous_chunk_bytes": contiguous_chunk_bytes,
+    }
+
+    def process(opened: h5py.File, raw_source: str) -> None:
+        opts["offset_shift"] = _detect_offset_shift(opened, _raw_reader(raw_source))
+        _process_group(opened, "", refs, hdf5_url_or_path, opened, **opts)
 
     if h5f is not None:
-        _process_group(h5f, "", refs, hdf5_url_or_path, h5f)
+        process(h5f, hdf5_url_or_path)
     elif local_hdf5_path is not None:
         with h5py.File(local_hdf5_path, "r") as opened:
-            _process_group(opened, "", refs, hdf5_url_or_path, opened)
+            process(opened, local_hdf5_path)
     elif hdf5_url_or_path.startswith("http://") or hdf5_url_or_path.startswith("https://"):
         from .remfile import ZindiRemfile
 
         remf = ZindiRemfile(hdf5_url_or_path)
         with h5py.File(remf, "r") as opened:
-            _process_group(opened, "", refs, hdf5_url_or_path, opened)
+            process(opened, hdf5_url_or_path)
     else:
         with h5py.File(hdf5_url_or_path, "r") as opened:
-            _process_group(opened, "", refs, hdf5_url_or_path, opened)
+            process(opened, hdf5_url_or_path)
 
     _add_dtype_attrs(refs)
-    rfs = {"refs": refs, "version": 1}
+    rfs: dict[str, Any] = {"refs": refs, "version": 2 if (indexes or gens) else 1}
+    if indexes:
+        rfs["indexes"] = indexes
+    if gens:
+        rfs["gen"] = gens
+    if record_sources:
+        rfs["sources"] = _describe_sources(rfs)
     _apply_templates(rfs)
     return rfs
 
 
 def write_rfs(rfs: dict, output_path: str) -> None:
-    """Write a reference file system dict to a JSON file."""
-    with open(output_path, "w") as f:
-        json.dump(rfs, f, indent=2, sort_keys=True)
+    """Write a reference file system to disk.
+
+    A path ending in ".json" writes a single version 1 reference file in which
+    every chunk of an indexed array is listed in refs, readable by any kerchunk
+    reader. Any other path writes a directory holding refs.json and, for each
+    chunk index, a zarr v3 array under index/<array path>. The "indexes" entry
+    in refs.json gives that path, relative to refs.json, and the file is marked
+    version 2 so that readers without index support refuse it. Opening the
+    directory reads only refs.json; index chunks are read when needed.
+    """
+    if output_path.endswith(".json"):
+        with open(output_path, "w") as f:
+            json.dump(_to_version1(rfs), f, indent=2, sort_keys=True)
+        return
+
+    refs_json = os.path.join(output_path, "refs.json")
+    if os.path.isdir(output_path) and os.listdir(output_path) and not os.path.exists(refs_json):
+        raise FileExistsError(f"{output_path} exists and is not a zindi RFS directory")
+    index_dir = os.path.join(output_path, "index")
+    if os.path.isdir(index_dir):
+        shutil.rmtree(index_dir)
+    os.makedirs(output_path, exist_ok=True)
+
+    indexes = rfs.get("indexes", {})
+    header = {k: v for k, v in rfs.items() if k != "indexes"}
+    if indexes:
+        header["version"] = 2
+        header["indexes"] = {p: {"url": e["url"], "index": f"index/{p}"} for p, e in indexes.items()}
+    with open(refs_json, "w") as f:
+        json.dump(header, f, indent=2, sort_keys=True)
+
+    store = zarr.storage.LocalStore(index_dir)
+    for path, entry in indexes.items():
+        data = np.asarray(ChunkIndex(entry["url"], entry["index"]).array[...])
+        arr = zarr.create_array(
+            store,
+            name=path,
+            shape=data.shape,
+            dtype="uint64",
+            chunks=(*index_block_shape(data.shape[:-1]), 2),
+            fill_value=int(MISSING),
+            compressors=BloscCodec(cname="zstd", clevel=5, shuffle="shuffle", typesize=8),
+            zarr_format=3,
+        )
+        arr[...] = data
+
+
+def _to_version1(rfs: dict) -> dict:
+    """Return a version 1 copy of rfs with every indexed or generated chunk listed in refs.
+
+    fsspec skips "gen" entries unless asked not to, so they are expanded too.
+    """
+    indexes = rfs.get("indexes", {})
+    gens = rfs.get("gen", [])
+    if not indexes and not gens:
+        return rfs
+    templates = rfs.get("templates", {})
+
+    def expand(url: str) -> str:
+        for key, value in templates.items():
+            url = url.replace("{{" + key + "}}", value)
+        return url
+
+    refs = {
+        key: [expand(val[0]), val[1], val[2]] if isinstance(val, list) and len(val) == 3 else val
+        for key, val in rfs["refs"].items()
+    }
+    for path, entry in indexes.items():
+        for coords, offset, nbytes in ChunkIndex(entry["url"], entry["index"]).iter_chunks():
+            refs[f"{path}/c/" + "/".join(map(str, coords))] = [entry["url"], offset, nbytes]
+    for entry in gens:
+        for key, ref in Generator(entry, templates).items():
+            refs[key] = ref
+    out = {k: v for k, v in rfs.items() if k not in ("indexes", "gen", "templates", "refs")}
+    out["version"] = 1
+    out["refs"] = refs
+    _apply_templates(out)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +229,7 @@ def _process_group(
     refs: dict,
     url: str,
     h5f: h5py.File,
+    **opts: Any,
 ) -> None:
     """Process an HDF5 group, adding zarr v3 metadata to refs."""
     # Check for soft link - if so, record in parent's _LINKS and skip children
@@ -151,9 +273,9 @@ def _process_group(
 
         child = item[name]
         if isinstance(child, h5py.Group):
-            _process_group(child, child_path, refs, url, h5f)
+            _process_group(child, child_path, refs, url, h5f, **opts)
         elif isinstance(child, h5py.Dataset):
-            _process_dataset(child, child_path, refs, url, h5f)
+            _process_dataset(child, child_path, refs, url, h5f, **opts)
 
 
 def _process_dataset(
@@ -162,6 +284,12 @@ def _process_dataset(
     refs: dict,
     url: str,
     h5f: h5py.File,
+    *,
+    indexes: dict,
+    chunk_index_threshold: int | None,
+    gen: list,
+    contiguous_chunk_bytes: int | None,
+    offset_shift: int,
 ) -> None:
     """Process an HDF5 dataset, adding zarr v3 array metadata and chunk refs."""
     attrs = _collect_attrs(ds, h5f=h5f, label=path)
@@ -181,7 +309,10 @@ def _process_dataset(
     codec_pipeline = h5_filters_to_codec_pipeline(ds)
 
     # Determine chunks
-    chunks = list(ds.chunks) if ds.chunks else list(ds.shape)
+    if ds.chunks:
+        chunks = list(ds.chunks)
+    else:
+        chunks = _contiguous_chunk_shape(ds.shape, ds.dtype.itemsize, contiguous_chunk_bytes)
     # Zarr doesn't allow zero-size chunks
     chunks = [max(c, 1) for c in chunks]
 
@@ -217,7 +348,7 @@ def _process_dataset(
 
     # Add chunk references
     if np.prod(ds.shape) > 0:
-        _add_chunk_refs(ds, path, refs, url)
+        _add_chunk_refs(ds, path, refs, url, indexes, chunk_index_threshold, gen, chunks, offset_shift)
 
 
 def _process_inline_dataset(
@@ -421,12 +552,23 @@ def _add_chunk_refs(
     path: str,
     refs: dict,
     url: str,
+    indexes: dict,
+    chunk_index_threshold: int | None,
+    gen: list,
+    chunk_shape: list[int],
+    offset_shift: int = 0,
 ) -> None:
-    """Add chunk references for a non-inline dataset."""
+    """Add chunk references, a chunk index, or a gen entry for a non-inline dataset.
+
+    offset_shift is added to every byte offset h5py reports (see _detect_offset_shift).
+    """
     if ds.chunks is not None:
         # Chunked dataset
         chunk_size = ds.chunks
         num_chunks = get_max_num_chunks(shape=ds.shape, chunk_size=chunk_size)
+        if chunk_index_threshold is not None and num_chunks > chunk_index_threshold:
+            _add_chunk_index(ds, path, url, indexes, num_chunks, offset_shift)
+            return
         pbar = tqdm(
             total=num_chunks,
             desc=f"Chunk refs for {path}",
@@ -441,16 +583,147 @@ def _add_chunk_refs(
             # zarr v3 chunk key: c/<idx0>/<idx1>/...
             indices = [str(a // b) for a, b in zip(chunk_offset, chunk_size)]
             chunk_key = f"{path}/c/" + "/".join(indices)
-            refs[chunk_key] = [url, byte_offset, byte_count]
+            refs[chunk_key] = [url, byte_offset + offset_shift, byte_count]
             pbar.update()
 
         apply_to_all_chunk_info(ds, store_chunk_info)
         pbar.close()
     else:
-        # Contiguous dataset - single chunk
+        # Contiguous dataset: one chunk, or equal slabs along the first axis
         byte_offset, byte_count = get_byte_range_for_contiguous_dataset(ds)
-        chunk_key = f"{path}/{_chunk_key(ds.ndim)}"
-        refs[chunk_key] = [url, byte_offset, byte_count]
+        byte_offset += offset_shift
+        if ds.ndim == 0 or chunk_shape[0] >= ds.shape[0]:
+            refs[f"{path}/{_chunk_key(ds.ndim)}"] = [url, byte_offset, byte_count]
+            return
+        slab = chunk_shape[0] * int(np.prod(ds.shape[1:])) * ds.dtype.itemsize
+        n_slabs = -(-ds.shape[0] // chunk_shape[0])
+        # Every chunk a reader decodes must be full size. A short last slab is
+        # read at full length when the file extends that far: zarr discards the
+        # part of an edge chunk past the end of the array. Only a dataset that
+        # ends within one slab of the end of the file keeps a short last ref,
+        # which RfsStore pads.
+        last = byte_offset + (n_slabs - 1) * slab
+        full_last = ds.shape[0] % chunk_shape[0] == 0 or last + slab <= ds.file.id.get_filesize()
+        n_generated = n_slabs if full_last else n_slabs - 1
+        rest = "/0" * (ds.ndim - 1)
+        if n_generated:
+            gen.append({
+                "key": f"{path}/c/{{{{i}}}}{rest}",
+                "url": url,
+                "offset": f"{{{{{byte_offset} + i * {slab}}}}}",
+                "length": str(slab),
+                "dimensions": {"i": {"stop": n_generated}},
+            })
+        if not full_last:
+            refs[f"{path}/c/{n_slabs - 1}{rest}"] = [url, last, byte_offset + byte_count - last]
+
+
+def _contiguous_chunk_shape(
+    shape: tuple[int, ...], itemsize: int, target_bytes: int | None
+) -> list[int]:
+    """Chunk shape for presenting a contiguous dataset: whole, or slabs along axis 0."""
+    shape_list = list(shape)
+    if target_bytes is None or not shape_list:
+        return shape_list
+    row_bytes = itemsize * int(np.prod(shape_list[1:]))
+    if row_bytes == 0 or row_bytes * shape_list[0] <= target_bytes:
+        return shape_list
+    rows = max(1, target_bytes // row_bytes)
+    # Prefer a slab height that divides the first axis, so no slab is short
+    for candidate in range(rows, rows // 2, -1):
+        if shape_list[0] % candidate == 0:
+            return [candidate] + shape_list[1:]
+    return [rows] + shape_list[1:]
+
+
+def _add_chunk_index(
+    ds: h5py.Dataset,
+    path: str,
+    url: str,
+    indexes: dict,
+    num_chunks: int,
+    offset_shift: int = 0,
+) -> None:
+    """Record a dataset's chunk byte ranges in an index array."""
+    chunk_size = ds.chunks
+    grid_shape = tuple(-(-a // b) for a, b in zip(ds.shape, chunk_size))
+    pbar = tqdm(total=num_chunks, desc=f"Chunk index for {path}", leave=True, delay=2)
+
+    def for_each_chunk(set_chunk: Any) -> None:
+        def store_chunk_info(chunk_info: Any) -> None:
+            coords = tuple(a // b for a, b in zip(chunk_info.chunk_offset, chunk_size))
+            set_chunk(coords, chunk_info.byte_offset + offset_shift, chunk_info.size)
+            pbar.update()
+
+        apply_to_all_chunk_info(ds, store_chunk_info)
+
+    indexes[path] = {"url": url, "index": build_index(grid_shape, for_each_chunk)}
+    pbar.close()
+
+
+def _raw_reader(path_or_url: str) -> Callable[[int, int], bytes]:
+    """Read raw bytes from the HDF5 file, bypassing h5py."""
+    from .rfs_store import _read_bytes_from_url_or_path
+
+    return lambda offset, length: _read_bytes_from_url_or_path(path_or_url, offset, length)
+
+
+def _first_stored_block(h5f: h5py.File) -> tuple[int, bytes] | None:
+    """The offset h5py reports for some stored data, and the bytes it holds there.
+
+    Uses the first chunk of the first chunked dataset with any chunks written,
+    or else the start of the first contiguous dataset with storage.
+    """
+    contiguous: tuple[int, bytes] | None = None
+    found: tuple[int, bytes] | None = None
+
+    def visit(name: str, obj: Any) -> Any:
+        nonlocal contiguous, found
+        if not isinstance(obj, h5py.Dataset) or obj.size == 0 or obj.dtype.kind in "OV":
+            return None
+        if obj.chunks is not None:
+            try:
+                info = obj.id.get_chunk_info(0)
+            except Exception:
+                return None
+            if info.byte_offset is None:
+                return None
+            _, raw = obj.id.read_direct_chunk(info.chunk_offset)
+            found = (info.byte_offset, bytes(raw[:64]))
+            return True  # stop visiting
+        if contiguous is None and obj.id.get_offset() is not None:
+            first = obj[:8] if obj.ndim == 1 else obj[(0,) * (obj.ndim - 1)][:8]
+            contiguous = (obj.id.get_offset(), np.asarray(first).tobytes())
+        return None
+
+    h5f.visititems(visit)
+    return found or contiguous
+
+
+def _detect_offset_shift(h5f: h5py.File, read_bytes: Callable[[int, int], bytes]) -> int:
+    """How far to shift the byte offsets h5py reports to get file offsets.
+
+    A file with a userblock (MATLAB v7.3 files have 512 bytes) is laid out
+    after it. HDF5 1.14 and later report absolute file offsets, but HDF5 1.10
+    reports offsets relative to the superblock, which puts every reference
+    off by the size of the userblock. Instead of relying on the library
+    version, read one stored block at the reported offset and with the
+    userblock added, and keep whichever matches what h5py reads.
+    """
+    userblock = h5f.userblock_size
+    if not userblock:
+        return 0
+    block = _first_stored_block(h5f)
+    if block is None:
+        return 0
+    offset, expected = block
+    for shift in (0, userblock):
+        if read_bytes(offset + shift, len(expected)) == expected:
+            return shift
+    raise RuntimeError(
+        f"Byte offsets reported by HDF5 do not match the file, with or without the "
+        f"{userblock}-byte userblock; chunk references would be wrong"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -698,6 +971,20 @@ def _add_dtype_attrs(refs: dict) -> None:
             continue
         attrs["_DTYPE"] = "str" if data_type == "string" else data_type
         refs[key] = json.dumps(meta, separators=(",", ":"))
+
+
+def _describe_sources(rfs: dict) -> dict:
+    """Size and ETag of every file the refs and indexes point into."""
+    urls = {val[0] for val in rfs["refs"].values() if isinstance(val, list) and len(val) == 3}
+    urls |= {entry["url"] for entry in rfs.get("indexes", {}).values()}
+    urls |= {entry["url"] for entry in rfs.get("gen", [])}
+    sources = {}
+    for url in sorted(urls):
+        try:
+            sources[url] = describe_source(url)
+        except Exception as e:
+            warnings.warn(f"Could not describe source {url}: {e}")
+    return sources
 
 
 def _apply_templates(rfs: dict) -> None:

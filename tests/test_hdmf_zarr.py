@@ -6,7 +6,8 @@ from datetime import datetime, timezone
 import numpy as np
 import pytest
 
-from zindi import generate_rfs
+from zindi import generate_rfs, write_rfs
+from zindi.open_rfs import load_rfs
 from zindi.rfs_store import RfsStore
 
 pynwb = pytest.importorskip("pynwb")
@@ -55,11 +56,28 @@ def nwb_path(tmp_path_factory):
     return str(path)
 
 
-@pytest.fixture(scope="module")
-def nwb_pair(nwb_path):
-    """Yield the file as read by NWBHDF5IO and by NWBZarrIO over the zindi RFS."""
+@pytest.fixture(scope="module", params=["refs", "chunk_index", "directory", "contiguous_gen"])
+def nwb_pair(request, nwb_path, tmp_path_factory):
+    """Yield the file as read by NWBHDF5IO and by NWBZarrIO over the zindi RFS.
+
+    The ElectricalSeries data has 30 chunks, so a threshold of 10 gives it a
+    chunk index. "directory" writes that RFS to disk and reads it back.
+    """
+    if request.param == "refs":
+        rfs = generate_rfs(nwb_path)
+    elif request.param == "contiguous_gen":
+        # linked/timestamps is a contiguous 240 KB dataset; split it into gen slabs
+        rfs = generate_rfs(nwb_path, contiguous_chunk_bytes=16 * 1024)
+        assert any(g["key"].startswith("acquisition/linked/timestamps/") for g in rfs["gen"])
+    else:
+        rfs = generate_rfs(nwb_path, chunk_index_threshold=10)
+        assert "acquisition/ElectricalSeries/data" in rfs["indexes"]
+    if request.param == "directory":
+        out = str(tmp_path_factory.mktemp("rfs") / "test.zindi")
+        write_rfs(rfs, out)
+        rfs = load_rfs(out)
     with NWBHDF5IO(nwb_path, "r") as h5io:
-        zio = hdmf_zarr_nwb.NWBZarrIO(RfsStore(generate_rfs(nwb_path)), mode="r")
+        zio = hdmf_zarr_nwb.NWBZarrIO(RfsStore(rfs), mode="r")
         yield h5io.read(), zio.read()
         zio.close()
 

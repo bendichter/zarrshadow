@@ -8,6 +8,8 @@ It handles:
 - DANDI URL resolution (redirects + auth)
 - Retry with exponential backoff
 - Chunk padding for contiguous HDF5 datasets
+- Chunk indexes for arrays with many chunks (see chunk_index.py)
+- kerchunk "gen" entries, evaluated when a key is requested (see gen.py)
 
 Ported from lindi's LindiReferenceFileSystemStore, adapted for zarr v3.
 """
@@ -27,6 +29,9 @@ import requests
 from zarr.abc.store import ByteRequest, Store
 from zarr.core.buffer import Buffer, BufferPrototype, default_buffer_prototype
 
+from .chunk_index import ChunkIndex
+from .gen import Generator
+from .sources import SourceChangedError, SourceChecker
 from .url_resolver import resolve_url
 
 
@@ -48,12 +53,14 @@ class RfsStore(Store):
         local_cache: Any = None,
         merge_gap: int = 256 * 1024,
         max_merge_size: int = 50 * 1024 * 1024,
+        validate_sources: bool = True,
     ) -> None:
         """
         Parameters
         ----------
         rfs : dict
-            Reference file system dict with "refs" key, and optional "templates".
+            Reference file system dict with "refs" key, and optional
+            "templates", "gen", "indexes", and "sources".
         local_cache : LocalCache or None
             Optional local cache for persisting remote chunk data on disk.
         merge_gap : int
@@ -63,6 +70,9 @@ class RfsStore(Store):
         max_merge_size : int
             Maximum size in bytes for a single merged HTTP request. Merged
             ranges that would exceed this are split. Default 50 MB.
+        validate_sources : bool
+            Check reads against the size and ETag recorded under "sources" and
+            raise SourceChangedError if a file has changed. Default True.
         """
         super().__init__(read_only=True)
         if "refs" not in rfs:
@@ -72,8 +82,16 @@ class RfsStore(Store):
         self._merge_gap = merge_gap
         self._max_merge_size = max_merge_size
         self._executor = ThreadPoolExecutor(max_workers=32)
+        self._sources = SourceChecker(rfs.get("sources", {}), enabled=validate_sources)
         self._session = requests.Session()
         self._session.headers["User-Agent"] = "Mozilla/5.0"
+        self._indexes = {
+            path: ChunkIndex(entry["url"], entry["index"])
+            for path, entry in rfs.get("indexes", {}).items()
+        }
+        self._generators = [Generator(entry, rfs.get("templates", {})) for entry in rfs.get("gen", [])]
+        self._children: dict[str, set[str]] | None = None
+        self._array_meta: dict[str, dict | None] = {}
         self._is_open = True
 
     # -- Abstract method implementations --
@@ -122,18 +140,15 @@ class RfsStore(Store):
         # Group remote refs by resolved URL for merging
         url_groups: dict[str, list[tuple[int, int, int, str]]] = {}  # url -> [(item_idx, offset, length, key)]
 
-        for i, (key, byte_range) in enumerate(items):
-            if byte_range is not None or key not in self.rfs["refs"]:
+        # Resolving may read chunk index blocks, which blocks, so run it off the event loop
+        resolved = await loop.run_in_executor(
+            self._executor, lambda: [self._resolve(key) for key, _ in items]
+        )
+        for i, ((key, byte_range), ref) in enumerate(zip(items, resolved)):
+            if byte_range is not None or not (isinstance(ref, list) and len(ref) == 3):
                 non_remote_indices.append(i)
                 continue
-            ref = self.rfs["refs"][key]
-            if not (isinstance(ref, list) and len(ref) == 3):
-                non_remote_indices.append(i)
-                continue
-            url_or_path = ref[0]
-            if "{{" in url_or_path and "}}" in url_or_path and "templates" in self.rfs:
-                for tkey, tval in self.rfs["templates"].items():
-                    url_or_path = url_or_path.replace("{{" + tkey + "}}", tval)
+            url_or_path = self._expand_templates(ref[0])
             if not (url_or_path.startswith("http://") or url_or_path.startswith("https://")):
                 non_remote_indices.append(i)
                 continue
@@ -214,7 +229,13 @@ class RfsStore(Store):
             uncached_end = max(r[1] + r[2] for r in uncached)
 
             # Fetch the merged range
-            raw = _read_bytes_from_url(url, uncached_start, uncached_end - uncached_start, session=self._store._session)
+            raw = _read_bytes_from_url(
+                url,
+                uncached_start,
+                uncached_end - uncached_start,
+                session=self._session,
+                checker=self._sources,
+            )
 
             # Split and deliver individual chunks
             for item_idx, offset, length, key in uncached:
@@ -240,7 +261,10 @@ class RfsStore(Store):
         return results
 
     async def exists(self, key: str) -> bool:
-        return key in self.rfs["refs"]
+        if key in self.rfs["refs"]:
+            return True
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._executor, self._resolve, key) is not None
 
     async def set(self, key: str, value: Buffer) -> None:
         raise NotImplementedError("RfsStore is read-only")
@@ -251,38 +275,103 @@ class RfsStore(Store):
     async def list(self) -> AsyncIterator[str]:
         for key in self.rfs["refs"]:
             yield key
+        for path, index in self._indexes.items():
+            for coords, _, _ in index.iter_chunks():
+                yield f"{path}/c/" + "/".join(map(str, coords))
+        for generator in self._generators:
+            for key, _ in generator.items():
+                yield key
 
     async def list_prefix(self, prefix: str) -> AsyncIterator[str]:
-        for key in self.rfs["refs"]:
+        async for key in self.list():
             if key.startswith(prefix):
                 yield key
 
     async def list_dir(self, prefix: str) -> AsyncIterator[str]:
-        if prefix and not prefix.endswith("/"):
-            prefix = prefix + "/"
-        prefix_len = len(prefix)
-        seen: set[str] = set()
-        for key in self.rfs["refs"]:
-            if not key.startswith(prefix):
-                continue
-            remainder = key[prefix_len:]
-            if "/" in remainder:
-                # It's inside a subdirectory; yield the directory name
-                subdir = remainder.split("/")[0]
-                if subdir not in seen:
-                    seen.add(subdir)
-                    yield subdir
-            else:
-                yield remainder
+        prefix = prefix.strip("/")
+        indexed = self._indexed_chunk_prefix(prefix)
+        if indexed is not None:
+            # Inside an indexed array's chunk directory: list chunk coordinates
+            path, parts = indexed
+            depth = len(parts)
+            seen: set[str] = set()
+            for coords, _, _ in self._indexes[path].iter_chunks():
+                if tuple(map(str, coords[:depth])) == parts and depth < len(coords):
+                    name = str(coords[depth])
+                    if name not in seen:
+                        seen.add(name)
+                        yield name
+            return
+        names = set(self._get_children().get(prefix, ()))
+        for generator in self._generators:
+            # Enumerate generated keys only when listing inside a generated directory
+            if (prefix + "/").startswith(generator.static_prefix) and "/" in generator.static_prefix:
+                for key, _ in generator.items():
+                    if key.startswith(prefix + "/"):
+                        names.add(key[len(prefix) + 1 :].split("/")[0])
+        for name in sorted(names):
+            yield name
+
+    def _get_children(self) -> dict[str, set[str]]:
+        """Map each directory prefix to its immediate children, built once."""
+        if self._children is None:
+            children: dict[str, set[str]] = {}
+            keys = list(self.rfs["refs"]) + [f"{path}/c" for path in self._indexes]
+            keys += [g.static_prefix.rsplit("/", 1)[0] for g in self._generators if "/" in g.static_prefix]
+            for key in keys:
+                parts = key.split("/")
+                for i in range(len(parts)):
+                    children.setdefault("/".join(parts[:i]), set()).add(parts[i])
+            self._children = children
+        return self._children
+
+    def _indexed_chunk_prefix(self, prefix: str) -> tuple[str, tuple[str, ...]] | None:
+        """If prefix is <indexed array>/c[/...], return (array path, coordinate parts)."""
+        for path in self._indexes:
+            chunk_dir = f"{path}/c"
+            if prefix == chunk_dir or prefix.startswith(chunk_dir + "/"):
+                rest = prefix[len(chunk_dir) + 1:]
+                return path, tuple(rest.split("/")) if rest else ()
+        return None
 
     # -- Core data resolution --
 
+    def _resolve(self, key: str) -> Any:
+        """Return the ref for key: inline str/dict, [url, offset, size], or None.
+
+        Keys are looked up in refs, then in the chunk index of their array,
+        then in the gen entries.
+        """
+        ref = self.rfs["refs"].get(key)
+        if ref is not None:
+            return ref
+        if self._indexes:
+            path, sep, coords_str = key.rpartition("/c/")
+            index = self._indexes.get(path) if sep else None
+            if index is not None:
+                try:
+                    coords = tuple(int(c) for c in coords_str.split("/"))
+                except ValueError:
+                    return None
+                hit = index.lookup(coords)
+                return None if hit is None else [index.url, hit[0], hit[1]]
+        for generator in self._generators:
+            ref = generator.lookup(key)
+            if ref is not None:
+                return ref
+        return None
+
+    def _expand_templates(self, url_or_path: str) -> str:
+        if "{{" in url_or_path and "}}" in url_or_path and "templates" in self.rfs:
+            for tkey, tval in self.rfs["templates"].items():
+                url_or_path = url_or_path.replace("{{" + tkey + "}}", tval)
+        return url_or_path
+
     def _get_bytes(self, key: str) -> bytes | None:
         """Resolve a key to bytes, handling all reference types."""
-        if key not in self.rfs["refs"]:
+        x = self._resolve(key)
+        if x is None:
             return None
-
-        x = self.rfs["refs"][key]
 
         if isinstance(x, str):
             if x.startswith("base64:"):
@@ -294,12 +383,7 @@ class RfsStore(Store):
         elif isinstance(x, list):
             if len(x) != 3:
                 raise ValueError(f"Reference list for {key} must have 3 elements")
-            url_or_path, offset, length = x[0], x[1], x[2]
-
-            # Expand templates
-            if "{{" in url_or_path and "}}" in url_or_path and "templates" in self.rfs:
-                for tkey, tval in self.rfs["templates"].items():
-                    url_or_path = url_or_path.replace("{{" + tkey + "}}", tval)
+            url_or_path, offset, length = self._expand_templates(x[0]), x[1], x[2]
 
             is_url = url_or_path.startswith("http://") or url_or_path.startswith("https://")
 
@@ -314,7 +398,9 @@ class RfsStore(Store):
                         cached = cached + b"\0" * (padded_size - len(cached))
                     return cached
 
-            data = _read_bytes_from_url_or_path(url_or_path, offset, length, session=self._session)
+            data = _read_bytes_from_url_or_path(
+                url_or_path, offset, length, session=self._session, checker=self._sources
+            )
 
             # Store in local cache
             if self._local_cache is not None and is_url:
@@ -366,15 +452,14 @@ class RfsStore(Store):
         array_path = "/".join(parts[:c_idx])
         meta_key = f"{array_path}/zarr.json" if array_path else "zarr.json"
 
-        if meta_key not in self.rfs["refs"]:
+        if meta_key not in self._array_meta:
+            meta_bytes = self._get_bytes(meta_key) if meta_key in self.rfs["refs"] else None
+            meta = json.loads(meta_bytes) if meta_bytes is not None else None
+            self._array_meta[meta_key] = meta if meta and meta.get("node_type") == "array" else None
+        meta = self._array_meta[meta_key]
+        if meta is None:
             return None
-
-        meta_bytes = self._get_bytes(meta_key)
-        if meta_bytes is None:
-            return None
-        meta = json.loads(meta_bytes)
-
-        if meta.get("node_type") != "array":
+        if any(codec.get("name") != "bytes" for codec in meta.get("codecs", [])):
             return None
         if any(codec.get("name") != "bytes" for codec in meta.get("codecs", [])):
             return None
@@ -423,34 +508,56 @@ def _zarr_field_type_to_numpy(field_type: str | dict) -> str:
 
 
 def _read_bytes_from_url_or_path(
-    url_or_path: str, offset: int, length: int, *, session: requests.Session | None = None
+    url_or_path: str,
+    offset: int,
+    length: int,
+    *,
+    session: requests.Session | None = None,
+    checker: SourceChecker | None = None,
 ) -> bytes:
     """Read a byte range from a URL or local file path."""
     if url_or_path.startswith("http://") or url_or_path.startswith("https://"):
-        return _read_bytes_from_url(url_or_path, offset, length, session=session)
+        return _read_bytes_from_url(url_or_path, offset, length, session=session, checker=checker)
     else:
+        if checker is not None:
+            checker.check_local(url_or_path)
         with open(url_or_path, "rb") as f:
             f.seek(offset)
             return f.read(length)
 
 
 def _read_bytes_from_url(
-    url: str, offset: int, length: int, *, session: requests.Session | None = None
+    url: str,
+    offset: int,
+    length: int,
+    *,
+    session: requests.Session | None = None,
+    checker: SourceChecker | None = None,
 ) -> bytes:
-    """Read a byte range from a URL with retry and DANDI resolution."""
+    """Read a byte range from a URL with retry and DANDI resolution.
+
+    With a checker, the request carries If-Match for the recorded ETag, and a
+    response showing the file changed raises SourceChangedError without retrying.
+    """
     num_retries = 8
     for try_num in range(num_retries):
         try:
             resolved_url = resolve_url(url)
             range_header = f"bytes={offset}-{offset + length - 1}"
             headers = {"Range": range_header}
+            if checker is not None:
+                headers.update(checker.request_headers(url))
             if session is not None:
                 response = session.get(resolved_url, headers=headers)
             else:
                 headers["User-Agent"] = "Mozilla/5.0"
                 response = requests.get(resolved_url, headers=headers)
+            if checker is not None:
+                checker.check_response(url, response)
             response.raise_for_status()
             return response.content
+        except SourceChangedError:
+            raise
         except Exception as e:
             if try_num == num_retries - 1:
                 raise
