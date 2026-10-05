@@ -301,6 +301,31 @@ hdmf-zarr writes the file's structure: the groups, attributes, object ids, refer
 
 The scaling of a series stays in NWB's `conversion`, `offset`, and `channel_conversion`, so the file's integers are referenced as they are. Continuous integration writes a SpikeGLX recording from GIN this way and compares both series with NEO's reads.
 
+## Materializing
+
+`materialize` reads the bytes a reference file system points at and writes them into an ordinary Zarr store, which then no longer depends on the source files.
+
+```python
+from zindi import materialize
+
+report = materialize("session.nwb.zindi", "session.nwb.zarr")
+```
+
+Groups, attributes, and datasets stored in the references file are copied as they are. Each array whose chunks are references is rewritten: by default an array of numbers is cut into chunks of about 4 MiB along its first axis and compressed with zarr's default compressor, and any other array is copied as stored. A `layout` function chooses per array, returning arguments for `zarr.create_array` or `None` to leave the array's chunks as they are:
+
+```python
+from zarr.codecs import BloscCodec
+
+def layout(path, array):
+    if path.endswith("ElectricalSeries/data"):
+        return {"chunks": (30_000, 64), "compressors": BloscCodec(cname="zstd", clevel=5, shuffle="shuffle")}
+    return {}
+
+materialize("session.nwb.zindi", "session.nwb.zarr", layout=layout)
+```
+
+A virtual NWB file materializes into an NWB Zarr file that `NWBZarrIO` opens from its directory. The reading goes through `RfsStore`, so materializing needs none of the libraries that read the source formats, and it can run wherever the references and the source files can be reached. The returned report gives each rewritten array's size and stored size. Pass `verify=True` to read back what was written and compare.
+
 ## Other File Formats
 
 `generate_rfs` is the generator for HDF5. Everything after it (the store, the directory format, chunk indexes, `gen`, and source checks) works for any format, and a generator for another format builds the same references with `RfsBuilder`. For a raw binary recording with 16 interleaved `int16` channels after a 12-byte header:
@@ -392,6 +417,7 @@ zindi/
 ├── neo_rawio.py             # NEO raw readers → reference file system, through RfsBuilder
 ├── virtual.py               # VirtualArray: slicing and stacking arrays stored in other files
 ├── nwb.py                   # Virtual NWB files, written through hdmf-zarr
+├── materialize.py           # Reference file system → ordinary Zarr store
 ├── open_rfs.py              # Open RFS as zarr.Group
 ├── rfs_store.py             # Zarr v3 Store backed by reference file system
 ├── chunk_index.py           # Byte-range indexes for arrays with many chunks
