@@ -332,6 +332,25 @@ It covers recordings that SpikeInterface reads through a NEO reader with the buf
 
 This is experimental. As of October 2026, SpikeInterface requires `zarr<3` and zarrshadow needs Zarr v3, so NeuroConv and zarrshadow install together only with that requirement overridden (`uv pip install --override`), and NeuroConv 0.10 reads `zarr.codec_registry` at import, which Zarr v3 removed. `tests/test_neuroconv_bridge.py` shows the environment and the one-line workaround.
 
+## Formats That VirtualiZarr Parses
+
+[VirtualiZarr](https://virtualizarr.readthedocs.io) parses NetCDF, HDF5, GRIB, FITS, Zarr, and kerchunk references into a `ManifestStore`: Zarr metadata and, for each array, a manifest of where its chunks are. `zarrshadow.virtualizarr` takes those manifests. Install with `pip install zarrshadow[virtualizarr]`.
+
+```python
+from obspec_utils.registry import ObjectStoreRegistry
+from obstore.store import LocalStore
+from virtualizarr.parsers import HDFParser
+from zarrshadow import write_rfs
+from zarrshadow.virtualizarr import manifest_store_to_rfs, virtual_array
+
+store = HDFParser()(url="file:///data/air.nc", registry=ObjectStoreRegistry({"file://": LocalStore()}))
+write_rfs(manifest_store_to_rfs(store), "air.zarrshadow")
+```
+
+`manifest_store_to_rfs` writes the whole store as a reference file system, with a chunk index for each array that has many chunks. `virtual_array` takes one `ManifestArray` as a `VirtualArray`, to stack, transpose, or put in an NWB file. An uncompressed array stored in one piece of one file becomes a contiguous `VirtualArray`, so it can also be sliced along any axis, which a `ManifestArray` cannot do by column.
+
+VirtualiZarr's HDF5 parser does not read NWB files, which hold variable-length strings and object references. Use `generate_rfs` for those.
+
 ## Materializing
 
 `materialize` reads the bytes a reference file system points at and writes them into an ordinary Zarr store, which then no longer depends on the source files.
@@ -449,6 +468,7 @@ zarrshadow/
 ├── virtual.py               # VirtualArray: slicing and stacking arrays stored in other files
 ├── nwb.py                   # Virtual NWB files, written through hdmf-zarr
 ├── neuroconv_bridge.py      # NeuroConv's in-memory NWB files → virtual NWB files
+├── virtualizarr.py          # VirtualiZarr manifests → reference file system and VirtualArray
 ├── materialize.py           # Reference file system → ordinary Zarr store
 ├── open_rfs.py              # Open RFS as zarr.Group
 ├── rfs_store.py             # Zarr v3 Store backed by reference file system

@@ -33,6 +33,9 @@ nwb = [
     "pynwb",
     "hdmf-zarr>=0.14.0",
 ]
+virtualizarr = [
+    "virtualizarr>=2.7",
+]
 dev = [
     "neo>=0.14",
     "pytest",
@@ -40,6 +43,7 @@ dev = [
     "hdmf-zarr>=0.14.0",
     "tifffile>=2026.4.11",
     "imagecodecs",
+    "virtualizarr[hdf]>=2.7",
 ]
 
 [tool.pytest.ini_options]

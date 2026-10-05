@@ -149,6 +149,17 @@ NEO's buffer description API covers six of NeuroConv's ephys formats (SpikeGLX, 
 
 The survey read NeuroConv at a development checkout (v0.10.1-18), NEO 0.14.4, SpikeInterface 0.103.1, and roiextractors 0.5.12 with the 0.10.0 source for extractors the installed version lacks.
 
+## Relation to VirtualiZarr
+
+VirtualiZarr's `ManifestArray` and `ManifestStore` cover much of what `VirtualArray` and `RfsStore` do, so in October 2026 we tried building on them. `zarrshadow.virtualizarr` came out of that: it writes a `ManifestStore` in this format and takes a `ManifestArray` as a `VirtualArray`. The rest stays separate for now, for these reasons.
+
+- VirtualiZarr's HDF5 parser raises on object references and cannot read variable-length strings, so it does not open an NWB file (https://github.com/zarr-developers/VirtualiZarr/issues/1104).
+- A `ManifestArray` cannot select columns, can slice rows inside a chunk only when the array is a single chunk, and has no transpose. Ephys with a sync channel and imaging depend on those.
+- Its kerchunk writer emits Zarr v2 metadata from an xarray Dataset. https://github.com/zarr-developers/VirtualiZarr/pull/1118 adds Zarr v3 metadata as an option.
+- It has no chunk index format. Its answer for large reference sets is kerchunk Parquet, which holds Zarr v2 metadata only, or Icechunk.
+
+VirtualiZarr adds concatenation, which `VirtualArray` lacks, and parsers for NetCDF, GRIB, FITS, Zarr, and DMR++. Kerchunk itself went into maintenance mode in September 2026 and points new projects to VirtualiZarr, so proposals about the format belong there.
+
 ## Open Questions
 
 - Hosting. A virtual file is useful only while its sources stay at stable URLs. Where do raw acquisition files live, and does DANDI accept them alongside the refs file?
