@@ -11,7 +11,7 @@ from neo.rawio.baserawio import (  # noqa: E402
     _signal_stream_dtype,
 )
 
-from zindi import generate_rfs_neo, open_rfs, write_rfs  # noqa: E402
+from zarrshadow import generate_rfs_neo, open_rfs, write_rfs  # noqa: E402
 
 
 def _columns(spec):
@@ -53,8 +53,8 @@ def test_url_for_and_written_forms(raw_file, tmp_path):
     path, x = raw_file
     reader = neo_rawio.RawBinarySignalRawIO(filename=path, dtype="int16", nb_channel=3, bytesoffset=64)
     rfs = generate_rfs_neo(reader, chunk_bytes=6000, url_for=lambda p: p, record_sources=False)
-    write_rfs(rfs, str(tmp_path / "rec.zindi"))
-    np.testing.assert_array_equal(open_rfs(str(tmp_path / "rec.zindi"))["0"][...], x)
+    write_rfs(rfs, str(tmp_path / "rec.zarrshadow"))
+    np.testing.assert_array_equal(open_rfs(str(tmp_path / "rec.zarrshadow"))["0"][...], x)
     hosted = generate_rfs_neo(reader, url_for=lambda p: "https://example.org/data/recording.raw", record_sources=False)
     assert {v[0] for v in hosted["refs"].values() if isinstance(v, list)} == {"https://example.org/data/recording.raw"}
 

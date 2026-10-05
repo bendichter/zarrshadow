@@ -12,7 +12,7 @@ import pytest
 tifffile = pytest.importorskip("tifffile")
 pytest.importorskip("imagecodecs")
 
-from zindi import generate_rfs_tiff, open_rfs, write_rfs  # noqa: E402
+from zarrshadow import generate_rfs_tiff, open_rfs, write_rfs  # noqa: E402
 
 RNG = np.random.default_rng(0)
 STACK = RNG.integers(0, 4000, (8, 300, 500), dtype="uint16")
@@ -102,8 +102,8 @@ def test_many_tiles_get_an_index(tmp_path):
     rfs = generate_rfs_tiff(path, chunk_index_threshold=100)
     assert rfs["indexes"]["0"]["index"].shape == (8, 10, 16, 2)
     np.testing.assert_array_equal(open_rfs(rfs)["0"][...], STACK)
-    write_rfs(rfs, str(tmp_path / "tiles.zindi"))
-    np.testing.assert_array_equal(open_rfs(str(tmp_path / "tiles.zindi"))["0"][...], STACK)
+    write_rfs(rfs, str(tmp_path / "tiles.zarrshadow"))
+    np.testing.assert_array_equal(open_rfs(str(tmp_path / "tiles.zarrshadow"))["0"][...], STACK)
 
 
 class _RangeHandler(http.server.SimpleHTTPRequestHandler):

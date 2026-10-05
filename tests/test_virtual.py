@@ -1,9 +1,11 @@
 """VirtualArray: slicing and stacking arrays that are stored in other files."""
 
+import json
+
 import numpy as np
 import pytest
 
-from zindi import RfsBuilder, VirtualArray, open_rfs, stack
+from zarrshadow import RfsBuilder, VirtualArray, open_rfs, stack
 
 HEADER = 12
 
@@ -184,3 +186,77 @@ def test_from_rfs_with_listed_chunks(tmp_path):
     array = VirtualArray.from_rfs(builder.build(), "tiles")
     np.testing.assert_array_equal(_read(array), x)
     np.testing.assert_array_equal(_read(stack([array, array])), np.stack([x, x]))
+
+
+@pytest.fixture
+def movie(tmp_path):
+    x = np.random.default_rng(4).integers(0, 4000, (50, 6, 8)).astype("<u2")
+    (tmp_path / "movie.bin").write_bytes(x.tobytes())
+    return str(tmp_path / "movie.bin"), x
+
+
+@pytest.mark.parametrize("axes", [(0, 2, 1), (2, 1, 0), (1, 0, 2), (1, 2, 0), ()])
+@pytest.mark.parametrize("chunk_bytes", [96, 960, None])
+def test_transpose(movie, axes, chunk_bytes):
+    path, x = movie
+    array = VirtualArray.contiguous(path, shape=x.shape, dtype="<u2", chunk_bytes=chunk_bytes).transpose(*axes)
+    assert array.shape == x.transpose(*axes).shape
+    np.testing.assert_array_equal(_read(array), x.transpose(*axes))
+
+
+def _codec_names(virtual):
+    return [codec["name"] for codec in json.loads(_build(virtual)["refs"]["data/zarr.json"])["codecs"]]
+
+
+def test_transpose_uses_the_codec_only_when_the_bytes_differ(movie):
+    path, x = movie
+    frames = VirtualArray.contiguous(path, shape=x.shape, dtype="<u2", chunk_bytes=96)  # one frame per chunk
+    # Rows and columns of a frame change places, so the stored order has to be declared
+    assert _codec_names(frames.transpose(0, 2, 1)) == ["transpose", "bytes"]
+    # The frame axis has one element per chunk, and moving it leaves a chunk's bytes as they are
+    assert _codec_names(frames.transpose(1, 2, 0)) == ["bytes"]
+    assert frames.transpose(1, 2, 0).chunk_shape == (6, 8, 1)
+
+
+def test_channel_major_file_as_time_by_channel(tmp_path):
+    """A file that stores one channel after another needs no codec to be read as time by channel."""
+    x = np.random.default_rng(5).integers(-500, 500, (4, 10_000)).astype("<i2")
+    (tmp_path / "channels.bin").write_bytes(x.tobytes())
+    stored = VirtualArray.contiguous(str(tmp_path / "channels.bin"), shape=x.shape, dtype="<i2", chunk_bytes=20_000)
+    array = stored.transpose()
+    assert array.shape == (10_000, 4) and array.chunk_shape == (10_000, 1) and _codec_names(array) == ["bytes"]
+    np.testing.assert_array_equal(_read(array), x.T)
+
+
+def test_transpose_composes(movie, recording):
+    path, x = movie
+    array = VirtualArray.contiguous(path, shape=x.shape, dtype="<u2", chunk_bytes=960)
+    assert array.transpose(0, 2, 1).transpose(0, 2, 1) is array
+    twice = array.transpose(0, 2, 1).transpose(2, 0, 1)
+    assert _codec_names(twice) == ["transpose", "bytes"]
+    np.testing.assert_array_equal(_read(twice), x.transpose(0, 2, 1).transpose(2, 0, 1))
+    # With a selection, and with a stack
+    np.testing.assert_array_equal(
+        _read(array[10:40, 1:5, ::2].transpose(0, 2, 1)), x[10:40, 1:5, ::2].transpose(0, 2, 1)
+    )
+    np.testing.assert_array_equal(
+        _read(stack([array, array]).transpose(1, 0, 3, 2)), np.stack([x, x]).transpose(1, 0, 3, 2)
+    )
+    with pytest.raises(ValueError, match="not an ordering"):
+        array.transpose(0, 1)
+    with pytest.raises(NotImplementedError, match="contiguous can be sliced"):
+        array.transpose(0, 2, 1)[:10]
+
+
+@pytest.mark.parametrize("options", [{}, {"compression": "zlib"}, {"tile": (16, 16), "compression": "zlib"}])
+def test_transpose_tiff(tmp_path, options):
+    """A TIFF stack, stored (page, row, column), read as (page, column, row)."""
+    tifffile = pytest.importorskip("tifffile")
+    pytest.importorskip("imagecodecs")
+    from zarrshadow import generate_rfs_tiff
+
+    x = np.random.default_rng(6).integers(0, 4000, (20, 48, 64)).astype("uint16")
+    tifffile.imwrite(tmp_path / "movie.tif", x, **options)
+    pages = VirtualArray.from_rfs(generate_rfs_tiff(str(tmp_path / "movie.tif")), "0")
+    assert pages.shape == (20, 48, 64)
+    np.testing.assert_array_equal(_read(pages.transpose(0, 2, 1)), x.transpose(0, 2, 1))

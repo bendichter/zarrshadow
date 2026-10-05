@@ -1,9 +1,9 @@
-"""Load a zindi JSON file and read data from the remote NWB file as zarr v3."""
+"""Load a zarrshadow JSON file and read data from the remote NWB file as zarr v3."""
 
-from zindi import open_rfs
+from zarrshadow import open_rfs
 
 # Open the reference file system as a zarr v3 group
-root = open_rfs("examples/example.zindi.json")
+root = open_rfs("examples/example.zarrshadow.json")
 
 # Browse the hierarchy
 print("Root attributes:")

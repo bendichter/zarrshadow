@@ -4,8 +4,8 @@ import h5py
 import numpy as np
 import pytest
 
-from zindi import generate_rfs, open_rfs
-from zindi import hdf5 as gr
+from zarrshadow import generate_rfs, open_rfs
+from zarrshadow import hdf5 as gr
 
 USERBLOCK = 512
 

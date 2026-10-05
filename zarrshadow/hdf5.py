@@ -1,6 +1,6 @@
 """Generate a zarr v3 reference file system (RFS) from an HDF5 file.
 
-This is zindi's generator for HDF5, including NWB files and MATLAB v7.3 .mat
+This is zarrshadow's generator for HDF5, including NWB files and MATLAB v7.3 .mat
 files. It walks the file with h5py and describes it through RfsBuilder: Zarr
 v3 metadata for every group and array, small datasets inline, and the byte
 range of every chunk in the original file, so zarr reads the data without
@@ -51,7 +51,7 @@ def generate_rfs(
     hdf5_url_or_path : str
         URL or local path of the HDF5 file. If a URL (http/https), it is
         used both as the source for reading metadata and as the target for
-        chunk references. For remote files, zindi uses its built-in Remfile
+        chunk references. For remote files, zarrshadow uses its built-in Remfile
         to read the file over HTTP.
     local_hdf5_path : str or None
         Path to a local copy of the HDF5 file to read metadata from. If
@@ -62,7 +62,7 @@ def generate_rfs(
         and neither hdf5_url_or_path nor local_hdf5_path are opened.
     chunk_index_threshold : int or None
         Arrays with more chunks than this get a chunk index (a numpy array of
-        byte ranges, see ``zindi.chunk_index``) in place of one ref per chunk.
+        byte ranges, see ``zarrshadow.chunk_index``) in place of one ref per chunk.
         None lists every chunk in refs.
     contiguous_chunk_bytes : int or None
         A contiguous (unchunked) HDF5 dataset larger than this is presented as
@@ -99,9 +99,9 @@ def generate_rfs(
         with h5py.File(local_hdf5_path, "r") as opened:
             process(opened, local_hdf5_path)
     elif hdf5_url_or_path.startswith("http://") or hdf5_url_or_path.startswith("https://"):
-        from .remfile import ZindiRemfile
+        from .remfile import ZarrShadowRemfile
 
-        remf = ZindiRemfile(hdf5_url_or_path)
+        remf = ZarrShadowRemfile(hdf5_url_or_path)
         with h5py.File(remf, "r") as opened:
             process(opened, hdf5_url_or_path)
     else:

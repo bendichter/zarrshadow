@@ -7,9 +7,9 @@ import numpy as np
 import pytest
 import zarr
 
-from zindi import RfsBuilder, open_rfs, write_rfs
-from zindi.builder import chunk_key
-from zindi.chunk_index import MISSING
+from zarrshadow import RfsBuilder, open_rfs, write_rfs
+from zarrshadow.builder import chunk_key
+from zarrshadow.chunk_index import MISSING
 
 N_CH, HEADER, ROWS = 16, 12, 1000
 
@@ -55,8 +55,8 @@ def test_strided_written_forms(raw_recording, tmp_path):
     path, x = raw_recording
     rfs = _raw_builder(path, x).build()
 
-    write_rfs(rfs, str(tmp_path / "raw.zindi"))
-    np.testing.assert_array_equal(open_rfs(str(tmp_path / "raw.zindi"))["data"][...], x)
+    write_rfs(rfs, str(tmp_path / "raw.zarrshadow"))
+    np.testing.assert_array_equal(open_rfs(str(tmp_path / "raw.zarrshadow"))["data"][...], x)
 
     # The single JSON lists every chunk, so stock fsspec and zarr read it
     write_rfs(rfs, str(tmp_path / "raw.json"))
@@ -87,8 +87,8 @@ def test_index_for_irregular_layout(tmp_path):
     expected = x.copy()
     expected[2000:2500] = -1.0  # the unwritten chunk reads as the fill value
     np.testing.assert_array_equal(open_rfs(rfs)["x"][...], expected)
-    write_rfs(rfs, str(tmp_path / "shuffled.zindi"))
-    np.testing.assert_array_equal(open_rfs(str(tmp_path / "shuffled.zindi"))["x"][...], expected)
+    write_rfs(rfs, str(tmp_path / "shuffled.zarrshadow"))
+    np.testing.assert_array_equal(open_rfs(str(tmp_path / "shuffled.zarrshadow"))["x"][...], expected)
 
 
 def test_inline_chunks():

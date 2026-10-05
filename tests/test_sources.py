@@ -11,9 +11,9 @@ import pytest
 from zarr.core.buffer import default_buffer_prototype
 from zarr.core.sync import sync
 
-from zindi import SourceChangedError, generate_rfs, open_rfs
-from zindi import sources as sources_module
-from zindi.rfs_store import RfsStore
+from zarrshadow import SourceChangedError, generate_rfs, open_rfs
+from zarrshadow import sources as sources_module
+from zarrshadow.rfs_store import RfsStore
 
 
 def _write_h5(path):

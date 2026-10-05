@@ -4,7 +4,7 @@ from .local_cache import LocalCache
 from .materialize import materialize
 from .neo_rawio import generate_rfs_neo, virtual_arrays_neo
 from .open_rfs import load_rfs, open_rfs
-from .remfile import ZindiRemfile
+from .remfile import ZarrShadowRemfile
 from .rfs_store import RfsStore
 from .sources import SourceChangedError
 from .tiff import generate_rfs_tiff
@@ -24,7 +24,7 @@ __all__ = [
     "open_rfs",
     "load_rfs",
     "LocalCache",
-    "ZindiRemfile",
+    "ZarrShadowRemfile",
     "RfsStore",
     "SourceChangedError",
     "add_url_resolver",

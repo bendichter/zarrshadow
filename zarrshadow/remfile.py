@@ -21,7 +21,7 @@ _DEFAULT_MAX_CHUNK_SIZE = 100 * 1024 * 1024  # 100 MB
 _NUM_REQUEST_RETRIES = 8
 
 
-class ZindiRemfile:
+class ZarrShadowRemfile:
     """A file-like object for reading a remote file over HTTP.
 
     Optimized for reading HDF5 files: starts with small reads for metadata,

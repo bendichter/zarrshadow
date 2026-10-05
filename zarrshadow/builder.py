@@ -9,12 +9,12 @@ files. A generator for a file format walks its source and calls RfsBuilder:
     builder.add_array("data", shape=[10_000, 16], data_type="int16", chunk_shape=[1000, 16])
     builder.add_strided_chunks("data", ndim=2, url=url, start=12, stride=32_000, length=32_000, count=10)
     rfs = builder.build()
-    write_rfs(rfs, "data.zindi")
+    write_rfs(rfs, "data.zarrshadow")
 
 Chunk locations can be given one at a time (add_chunk), as a whole index
 array for arrays with many chunks (add_index), as an arithmetic series for
 evenly spaced chunks (add_strided_chunks, stored as a kerchunk "gen" entry),
-or inline (add_inline_chunk). zindi.hdf5 is the generator for HDF5 files.
+or inline (add_inline_chunk). zarrshadow.hdf5 is the generator for HDF5 files.
 
 When an array is only part of what the file stores in each row, such as some
 of the channels of an interleaved recording, add_selection says which bytes
@@ -191,14 +191,14 @@ class RfsBuilder:
     def add_index(self, path: str, url: str, index: np.ndarray) -> None:
         """All chunks of an array as a uint64 array of shape (*chunk_grid, 2) holding (offset, nbytes).
 
-        Chunks that were never written hold zindi.chunk_index.MISSING. Use this
+        Chunks that were never written hold zarrshadow.chunk_index.MISSING. Use this
         for arrays with many chunks: write_rfs stores the index as a Zarr array
         that readers load one index chunk at a time.
         """
         self.indexes[path] = {"url": url, "index": np.asarray(index, dtype=np.uint64)}
 
     def add_gen(self, key: str, url: str, offset: str, length: str, dimensions: dict) -> None:
-        """A kerchunk gen entry; see zindi.gen for what the templates may contain."""
+        """A kerchunk gen entry; see zarrshadow.gen for what the templates may contain."""
         self.gen.append({"key": key, "url": url, "offset": offset, "length": length, "dimensions": dimensions})
 
     def add_strided_chunks(
@@ -398,7 +398,7 @@ def write_rfs(rfs: dict, output_path: str) -> None:
 
     refs_json = os.path.join(output_path, "refs.json")
     if os.path.isdir(output_path) and os.listdir(output_path) and not os.path.exists(refs_json):
-        raise FileExistsError(f"{output_path} exists and is not a zindi RFS directory")
+        raise FileExistsError(f"{output_path} exists and is not a zarrshadow RFS directory")
     index_dir = os.path.join(output_path, "index")
     if os.path.isdir(index_dir):
         shutil.rmtree(index_dir)

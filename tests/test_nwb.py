@@ -13,8 +13,8 @@ from hdmf_zarr import NWBZarrIO  # noqa: E402
 from pynwb import NWBFile, TimeSeries  # noqa: E402
 from pynwb.ecephys import ElectricalSeries  # noqa: E402
 
-from zindi import RfsStore, VirtualArray, load_rfs, stack  # noqa: E402
-from zindi.nwb import write_virtual_nwb  # noqa: E402
+from zarrshadow import RfsStore, VirtualArray, load_rfs, stack  # noqa: E402
+from zarrshadow.nwb import write_virtual_nwb  # noqa: E402
 
 
 def _nwbfile(n_electrodes=0):
@@ -60,7 +60,7 @@ def test_virtual_nwb(sources, tmp_path):
     nwbfile.add_acquisition(TimeSeries(name="lfp", data=stack(channels, axis=1).placeholder(), unit="V", rate=1000.0))
     nwbfile.add_acquisition(TimeSeries(name="position", data=np.arange(10.0), unit="m", rate=1.0))
 
-    rfs = write_virtual_nwb(nwbfile, str(tmp_path / "session.nwb.zindi"))
+    rfs = write_virtual_nwb(nwbfile, str(tmp_path / "session.nwb.zarrshadow"))
 
     # The signals are references into the five source files, and nothing of them is stored
     assert len(rfs["sources"]) == 5
@@ -72,7 +72,7 @@ def test_virtual_nwb(sources, tmp_path):
     assert all(isinstance(rfs["refs"][k], list) for k in signal_keys)
     assert len(json.dumps(rfs)) < 300_000
 
-    for opened in (rfs, load_rfs(str(tmp_path / "session.nwb.zindi"))):
+    for opened in (rfs, load_rfs(str(tmp_path / "session.nwb.zarrshadow"))):
         with NWBZarrIO(RfsStore(opened), mode="r") as io:
             read = io.read()
             series = read.acquisition["ElectricalSeries"]
@@ -89,7 +89,7 @@ def test_virtual_nwb(sources, tmp_path):
 
 def test_reading_fetches_no_signal(sources, monkeypatch):
     """Opening the file and looking at a dataset's shape reads none of the source files."""
-    import zindi.rfs_store
+    import zarrshadow.rfs_store
 
     raw, x, _, _ = sources
     nwbfile = _nwbfile()
@@ -97,13 +97,13 @@ def test_reading_fetches_no_signal(sources, monkeypatch):
     rfs = write_virtual_nwb(nwbfile)
 
     reads = []
-    read_bytes = zindi.rfs_store._read_bytes_from_url_or_path
+    read_bytes = zarrshadow.rfs_store._read_bytes_from_url_or_path
 
     def logged(url_or_path, offset, length, **kwargs):
         reads.append((offset, length))
         return read_bytes(url_or_path, offset, length, **kwargs)
 
-    monkeypatch.setattr(zindi.rfs_store, "_read_bytes_from_url_or_path", logged)
+    monkeypatch.setattr(zarrshadow.rfs_store, "_read_bytes_from_url_or_path", logged)
     with NWBZarrIO(RfsStore(rfs), mode="r") as io:
         data = io.read().acquisition["raw"].data
         assert data.shape == (10_000, 17) and reads == []
@@ -129,3 +129,45 @@ def test_file_without_virtual_arrays():
     assert rfs["version"] == 1 and "sources" in rfs and rfs["sources"] == {}
     with NWBZarrIO(RfsStore(rfs), mode="r") as io:
         np.testing.assert_array_equal(io.read().acquisition["position"].data[...], np.arange(10.0))
+
+
+@pytest.mark.parametrize("options", [{}, {"compression": "zlib"}])
+def test_tiff_movie_as_two_photon_series(tmp_path, options):
+    """A TIFF stack as a TwoPhotonSeries, whose frames NWB orders (frame, x, y) where the file has (page, row, column)."""
+    tifffile = pytest.importorskip("tifffile")
+    pytest.importorskip("imagecodecs")
+    from pynwb.ophys import OpticalChannel, TwoPhotonSeries
+
+    from zarrshadow import generate_rfs_tiff
+
+    x = np.random.default_rng(2).integers(0, 4000, (30, 48, 64)).astype("uint16")
+    tifffile.imwrite(tmp_path / "movie.tif", x, **options)
+    pages = VirtualArray.from_rfs(generate_rfs_tiff(str(tmp_path / "movie.tif")), "0")
+
+    nwbfile = _nwbfile()
+    device = nwbfile.create_device("microscope")
+    plane = nwbfile.create_imaging_plane(
+        name="plane",
+        optical_channel=OpticalChannel(name="green", description="GCaMP", emission_lambda=510.0),
+        description="a plane",
+        device=device,
+        excitation_lambda=920.0,
+        indicator="GCaMP6f",
+        location="V1",
+    )
+    nwbfile.add_acquisition(
+        TwoPhotonSeries(
+            name="TwoPhotonSeries", data=pages.transpose(0, 2, 1).placeholder(), imaging_plane=plane, rate=30.0, unit="a.u."
+        )
+    )
+    rfs = write_virtual_nwb(nwbfile)
+    codecs = json.loads(rfs["refs"]["acquisition/TwoPhotonSeries/data/zarr.json"])["codecs"]
+    assert codecs[0] == {"name": "transpose", "configuration": {"order": [0, 2, 1]}}
+    assert len(codecs) == (3 if options else 2)
+
+    with NWBZarrIO(RfsStore(rfs), mode="r") as io:
+        data = io.read().acquisition["TwoPhotonSeries"].data
+        assert data.shape == (30, 64, 48)
+        np.testing.assert_array_equal(data[...], x.transpose(0, 2, 1))
+        np.testing.assert_array_equal(data[7, 10:20, 5], x[7, 5, 10:20])
+        assert pynwb.validate(io=io) == []

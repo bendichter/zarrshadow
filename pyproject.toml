@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "zindi"
+name = "zarrshadow"
 version = "0.1.0"
 description = "Represent remote HDF5 NWB files as Zarr v3 via reference file systems"
 requires-python = ">=3.12"

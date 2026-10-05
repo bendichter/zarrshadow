@@ -1,4 +1,4 @@
-"""Read a zindi RFS of a pynwb-written file with hdmf-zarr's NWBZarrIO."""
+"""Read a zarrshadow RFS of a pynwb-written file with hdmf-zarr's NWBZarrIO."""
 
 import warnings
 from datetime import datetime, timezone
@@ -6,9 +6,9 @@ from datetime import datetime, timezone
 import numpy as np
 import pytest
 
-from zindi import generate_rfs, write_rfs
-from zindi.open_rfs import load_rfs
-from zindi.rfs_store import RfsStore
+from zarrshadow import generate_rfs, write_rfs
+from zarrshadow.open_rfs import load_rfs
+from zarrshadow.rfs_store import RfsStore
 
 pynwb = pytest.importorskip("pynwb")
 hdmf_zarr_nwb = pytest.importorskip("hdmf_zarr.nwb")
@@ -23,7 +23,7 @@ from pynwb.file import Subject  # noqa: E402
 def nwb_path(tmp_path_factory):
     path = tmp_path_factory.mktemp("nwb") / "test.nwb"
     nwb = NWBFile(
-        session_description="zindi test",
+        session_description="zarrshadow test",
         identifier="abc",
         session_start_time=datetime(2024, 1, 1, tzinfo=timezone.utc),
         subject=Subject(subject_id="m1", species="Mus musculus", age="P90D"),
@@ -58,7 +58,7 @@ def nwb_path(tmp_path_factory):
 
 @pytest.fixture(scope="module", params=["refs", "chunk_index", "directory", "contiguous_gen"])
 def nwb_pair(request, nwb_path, tmp_path_factory):
-    """Yield the file as read by NWBHDF5IO and by NWBZarrIO over the zindi RFS.
+    """Yield the file as read by NWBHDF5IO and by NWBZarrIO over the zarrshadow RFS.
 
     The ElectricalSeries data has 30 chunks, so a threshold of 10 gives it a
     chunk index. "directory" writes that RFS to disk and reads it back.
@@ -73,7 +73,7 @@ def nwb_pair(request, nwb_path, tmp_path_factory):
         rfs = generate_rfs(nwb_path, chunk_index_threshold=10)
         assert "acquisition/ElectricalSeries/data" in rfs["indexes"]
     if request.param == "directory":
-        out = str(tmp_path_factory.mktemp("rfs") / "test.zindi")
+        out = str(tmp_path_factory.mktemp("rfs") / "test.zarrshadow")
         write_rfs(rfs, out)
         rfs = load_rfs(out)
     with NWBHDF5IO(nwb_path, "r") as h5io:

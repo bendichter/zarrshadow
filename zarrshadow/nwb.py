@@ -6,7 +6,7 @@ VirtualArray's placeholder as its data:
     arrays = virtual_arrays_neo(reader)
     series = ElectricalSeries(name="ElectricalSeries", data=arrays["imec0.ap"].placeholder(), ...)
     nwbfile.add_acquisition(series)
-    rfs = write_virtual_nwb(nwbfile, "session.nwb.zindi")
+    rfs = write_virtual_nwb(nwbfile, "session.nwb.zarrshadow")
 
 hdmf-zarr writes the file's structure: the groups, attributes, object ids,
 references, the cached specification, and every dataset that holds real data.
@@ -14,9 +14,9 @@ For a placeholder it writes only the array's metadata, and write_virtual_nwb
 adds the VirtualArray's chunk locations there. No signal data is read or
 copied. Read the result with
 
-    NWBZarrIO(RfsStore(load_rfs("session.nwb.zindi")), mode="r")
+    NWBZarrIO(RfsStore(load_rfs("session.nwb.zarrshadow")), mode="r")
 
-Requires pynwb and hdmf-zarr 0.14 or later (pip install zindi[nwb]).
+Requires pynwb and hdmf-zarr 0.14 or later (pip install zarrshadow[nwb]).
 """
 
 from __future__ import annotations
