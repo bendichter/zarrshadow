@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "zindi"
 version = "0.1.0"
 description = "Represent remote HDF5 NWB files as Zarr v3 via reference file systems"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "zarr>=3.1.3",
     "h5py",
@@ -19,7 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 tiff = [
-    "tifffile>=2025.1.1",
+    "tifffile>=2026.4.11",
     "imagecodecs",
 ]
 neo = [
@@ -30,6 +30,12 @@ dev = [
     "pytest",
     "pynwb",
     "hdmf-zarr>=0.14.0",
-    "tifffile>=2025.1.1",
+    "tifffile>=2026.4.11",
     "imagecodecs",
 ]
+
+[tool.pytest.ini_options]
+markers = [
+    "gin: tests that download NEO's testing data from GIN (run with -m gin)",
+]
+addopts = "-m 'not gin'"
