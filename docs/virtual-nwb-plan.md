@@ -100,7 +100,7 @@ A column permutation needs no selection: the `electrodes` region of an `Electric
 
    Two things stand between the prototype and something users can install:
    - SpikeInterface requires `zarr<3` (0.105.1), and zindi needs Zarr v3. Zarr v3 support is in progress at https://github.com/SpikeInterface/spikeinterface/pull/4260. Until then the two install together only with the requirement overridden.
-   - NeuroConv 0.10.2 reads `zarr.codec_registry` at import, which Zarr v3 removed. Building an NWB file in memory works once that one attribute is put back, and the bridge needs nothing else from NeuroConv. NeuroConv's own Zarr backend was not tested under Zarr v3.
+   - NeuroConv 0.10.2 reads `zarr.codec_registry` at import, which Zarr v3 removed. Building an NWB file in memory works once that one attribute is put back, and the bridge needs nothing else from NeuroConv. NeuroConv's own Zarr backend was not tested under Zarr v3. NeuroConv pins `zarr<3` on its main branch. Zarr v3 support is tracked in https://github.com/catalystneuro/neuroconv/issues/2076, and https://github.com/catalystneuro/neuroconv/pull/1749 is a draft port of its Zarr backend.
 3. Imaging: the TIFF family (ScanImage, Bruker, Micro-Manager, Thor) through the extractors' page tables, and HDF5 imaging. This is the largest data volume NeuroConv handles, and it brings in the transpose work that every other imaging format reuses.
 4. New ephys generators, in this order:
    - Blackrock nsX, specs 2.1 to 3.0: one contiguous block per segment.
