@@ -16,6 +16,18 @@ When you open this JSON, zarrshadow provides a zarr v3 `Store` that fetches chun
 
 The metadata and small datasets are copied into the JSON when it is generated. Each chunk is a `[url, offset, size]` pointer into the original file and is fetched with an HTTP range request when it is read. The strip on the right enlarges the first 0.8 MB of the 103 GB file, where `c/0/0` begins right after 10 KB of HDF5 headers. The rest of the file holds more chunks, with more headers and heaps spread through it.
 
+## How the Packages Fit Together
+
+zarrshadow sits between the libraries that understand source formats and the libraries that read Zarr.
+
+![zarrshadow reads the headers of source files and writes kerchunk references, which zarr-python reads through zarrshadow's store while fetching byte ranges from the source files; materialize turns the references into an ordinary Zarr store; in MATLAB, matzarr indexes MAT files for zarr-matlab](docs/images/ecosystem.svg)
+
+On the writing side, zarrshadow reads only headers, through h5py, tifffile, and NEO, and writes references in the [kerchunk](https://fsspec.github.io/kerchunk/spec.html) JSON format with Zarr v3 keys. For an NWB file, hdmf-zarr and PyNWB write the file's structure, and NeuroConv can supply the file to write, which is experimental. On the reading side, `RfsStore` is a zarr-python store, so anything built on zarr-python reads the references, including hdmf-zarr's `NWBZarrIO`. A version 1 file is plain kerchunk, which fsspec reads too. A version 2 file, which uses `gen`, `indexes`, or `selections`, needs zarrshadow's store.
+
+MATLAB has a parallel path for MAT files. [matzarr](https://github.com/catalystneuro/matzarr) indexes a `.mat` file into Zarr v3 metadata and a `manifest.json`, which the `ManifestStore` of [zarr-matlab](https://github.com/catalystneuro/zarr-matlab) reads, and a script in matzarr translates that index into kerchunk references. zarr-matlab does not read kerchunk references, so the references zarrshadow writes cannot be read from MATLAB as they are.
+
+`materialize` removes the difference. Its output is an ordinary Zarr v3 store with no references, which zarr-python, zarr-matlab, and zarrita.js all read.
+
 ## How it relates to Lindi
 
 [Lindi](https://github.com/NeurodataWithoutBorders/lindi) does something similar but targets Zarr v2 and creates an h5py-like shim object for use with `pynwb.NWBHDF5IO`.
