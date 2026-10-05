@@ -27,6 +27,7 @@ from typing import Any
 import numpy as np
 
 from .builder import RfsBuilder, bytes_codecs, contiguous_chunk_shape, zarr_data_type
+from .virtual import VirtualArray
 
 
 def generate_rfs_neo(
@@ -102,6 +103,81 @@ def generate_rfs_neo(
     return builder.build(record_sources=record_sources)
 
 
+def virtual_arrays_neo(
+    reader: Any,
+    *,
+    url_for: Callable[[str], str] | None = None,
+    chunk_bytes: int = 4 * 2**20,
+) -> dict[str, VirtualArray]:
+    """One VirtualArray for each signal stream of a NEO raw reader.
+
+    generate_rfs_neo describes each buffer as the file stores it, which may
+    hold several streams side by side, such as the neural channels and the
+    sync channel of a SpikeGLX file. Here each stream is its own array, time
+    by channel, holding only its channels. Each array's attributes give the
+    stream's sampling rate, t_start, and its channels' ids, names, units,
+    gains, and offsets.
+
+    The arrays are keyed by stream id for a reader with one block and one
+    segment, and otherwise by "block<b>/segment<s>/<stream id>". The
+    parameters are those of generate_rfs_neo. Only raw binary buffers are
+    supported.
+    """
+    if getattr(reader, "header", None) is None:
+        reader.parse_header()
+    if not reader.has_buffer_description_api():
+        raise ValueError(
+            f"{type(reader).__name__} does not describe its signal buffers, so its "
+            "files cannot be referenced; zindi supports the NEO readers that do"
+        )
+    url_for = url_for or (lambda path: path)
+    n_blocks = reader.block_count()
+    single = n_blocks == 1 and reader.segment_count(0) == 1
+    buffers = {str(buffer["id"]): buffer for buffer in reader.header["signal_buffers"]}
+    arrays: dict[str, VirtualArray] = {}
+    for block in range(n_blocks):
+        for seg in range(reader.segment_count(block)):
+            for stream in reader.header["signal_streams"]:
+                stream_id, buffer_id = str(stream["id"]), str(stream["buffer_id"])
+                try:
+                    desc = reader.get_analogsignal_buffer_description(
+                        block_index=block, seg_index=seg, buffer_id=buffer_id
+                    )
+                except KeyError:
+                    continue  # this buffer is not in this segment
+                if desc["type"] != "raw":
+                    raise NotImplementedError(
+                        f"Stream {stream_id!r} is in a {desc['type']} buffer; only raw binary buffers "
+                        "can be split into streams"
+                    )
+                _check_raw_layout(desc)
+                file_path = str(desc["file_path"])
+                buffer_array = VirtualArray.contiguous(
+                    url_for(file_path),
+                    shape=[int(n) for n in desc["shape"]],
+                    dtype=np.dtype(desc["dtype"]),
+                    offset=int(desc["file_offset"]),
+                    file_size=os.path.getsize(file_path),
+                    chunk_bytes=chunk_bytes,
+                )
+                columns = reader._stream_buffer_slice.get(stream_id)
+                array = buffer_array if columns is None else buffer_array[:, columns]
+                info = _buffer_attributes(reader, block, seg, buffers[buffer_id], desc)
+                (stream_info,) = [s for s in info["streams"] if s["id"] == stream_id]
+                array.attributes = {k: v for k, v in stream_info.items() if k != "columns"}
+                name = stream_id.replace("/", "_")
+                arrays[name if single else f"block{block}/segment{seg}/{name}"] = array
+    return arrays
+
+
+def _check_raw_layout(desc: dict) -> None:
+    if desc.get("order", "C") != "C" or desc.get("time_axis", 0) != 0:
+        raise NotImplementedError(
+            f"raw buffers are supported in C order with time first; got order "
+            f"{desc.get('order')!r} and time_axis {desc.get('time_axis', 0)}"
+        )
+
+
 def _add_raw_buffer(
     builder: RfsBuilder,
     path: str,
@@ -111,11 +187,7 @@ def _add_raw_buffer(
     chunk_bytes: int,
 ) -> None:
     """A raw binary buffer: an uncompressed array stored in one piece."""
-    if desc.get("order", "C") != "C" or desc.get("time_axis", 0) != 0:
-        raise NotImplementedError(
-            f"raw buffers are supported in C order with time first; got order "
-            f"{desc.get('order')!r} and time_axis {desc.get('time_axis', 0)}"
-        )
+    _check_raw_layout(desc)
     dtype = np.dtype(desc["dtype"])
     shape = [int(n) for n in desc["shape"]]
     chunk_shape = contiguous_chunk_shape(shape, dtype.itemsize, chunk_bytes)

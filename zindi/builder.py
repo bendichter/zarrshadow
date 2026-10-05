@@ -94,6 +94,13 @@ def contiguous_chunk_shape(shape: Sequence[int], itemsize: int, target_bytes: in
     return [rows] + shape_list[1:]
 
 
+def inline_value(data: bytes) -> str:
+    """How bytes are stored in the RFS itself: printable text as is, anything else as base64."""
+    if not data.startswith(b"base64:") and all(32 <= b < 127 or b in (9, 10, 13) for b in data):
+        return data.decode("ascii")
+    return "base64:" + base64.b64encode(data).decode("ascii")
+
+
 def columns_selection(n_columns: int, itemsize: int, columns: slice | Sequence[int]) -> tuple[int, list[list[int]]]:
     """The record size and byte ranges that keep some columns of interleaved data.
 
@@ -179,10 +186,7 @@ class RfsBuilder:
 
     def add_inline_chunk(self, path: str, coords: Sequence[int], data: bytes) -> None:
         """A chunk stored in the RFS itself: printable text as is, anything else as base64."""
-        text = None
-        if not data.startswith(b"base64:") and all(32 <= b < 127 or b in (9, 10, 13) for b in data):
-            text = data.decode("ascii")
-        self.refs[chunk_key(path, coords)] = text if text is not None else "base64:" + base64.b64encode(data).decode("ascii")
+        self.refs[chunk_key(path, coords)] = inline_value(data)
 
     def add_index(self, path: str, url: str, index: np.ndarray) -> None:
         """All chunks of an array as a uint64 array of shape (*chunk_grid, 2) holding (offset, nbytes).
@@ -207,18 +211,23 @@ class RfsBuilder:
         stride: int,
         length: int,
         count: int,
+        coords: Sequence[int | None] | None = None,
     ) -> None:
         """Chunks 0..count-1 along the first axis, chunk i at start + i * stride.
 
         The other chunk coordinates are 0, so the chunk shape must span every
         other axis. This is the layout of a raw binary recording, or of a
         contiguous HDF5 dataset split into slabs.
+
+        coords places the chunks elsewhere in the chunk grid: one coordinate
+        per axis, with None for the axis the chunks run along.
         """
         if count <= 0:
             return
-        rest = "/0" * (ndim - 1)
+        if coords is None:
+            coords = [None] + [0] * (ndim - 1)
         self.add_gen(
-            key=f"{path}/c/{{{{i}}}}{rest}",
+            key=f"{path}/c/" + "/".join("{{i}}" if c is None else str(int(c)) for c in coords),
             url=url,
             offset=f"{{{{{int(start)} + i * {int(stride)}}}}}",
             length=str(int(length)),
@@ -265,6 +274,7 @@ class RfsBuilder:
         itemsize: int,
         file_size: int | None = None,
         row_bytes: int | None = None,
+        coords: Sequence[int | None] | None = None,
     ) -> None:
         """Chunks of an uncompressed C-ordered array stored in one piece at start.
 
@@ -277,15 +287,21 @@ class RfsBuilder:
 
         row_bytes is the size in the file of one step along the first axis,
         when that is more than the array's own row because the array has a
-        selection (see add_selection).
+        selection (see add_selection). coords places the chunks elsewhere in
+        the chunk grid, as for add_strided_chunks.
         """
         shape = [int(s) for s in shape]
         if row_bytes is None:
             row_bytes = int(np.prod(shape[1:])) * itemsize
         total = shape[0] * row_bytes if shape else itemsize
-        origin = [0] * len(shape)
+        if coords is None:
+            coords = [None] + [0] * (len(shape) - 1) if shape else []
+
+        def at(i: int) -> list[int]:
+            return [i if c is None else int(c) for c in coords]
+
         if not shape or chunk_shape[0] >= shape[0]:
-            self.add_chunk(path, origin, url, start, total)
+            self.add_chunk(path, at(0), url, start, total)
             return
         slab = int(chunk_shape[0]) * row_bytes
         n_slabs = -(-shape[0] // int(chunk_shape[0]))
@@ -293,10 +309,10 @@ class RfsBuilder:
         full_last = shape[0] % int(chunk_shape[0]) == 0 or (file_size is not None and last + slab <= file_size)
         self.add_strided_chunks(
             path, ndim=len(shape), url=url, start=start, stride=slab, length=slab,
-            count=n_slabs if full_last else n_slabs - 1,
+            count=n_slabs if full_last else n_slabs - 1, coords=coords,
         )
         if not full_last:
-            self.add_chunk(path, [n_slabs - 1] + origin[1:], url, last, start + total - last)
+            self.add_chunk(path, at(n_slabs - 1), url, last, start + total - last)
 
     def add_chunks(
         self,
