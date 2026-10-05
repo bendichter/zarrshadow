@@ -229,16 +229,16 @@ def test_stream_selections_match_neo(name, path):
                 dtype = np.dtype(desc["dtype"])
                 shape = [n_rows, len(columns)]
                 chunk_shape = contiguous_chunk_shape(shape, dtype.itemsize, 2**20)
-                record, keep = columns_selection(n_columns, dtype.itemsize, columns)
+                record_size, keep = columns_selection(n_columns, dtype.itemsize, columns)
                 array_path = f"a{len(expected)}"
                 builder.add_array(
                     array_path, shape=shape, data_type=zarr_data_type(dtype), chunk_shape=chunk_shape,
                     codecs=bytes_codecs(dtype),
                 )
-                builder.add_selection(array_path, record, keep)
+                builder.add_selection(array_path, record_size, keep)
                 builder.add_contiguous_chunks(
                     array_path, url=str(desc["file_path"]), start=int(desc["file_offset"]), shape=shape,
-                    chunk_shape=chunk_shape, itemsize=dtype.itemsize, row_bytes=record,
+                    chunk_shape=chunk_shape, itemsize=dtype.itemsize, row_bytes=record_size,
                     file_size=os.path.getsize(desc["file_path"]),
                 )
                 expected[array_path] = reader.get_analogsignal_chunk(

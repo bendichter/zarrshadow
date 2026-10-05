@@ -29,15 +29,15 @@ def recording(tmp_path):
 
 
 def _builder(url, x, columns, *, chunk_rows=CHUNK_ROWS, file_size=None):
-    record, keep = columns_selection(x.shape[1], x.itemsize, columns)
+    record_size, keep = columns_selection(x.shape[1], x.itemsize, columns)
     n_kept = sum(stop - start for start, stop in keep) // x.itemsize
     builder = RfsBuilder()
     builder.add_group("")
     builder.add_array("data", shape=[len(x), n_kept], data_type="int16", chunk_shape=[chunk_rows, n_kept])
-    builder.add_selection("data", record, keep)
+    builder.add_selection("data", record_size, keep)
     builder.add_contiguous_chunks(
         "data", url=url, start=HEADER, shape=[len(x), n_kept], chunk_shape=[chunk_rows, n_kept],
-        itemsize=x.itemsize, file_size=file_size, row_bytes=record,
+        itemsize=x.itemsize, file_size=file_size, row_bytes=record_size,
     )
     return builder
 
@@ -56,7 +56,7 @@ def test_leading_columns(recording):
     path, x = recording
     rfs = _builder(path, x, slice(0, 16)).build()
     assert rfs["version"] == 2
-    assert rfs["selections"] == {"data": {"record": 34, "keep": [[0, 32]]}}
+    assert rfs["selections"] == {"data": {"record_size": 34, "keep": [[0, 32]]}}
     data = open_rfs(rfs)["data"]
     assert data.shape == (ROWS, 16)
     np.testing.assert_array_equal(data[...], x[:, :16])
@@ -90,7 +90,7 @@ def test_packet_headers(tmp_path):
     builder = RfsBuilder()
     builder.add_group("")
     builder.add_array("data", shape=x.shape, data_type="int16", chunk_shape=[500, 4])
-    builder.add_selection("data", record=16, keep=[[6, 14]])
+    builder.add_selection("data", record_size=16, keep=[[6, 14]])
     builder.add_strided_chunks("data", ndim=2, url=str(path), start=0, stride=8000, length=8000, count=10)
     np.testing.assert_array_equal(open_rfs(builder.build())["data"][...], x)
 
@@ -113,9 +113,9 @@ def test_written_forms(recording, tmp_path):
 def test_invalid_selections(recording):
     path, x = recording
     builder = RfsBuilder()
-    for record, keep in [(0, [[0, 1]]), (8, []), (8, [[4, 4]]), (8, [[6, 10]]), (8, [[-1, 2]])]:
+    for record_size, keep in [(0, [[0, 1]]), (8, []), (8, [[4, 4]]), (8, [[6, 10]]), (8, [[-1, 2]])]:
         with pytest.raises(ValueError):
-            builder.add_selection("data", record, keep)
+            builder.add_selection("data", record_size, keep)
 
     # A reference that is not a whole number of records
     builder = _builder(path, x, slice(0, 16))
@@ -126,7 +126,7 @@ def test_invalid_selections(recording):
 
 
 def test_selection_source_range():
-    selection = Selection(record=10, keep=[[2, 6], [8, 10]])  # 6 of every 10 bytes
+    selection = Selection(record_size=10, keep=[[2, 6], [8, 10]])  # 6 of every 10 bytes
     data = bytes(range(40))
     assert selection.apply(data) == bytes([2, 3, 4, 5, 8, 9, 12, 13, 14, 15, 18, 19, 22, 23, 24, 25, 28, 29,
                                            32, 33, 34, 35, 38, 39])

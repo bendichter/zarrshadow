@@ -151,22 +151,22 @@ zindi computes a slab's offset when that chunk is requested. The slab height div
 Some files store an array together with bytes that do not belong to it. A SpikeGLX recording holds 384 neural channels and one sync channel, interleaved sample by sample, so no byte range contains the neural channels alone. Other formats put a header in front of every sample. For these, `selections` says which bytes of the file belong to the array:
 
 ```json
-"selections": {"imec0.ap": {"record": 770, "keep": [[0, 768]]}}
+"selections": {"imec0.ap": {"record_size": 770, "keep": [[0, 768]]}}
 ```
 
-Every reference of the array is read as consecutive records of `record` bytes, here one sample of all 385 int16 channels. From each record the byte ranges in `keep` are taken and joined in the order listed, and the rest is dropped. The Zarr metadata describes only the selected data, a 384-column array with the plain `bytes` codec, so nothing in the codec chain is specific to zindi. Listing several ranges keeps columns that are not next to each other, and listing them in another order reorders the columns. A selection applies to uncompressed data.
+Every reference of the array is read as consecutive records of `record_size` bytes, here one sample of all 385 int16 channels. From each record the byte ranges in `keep` are taken and joined in the order listed, and the rest is dropped. The Zarr metadata describes only the selected data, a 384-column array with the plain `bytes` codec, so nothing in the codec chain is specific to zindi. Listing several ranges keeps columns that are not next to each other, and listing them in another order reorders the columns. A selection applies to uncompressed data.
 
 ```python
 from zindi import RfsBuilder
 from zindi.builder import columns_selection
 
-record, keep = columns_selection(n_columns=385, itemsize=2, columns=slice(0, 384))
+record_size, keep = columns_selection(n_columns=385, itemsize=2, columns=slice(0, 384))
 builder = RfsBuilder()
 builder.add_group("")
 builder.add_array("imec0.ap", shape=[n_samples, 384], data_type="int16", chunk_shape=[30_000, 384])
-builder.add_selection("imec0.ap", record, keep)
+builder.add_selection("imec0.ap", record_size, keep)
 builder.add_contiguous_chunks(
-    "imec0.ap", url=url, start=0, shape=[n_samples, 384], chunk_shape=[30_000, 384], itemsize=2, row_bytes=record
+    "imec0.ap", url=url, start=0, shape=[n_samples, 384], chunk_shape=[30_000, 384], itemsize=2, row_bytes=record_size
 )
 ```
 

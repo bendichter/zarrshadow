@@ -659,30 +659,30 @@ def _array_path(key: str) -> str | None:
 class Selection:
     """Which bytes of every record in the file belong to an array.
 
-    A reference is read as consecutive records of record bytes. From each one,
+    A reference is read as consecutive records of record_size bytes. From each one,
     the [start, stop) ranges in keep are taken and joined in the order listed.
     See RfsBuilder.add_selection.
     """
 
-    def __init__(self, record: int, keep: list[list[int]]) -> None:
-        self.record = int(record)
+    def __init__(self, record_size: int, keep: list[list[int]]) -> None:
+        self.record_size = int(record_size)
         self.keep = [(int(a), int(b)) for a, b in keep]
-        if self.record <= 0 or not self.keep or any(not 0 <= a < b <= self.record for a, b in self.keep):
-            raise ValueError(f"Invalid selection: record {record}, keep {keep}")
+        if self.record_size <= 0 or not self.keep or any(not 0 <= a < b <= self.record_size for a, b in self.keep):
+            raise ValueError(f"Invalid selection: record_size {record_size}, keep {keep}")
         self.kept = sum(b - a for a, b in self.keep)
 
     def selected_size(self, source_size: int) -> int:
         """The size of what is kept from source_size bytes of the file."""
-        if source_size % self.record:
+        if source_size % self.record_size:
             raise ValueError(
-                f"A reference of {source_size} bytes is not a whole number of {self.record} byte records"
+                f"A reference of {source_size} bytes is not a whole number of {self.record_size} byte records"
             )
-        return source_size // self.record * self.kept
+        return source_size // self.record_size * self.kept
 
     def apply(self, data: bytes) -> bytes:
         """Keep the selected bytes of every record in data."""
         self.selected_size(len(data))
-        records = np.frombuffer(data, dtype=np.uint8).reshape(-1, self.record)
+        records = np.frombuffer(data, dtype=np.uint8).reshape(-1, self.record_size)
         if len(self.keep) == 1:
             start, stop = self.keep[0]
             return records[:, start:stop].tobytes()
@@ -696,4 +696,4 @@ class Selection:
         """
         first = start // self.kept
         last = -(-stop // self.kept)
-        return first * self.record, (last - first) * self.record, start - first * self.kept
+        return first * self.record_size, (last - first) * self.record_size, start - first * self.kept

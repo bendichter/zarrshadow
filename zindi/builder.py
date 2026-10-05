@@ -225,34 +225,34 @@ class RfsBuilder:
             dimensions={"i": {"stop": int(count)}},
         )
 
-    def add_selection(self, path: str, record: int, keep: Sequence[Sequence[int]]) -> None:
+    def add_selection(self, path: str, record_size: int, keep: Sequence[Sequence[int]]) -> None:
         """Say which bytes of the file belong to an array, when its chunks are stored with other bytes.
 
         Every chunk reference of the array is read as consecutive records of
-        record bytes. From each record the byte ranges in keep, given as
+        record_size bytes. From each record the byte ranges in keep, given as
         [start, stop) pairs within the record, are taken and joined in the
         order listed; the rest is dropped. The chunk a reader decodes is the
         result for all of the records the reference covers.
 
         For a file holding 385 interleaved int16 channels, of which an array
         holds the first 384, a record is one sample of every channel:
-        record=770 and keep=[[0, 768]]. For samples stored in packets with a
-        14-byte header each, keep=[[14, record]]. Listing the ranges in
+        record_size=770 and keep=[[0, 768]]. For samples stored in packets with a
+        14-byte header each, keep=[[14, record_size]]. Listing the ranges in
         another order reorders the columns. columns_selection builds the
         arguments for a choice of columns.
 
         The references of an array with a selection give the bytes in the
-        file, so their lengths are multiples of record. A selection applies to
+        file, so their lengths are multiples of record_size. A selection applies to
         uncompressed data.
         """
-        record = int(record)
+        record_size = int(record_size)
         spans = [[int(a), int(b)] for a, b in keep]
-        if record <= 0 or not spans:
+        if record_size <= 0 or not spans:
             raise ValueError("A selection needs a positive record size and at least one byte range")
         for a, b in spans:
-            if not 0 <= a < b <= record:
-                raise ValueError(f"Byte range [{a}, {b}) is not within a record of {record} bytes")
-        self.selections[path] = {"record": record, "keep": spans}
+            if not 0 <= a < b <= record_size:
+                raise ValueError(f"Byte range [{a}, {b}) is not within a record of {record_size} bytes")
+        self.selections[path] = {"record_size": record_size, "keep": spans}
 
     def add_contiguous_chunks(
         self,
