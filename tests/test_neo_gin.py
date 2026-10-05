@@ -193,3 +193,59 @@ def test_every_reader_with_buffer_api_is_listed():
     """A reader that gains the buffer description API in a new NEO release needs files here."""
     readers = {cls.__name__ for cls in neo_rawio.rawiolist if issubclass(cls, BaseRawWithBufferApiIO)}
     assert readers == set(FILES) | set(UNSUPPORTED_FILES)
+
+
+def _stream_columns(reader, stream_id, n_columns):
+    """The columns of its buffer that a stream holds, or None when it holds all of them."""
+    spec = reader._stream_buffer_slice.get(stream_id)
+    if spec is None:
+        return None
+    columns = list(range(*spec.indices(n_columns))) if isinstance(spec, slice) else [int(c) for c in spec]
+    return None if columns == list(range(n_columns)) else columns
+
+
+@pytest.mark.parametrize(("name", "path"), _cases(FILES))
+def test_stream_selections_match_neo(name, path):
+    """A stream that is some of the columns of its buffer reads the same through a selection as through NEO."""
+    from zindi import RfsBuilder
+    from zindi.builder import bytes_codecs, columns_selection, contiguous_chunk_shape, zarr_data_type
+
+    reader = _reader(name, path)
+    builder = RfsBuilder()
+    builder.add_group("")
+    expected = {}
+    for block in range(reader.block_count()):
+        for seg in range(reader.segment_count(block)):
+            for stream_index, stream in enumerate(reader.header["signal_streams"]):
+                desc = reader.get_analogsignal_buffer_description(
+                    block_index=block, seg_index=seg, buffer_id=str(stream["buffer_id"])
+                )
+                if desc["type"] != "raw":
+                    continue
+                n_rows, n_columns = (int(n) for n in desc["shape"])
+                columns = _stream_columns(reader, str(stream["id"]), n_columns)
+                if columns is None or n_rows == 0:
+                    continue
+                dtype = np.dtype(desc["dtype"])
+                shape = [n_rows, len(columns)]
+                chunk_shape = contiguous_chunk_shape(shape, dtype.itemsize, 2**20)
+                record_size, keep = columns_selection(n_columns, dtype.itemsize, columns)
+                array_path = f"a{len(expected)}"
+                builder.add_array(
+                    array_path, shape=shape, data_type=zarr_data_type(dtype), chunk_shape=chunk_shape,
+                    codecs=bytes_codecs(dtype),
+                )
+                builder.add_selection(array_path, record_size, keep)
+                builder.add_contiguous_chunks(
+                    array_path, url=str(desc["file_path"]), start=int(desc["file_offset"]), shape=shape,
+                    chunk_shape=chunk_shape, itemsize=dtype.itemsize, row_bytes=record_size,
+                    file_size=os.path.getsize(desc["file_path"]),
+                )
+                expected[array_path] = reader.get_analogsignal_chunk(
+                    block_index=block, seg_index=seg, stream_index=stream_index
+                )
+    if not expected:
+        pytest.skip("every stream of this recording holds all the columns of its buffer")
+    root = open_rfs(builder.build())
+    for array_path, data in expected.items():
+        np.testing.assert_array_equal(root[array_path][...], data)

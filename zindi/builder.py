@@ -15,6 +15,10 @@ Chunk locations can be given one at a time (add_chunk), as a whole index
 array for arrays with many chunks (add_index), as an arithmetic series for
 evenly spaced chunks (add_strided_chunks, stored as a kerchunk "gen" entry),
 or inline (add_inline_chunk). zindi.hdf5 is the generator for HDF5 files.
+
+When an array is only part of what the file stores in each row, such as some
+of the channels of an interleaved recording, add_selection says which bytes
+of every row belong to it.
 """
 
 from __future__ import annotations
@@ -90,6 +94,30 @@ def contiguous_chunk_shape(shape: Sequence[int], itemsize: int, target_bytes: in
     return [rows] + shape_list[1:]
 
 
+def columns_selection(n_columns: int, itemsize: int, columns: slice | Sequence[int]) -> tuple[int, list[list[int]]]:
+    """The record size and byte ranges that keep some columns of interleaved data.
+
+    The file stores n_columns values of itemsize bytes for every row. columns
+    is a slice or a list of column numbers, in the order the array has them.
+    Pass the result to RfsBuilder.add_selection.
+    """
+    if isinstance(columns, slice):
+        columns = range(*columns.indices(n_columns))
+    keep: list[list[int]] = []
+    for column in columns:
+        column = int(column)
+        if not 0 <= column < n_columns:
+            raise ValueError(f"Column {column} is not one of the {n_columns} columns")
+        start = column * itemsize
+        if keep and keep[-1][1] == start:
+            keep[-1][1] = start + itemsize
+        else:
+            keep.append([start, start + itemsize])
+    if not keep:
+        raise ValueError("No columns selected")
+    return n_columns * itemsize, keep
+
+
 class RfsBuilder:
     """Accumulates Zarr metadata and chunk locations for one reference file system."""
 
@@ -97,6 +125,7 @@ class RfsBuilder:
         self.refs: dict[str, Any] = {}
         self.indexes: dict[str, dict] = {}
         self.gen: list[dict] = []
+        self.selections: dict[str, dict] = {}
 
     # -- Metadata --
 
@@ -196,6 +225,35 @@ class RfsBuilder:
             dimensions={"i": {"stop": int(count)}},
         )
 
+    def add_selection(self, path: str, record_size: int, keep: Sequence[Sequence[int]]) -> None:
+        """Say which bytes of the file belong to an array, when its chunks are stored with other bytes.
+
+        Every chunk reference of the array is read as consecutive records of
+        record_size bytes. From each record the byte ranges in keep, given as
+        [start, stop) pairs within the record, are taken and joined in the
+        order listed; the rest is dropped. The chunk a reader decodes is the
+        result for all of the records the reference covers.
+
+        For a file holding 385 interleaved int16 channels, of which an array
+        holds the first 384, a record is one sample of every channel:
+        record_size=770 and keep=[[0, 768]]. For samples stored in packets with a
+        14-byte header each, keep=[[14, record_size]]. Listing the ranges in
+        another order reorders the columns. columns_selection builds the
+        arguments for a choice of columns.
+
+        The references of an array with a selection give the bytes in the
+        file, so their lengths are multiples of record_size. A selection applies to
+        uncompressed data.
+        """
+        record_size = int(record_size)
+        spans = [[int(a), int(b)] for a, b in keep]
+        if record_size <= 0 or not spans:
+            raise ValueError("A selection needs a positive record size and at least one byte range")
+        for a, b in spans:
+            if not 0 <= a < b <= record_size:
+                raise ValueError(f"Byte range [{a}, {b}) is not within a record of {record_size} bytes")
+        self.selections[path] = {"record_size": record_size, "keep": spans}
+
     def add_contiguous_chunks(
         self,
         path: str,
@@ -206,6 +264,7 @@ class RfsBuilder:
         chunk_shape: Sequence[int],
         itemsize: int,
         file_size: int | None = None,
+        row_bytes: int | None = None,
     ) -> None:
         """Chunks of an uncompressed C-ordered array stored in one piece at start.
 
@@ -215,14 +274,20 @@ class RfsBuilder:
         slab is read at full length when file_size shows the file extends that
         far (zarr discards the part of an edge chunk past the end of the array);
         otherwise it is a short ref, which RfsStore pads.
+
+        row_bytes is the size in the file of one step along the first axis,
+        when that is more than the array's own row because the array has a
+        selection (see add_selection).
         """
         shape = [int(s) for s in shape]
-        total = int(np.prod(shape)) * itemsize
+        if row_bytes is None:
+            row_bytes = int(np.prod(shape[1:])) * itemsize
+        total = shape[0] * row_bytes if shape else itemsize
         origin = [0] * len(shape)
         if not shape or chunk_shape[0] >= shape[0]:
             self.add_chunk(path, origin, url, start, total)
             return
-        slab = int(chunk_shape[0]) * int(np.prod(shape[1:])) * itemsize
+        slab = int(chunk_shape[0]) * row_bytes
         n_slabs = -(-shape[0] // int(chunk_shape[0]))
         last = start + (n_slabs - 1) * slab
         full_last = shape[0] % int(chunk_shape[0]) == 0 or (file_size is not None and last + slab <= file_size)
@@ -284,11 +349,14 @@ class RfsBuilder:
         recorded under "sources" so readers can detect a file that has changed.
         URLs used many times are replaced by templates.
         """
-        rfs: dict[str, Any] = {"refs": self.refs, "version": 2 if (self.indexes or self.gen) else 1}
+        extended = self.indexes or self.gen or self.selections
+        rfs: dict[str, Any] = {"refs": self.refs, "version": 2 if extended else 1}
         if self.indexes:
             rfs["indexes"] = self.indexes
         if self.gen:
             rfs["gen"] = self.gen
+        if self.selections:
+            rfs["selections"] = self.selections
         if record_sources:
             rfs["sources"] = _describe_sources(rfs)
         _apply_templates(rfs)
@@ -300,7 +368,8 @@ def write_rfs(rfs: dict, output_path: str) -> None:
 
     A path ending in ".json" writes a single version 1 reference file in which
     every chunk of an indexed array is listed in refs, readable by any kerchunk
-    reader. Any other path writes a directory holding refs.json and, for each
+    reader. Selections cannot be expressed in version 1, so a file that has
+    them stays version 2. Any other path writes a directory holding refs.json and, for each
     chunk index, a zarr v3 array under index/<array path>. The "indexes" entry
     in refs.json gives that path, relative to refs.json, and the file is marked
     version 2 so that readers without index support refuse it. Opening the
@@ -347,6 +416,8 @@ def to_version1(rfs: dict) -> dict:
     """Return a version 1 copy of rfs with every indexed or generated chunk listed in refs.
 
     fsspec skips "gen" entries unless asked not to, so they are expanded too.
+    Selections have no version 1 form: a copy that has them keeps them and is
+    marked version 2, so that kerchunk readers refuse it.
     """
     indexes = rfs.get("indexes", {})
     gens = rfs.get("gen", [])
@@ -370,7 +441,7 @@ def to_version1(rfs: dict) -> dict:
         for key, ref in Generator(entry, templates).items():
             refs[key] = ref
     out = {k: v for k, v in rfs.items() if k not in ("indexes", "gen", "templates", "refs")}
-    out["version"] = 1
+    out["version"] = 2 if out.get("selections") else 1
     out["refs"] = refs
     _apply_templates(out)
     return out
