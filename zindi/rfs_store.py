@@ -10,6 +10,9 @@ It handles:
 - Chunk padding for contiguous HDF5 datasets
 - Chunk indexes for arrays with many chunks (see chunk_index.py)
 - kerchunk "gen" entries, evaluated when a key is requested (see gen.py)
+- Selections, for arrays stored with other bytes in every record (see
+  RfsBuilder.add_selection)
+- Byte range requests, which fetch only the part of a chunk that is asked for
 
 Ported from lindi's LindiReferenceFileSystemStore, adapted for zarr v3.
 """
@@ -84,7 +87,7 @@ class RfsStore(Store):
         ----------
         rfs : dict
             Reference file system dict with "refs" key, and optional
-            "templates", "gen", "indexes", and "sources".
+            "templates", "gen", "indexes", "selections", and "sources".
         local_cache : LocalCache or None
             Optional local cache for persisting remote chunk data on disk.
         merge_gap : int
@@ -115,6 +118,7 @@ class RfsStore(Store):
             for path, entry in rfs.get("indexes", {}).items()
         }
         self._generators = [Generator(entry, rfs.get("templates", {})) for entry in rfs.get("gen", [])]
+        self._selections = {path: Selection(**entry) for path, entry in rfs.get("selections", {}).items()}
         self._children: dict[str, set[str]] | None = None
         self._array_meta: dict[str, dict | None] = {}
         self._is_open = True
@@ -145,11 +149,9 @@ class RfsStore(Store):
         if prototype is None:
             prototype = default_buffer_prototype()
         loop = asyncio.get_running_loop()
-        data = await loop.run_in_executor(self._executor, self._get_bytes, key)
+        data = await loop.run_in_executor(self._executor, self._get_bytes, key, byte_range)
         if data is None:
             return None
-        if byte_range is not None:
-            data = _apply_byte_range(data, byte_range)
         return prototype.buffer.from_bytes(data)
 
     async def get_partial_values(
@@ -239,10 +241,7 @@ class RfsStore(Store):
                         url=url, offset=offset, size=length
                     )
                 if cached_data is not None:
-                    padded_size = self._get_padded_size(key, cached_data)
-                    if padded_size is not None:
-                        cached_data = cached_data + b"\0" * (padded_size - len(cached_data))
-                    results.append((item_idx, prototype.buffer.from_bytes(cached_data)))
+                    results.append((item_idx, prototype.buffer.from_bytes(self._finish(key, cached_data))))
                 else:
                     uncached.append((item_idx, offset, length, key))
 
@@ -276,12 +275,7 @@ class RfsStore(Store):
                     except ChunkTooLargeError:
                         pass
 
-                # Apply padding
-                padded_size = self._get_padded_size(key, chunk_data)
-                if padded_size is not None:
-                    chunk_data = chunk_data + b"\0" * (padded_size - len(chunk_data))
-
-                results.append((item_idx, prototype.buffer.from_bytes(chunk_data)))
+                results.append((item_idx, prototype.buffer.from_bytes(self._finish(key, chunk_data))))
 
         return results
 
@@ -392,63 +386,100 @@ class RfsStore(Store):
                 url_or_path = url_or_path.replace("{{" + tkey + "}}", tval)
         return url_or_path
 
-    def _get_bytes(self, key: str) -> bytes | None:
-        """Resolve a key to bytes, handling all reference types."""
+    def _get_bytes(self, key: str, byte_range: ByteRequest | None = None) -> bytes | None:
+        """Resolve a key to bytes, handling all reference types.
+
+        With byte_range, only that part of the value is returned, and for a
+        reference into a file only the bytes it needs are read.
+        """
         x = self._resolve(key)
         if x is None:
             return None
 
         if isinstance(x, str):
             if x.startswith("base64:"):
-                return base64.b64decode(x[len("base64:"):])
+                data = base64.b64decode(x[len("base64:"):])
             else:
-                return x.encode("utf-8")
+                data = x.encode("utf-8")
         elif isinstance(x, dict):
-            return json.dumps(x).encode("utf-8")
+            data = json.dumps(x).encode("utf-8")
         elif isinstance(x, list):
             if len(x) != 3:
                 raise ValueError(f"Reference list for {key} must have 3 elements")
             url_or_path, offset, length = self._expand_templates(x[0]), x[1], x[2]
-
-            is_url = url_or_path.startswith("http://") or url_or_path.startswith("https://")
-
-            # Check local cache for remote chunks
-            if self._local_cache is not None and is_url:
-                cached = self._local_cache.get_remote_chunk(
-                    url=url_or_path, offset=offset, size=length
-                )
-                if cached is not None:
-                    padded_size = self._get_padded_size(key, cached)
-                    if padded_size is not None:
-                        cached = cached + b"\0" * (padded_size - len(cached))
-                    return cached
-
-            data = _read_bytes_from_url_or_path(
-                url_or_path, offset, length, session=self._session, checker=self._sources
-            )
-
-            # Store in local cache
-            if self._local_cache is not None and is_url:
-                from .local_cache import ChunkTooLargeError
-
-                try:
-                    self._local_cache.put_remote_chunk(
-                        url=url_or_path, offset=offset, size=length, data=data
-                    )
-                except ChunkTooLargeError:
-                    pass  # chunk exceeds SQLite blob limit, skip caching
-
-            # Pad if this is a final chunk in a contiguous dataset
-            padded_size = self._get_padded_size(key, data)
-            if padded_size is not None:
-                data = data + b"\0" * (padded_size - len(data))
-
-            return data
+            if byte_range is not None:
+                return self._read_part(key, url_or_path, offset, length, byte_range)
+            return self._finish(key, self._read_source(url_or_path, offset, length))
         else:
             raise ValueError(f"Unexpected reference type for {key}: {type(x)}")
+        return data if byte_range is None else _apply_byte_range(data, byte_range)
 
-    def _get_padded_size(self, key: str, data: bytes) -> int | None:
-        """Check if a chunk needs padding (final chunk in contiguous dataset).
+    def _read_source(self, url_or_path: str, offset: int, length: int) -> bytes:
+        """Read a whole reference from its file, through the local cache for remote files."""
+        is_url = url_or_path.startswith("http://") or url_or_path.startswith("https://")
+        if self._local_cache is not None and is_url:
+            cached = self._local_cache.get_remote_chunk(url=url_or_path, offset=offset, size=length)
+            if cached is not None:
+                return cached
+
+        data = _read_bytes_from_url_or_path(
+            url_or_path, offset, length, session=self._session, checker=self._sources
+        )
+
+        if self._local_cache is not None and is_url:
+            from .local_cache import ChunkTooLargeError
+
+            try:
+                self._local_cache.put_remote_chunk(url=url_or_path, offset=offset, size=length, data=data)
+            except ChunkTooLargeError:
+                pass  # chunk exceeds SQLite blob limit, skip caching
+        return data
+
+    def _finish(self, key: str, data: bytes) -> bytes:
+        """Turn the bytes of a reference into the chunk a reader decodes.
+
+        The array's selection, if it has one, is applied, and a final chunk of
+        a contiguous dataset that is shorter than a full chunk is padded.
+        """
+        selection = self._selection_for(key)
+        if selection is not None:
+            data = selection.apply(data)
+        padded_size = self._get_padded_size(key, len(data))
+        if padded_size is not None:
+            data = data + b"\0" * (padded_size - len(data))
+        return data
+
+    def _read_part(self, key: str, url_or_path: str, offset: int, length: int, byte_range: ByteRequest) -> bytes:
+        """Read part of a chunk, fetching only the bytes of the file that hold it."""
+        selection = self._selection_for(key)
+        stored = length if selection is None else selection.selected_size(length)
+        total = self._get_padded_size(key, stored) or stored
+        start, stop = _range_bounds(byte_range, total)
+        if stop <= start:
+            return b""
+        available = min(stop, stored)  # past this, the chunk is padding
+        data = b""
+        if start < available:
+            if selection is None:
+                data = _read_bytes_from_url_or_path(
+                    url_or_path, offset + start, available - start, session=self._session, checker=self._sources
+                )
+            else:
+                source_start, source_length, skip = selection.source_range(start, available)
+                data = _read_bytes_from_url_or_path(
+                    url_or_path, offset + source_start, source_length, session=self._session, checker=self._sources
+                )
+                data = selection.apply(data)[skip : skip + available - start]
+        return data + b"\0" * (stop - start - len(data))
+
+    def _selection_for(self, key: str) -> Selection | None:
+        if not self._selections:
+            return None
+        path = _array_path(key)
+        return None if path is None else self._selections.get(path)
+
+    def _get_padded_size(self, key: str, nbytes: int) -> int | None:
+        """The full size of a chunk of nbytes that needs padding (final chunk in contiguous dataset).
 
         Only uncompressed chunks are padded. A compressed chunk is shorter than
         its decoded size by design, and zeros appended to it break codecs that
@@ -486,8 +517,6 @@ class RfsStore(Store):
             return None
         if any(codec.get("name") != "bytes" for codec in meta.get("codecs", [])):
             return None
-        if any(codec.get("name") != "bytes" for codec in meta.get("codecs", [])):
-            return None
 
         chunk_shape = meta.get("chunk_grid", {}).get("configuration", {}).get("chunk_shape")
         data_type = meta.get("data_type")
@@ -510,7 +539,7 @@ class RfsStore(Store):
             return None
 
         expected_size = int(np.prod(chunk_shape)) * dtype.itemsize
-        if len(data) < expected_size:
+        if nbytes < expected_size:
             return expected_size
 
         return None
@@ -592,16 +621,79 @@ def _read_bytes_from_url(
     raise RuntimeError(f"Failed to read from {url}")
 
 
-def _apply_byte_range(data: bytes, byte_range: ByteRequest) -> bytes:
-    """Apply a ByteRequest to raw bytes."""
+def _range_bounds(byte_range: ByteRequest, total: int) -> tuple[int, int]:
+    """The [start, stop) that a ByteRequest covers in a value of total bytes."""
     from zarr.abc.store import OffsetByteRequest, RangeByteRequest, SuffixByteRequest
 
     if isinstance(byte_range, RangeByteRequest):
-        end = byte_range.end if byte_range.end is not None else len(data)
-        return data[byte_range.start:end]
+        start, stop = byte_range.start, total if byte_range.end is None else byte_range.end
     elif isinstance(byte_range, OffsetByteRequest):
-        return data[byte_range.offset:]
+        start, stop = byte_range.offset, total
     elif isinstance(byte_range, SuffixByteRequest):
-        return data[-byte_range.suffix:]
+        start, stop = total - byte_range.suffix, total
     else:
-        return data
+        raise TypeError(f"Unsupported byte range request: {byte_range!r}")
+    return max(0, min(start, total)), max(0, min(stop, total))
+
+
+def _apply_byte_range(data: bytes, byte_range: ByteRequest) -> bytes:
+    """Apply a ByteRequest to raw bytes."""
+    start, stop = _range_bounds(byte_range, len(data))
+    return data[start:stop]
+
+
+def _array_path(key: str) -> str | None:
+    """The path of the array a chunk key belongs to, or None for any other key."""
+    if key == "c":
+        return ""
+    if key.endswith("/c"):
+        return key[:-2]
+    head, sep, tail = key.rpartition("/c/")
+    if not sep and key.startswith("c/"):
+        head, sep, tail = "", "c/", key[2:]
+    if sep and tail and all(part.isdigit() for part in tail.split("/")):
+        return head
+    return None
+
+
+class Selection:
+    """Which bytes of every record in the file belong to an array.
+
+    A reference is read as consecutive records of record bytes. From each one,
+    the [start, stop) ranges in keep are taken and joined in the order listed.
+    See RfsBuilder.add_selection.
+    """
+
+    def __init__(self, record: int, keep: list[list[int]]) -> None:
+        self.record = int(record)
+        self.keep = [(int(a), int(b)) for a, b in keep]
+        if self.record <= 0 or not self.keep or any(not 0 <= a < b <= self.record for a, b in self.keep):
+            raise ValueError(f"Invalid selection: record {record}, keep {keep}")
+        self.kept = sum(b - a for a, b in self.keep)
+
+    def selected_size(self, source_size: int) -> int:
+        """The size of what is kept from source_size bytes of the file."""
+        if source_size % self.record:
+            raise ValueError(
+                f"A reference of {source_size} bytes is not a whole number of {self.record} byte records"
+            )
+        return source_size // self.record * self.kept
+
+    def apply(self, data: bytes) -> bytes:
+        """Keep the selected bytes of every record in data."""
+        self.selected_size(len(data))
+        records = np.frombuffer(data, dtype=np.uint8).reshape(-1, self.record)
+        if len(self.keep) == 1:
+            start, stop = self.keep[0]
+            return records[:, start:stop].tobytes()
+        return np.concatenate([records[:, a:b] for a, b in self.keep], axis=1).tobytes()
+
+    def source_range(self, start: int, stop: int) -> tuple[int, int, int]:
+        """Where bytes [start, stop) of the selected data are in the file.
+
+        Returns the offset and length of the whole records that hold them, and
+        how many selected bytes to skip at the front of what those records give.
+        """
+        first = start // self.kept
+        last = -(-stop // self.kept)
+        return first * self.record, (last - first) * self.record, start - first * self.kept

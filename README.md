@@ -132,9 +132,9 @@ Opening the directory reads only `refs.json`. Each index is itself an ordinary Z
 }
 ```
 
-`refs` holds the Zarr metadata, small datasets, and a `[url, offset, size]` entry for each chunk of an array with at most 1,000 chunks. For each larger array, `indexes` gives the file its chunks are in and the path of its index array, relative to `refs.json`. There is nothing in between: a reader looks up the array in `indexes`, opens that Zarr array, and reads the index chunk it needs. `gen` and `sources` are described below.
+`refs` holds the Zarr metadata, small datasets, and a `[url, offset, size]` entry for each chunk of an array with at most 1,000 chunks. For each larger array, `indexes` gives the file its chunks are in and the path of its index array, relative to `refs.json`. There is nothing in between: a reader looks up the array in `indexes`, opens that Zarr array, and reads the index chunk it needs. `gen`, `selections`, and `sources` are described below.
 
-A directory that uses `indexes` or `gen` is marked `"version": 2`, so readers that only know version 1 of the kerchunk format refuse it instead of returning fill values for the chunks they cannot find. Writing to a path ending in `.json` produces a version 1 file with every chunk listed in `refs`, which any kerchunk reader can open.
+A directory that uses `indexes`, `gen`, or `selections` is marked `"version": 2`, so readers that only know version 1 of the kerchunk format refuse it instead of returning fill values for the chunks they cannot find. Writing to a path ending in `.json` produces a version 1 file with every chunk listed in `refs`, which any kerchunk reader can open. A file with `selections` stays version 2, because version 1 cannot express them.
 
 ### Contiguous Datasets
 
@@ -145,6 +145,32 @@ HDF5 stores a dataset that was written without chunking as one contiguous block.
 ```
 
 zindi computes a slab's offset when that chunk is requested. The slab height divides the first axis when a divisor is close to the target, so every slab has the same length. When none does, the last slab is read at full length, and zarr discards the part past the end of the array.
+
+### Arrays Stored with Other Bytes
+
+Some files store an array together with bytes that do not belong to it. A SpikeGLX recording holds 384 neural channels and one sync channel, interleaved sample by sample, so no byte range contains the neural channels alone. Other formats put a header in front of every sample. For these, `selections` says which bytes of the file belong to the array:
+
+```json
+"selections": {"imec0.ap": {"record": 770, "keep": [[0, 768]]}}
+```
+
+Every reference of the array is read as consecutive records of `record` bytes, here one sample of all 385 int16 channels. From each record the byte ranges in `keep` are taken and joined in the order listed, and the rest is dropped. The Zarr metadata describes only the selected data, a 384-column array with the plain `bytes` codec, so nothing in the codec chain is specific to zindi. Listing several ranges keeps columns that are not next to each other, and listing them in another order reorders the columns. A selection applies to uncompressed data.
+
+```python
+from zindi import RfsBuilder
+from zindi.builder import columns_selection
+
+record, keep = columns_selection(n_columns=385, itemsize=2, columns=slice(0, 384))
+builder = RfsBuilder()
+builder.add_group("")
+builder.add_array("imec0.ap", shape=[n_samples, 384], data_type="int16", chunk_shape=[30_000, 384])
+builder.add_selection("imec0.ap", record, keep)
+builder.add_contiguous_chunks(
+    "imec0.ap", url=url, start=0, shape=[n_samples, 384], chunk_shape=[30_000, 384], itemsize=2, row_bytes=record
+)
+```
+
+A request for part of a chunk reads only the records that hold it, with or without a selection, so reading a few samples from a large chunk does not fetch the whole chunk.
 
 ### Detecting Changed Files
 
