@@ -65,3 +65,34 @@ jobs:
         with:
           path: ~/ephy_testing_data
           key: ephy-testing-data-${{ steps.ephy.outputs.hash }}-${{ hashFiles('tests/test_neo_gin.py') }}
+
+  neuroconv:
+    name: NeuroConv bridge on GIN data
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      # SpikeInterface requires zarr<3 and zindi needs Zarr v3, so the two
+      # install together only with that requirement overridden. Remove the
+      # override once SpikeInterface supports Zarr v3
+      # (https://github.com/SpikeInterface/spikeinterface/pull/4260).
+      - name: Install zindi and NeuroConv with Zarr v3
+        run: |
+          pip install uv
+          printf 'zarr>=3.1.3\nnumcodecs>=0.15\n' > overrides.txt
+          uv pip install --system --override overrides.txt -e ".[dev]" \
+            "neuroconv[spikeglx,openephys,neuroscope,mcsraw]" datalad git-annex
+          git config --global user.name "CI"
+          git config --global user.email "ci@example.org"
+      - name: Get the current commit of NEO's testing data
+        id: ephy
+        run: echo "hash=$(git ls-remote https://gin.g-node.org/NeuralEnsemble/ephy_testing_data.git HEAD | cut -f1)" >> "$GITHUB_OUTPUT"
+      - name: Restore the cached testing data
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/ephy_testing_data
+          key: ephy-testing-data-${{ steps.ephy.outputs.hash }}-${{ hashFiles('tests/test_neo_gin.py') }}
+          restore-keys: ephy-testing-data-
+      - run: pytest -m gin -v tests/test_neuroconv_bridge.py

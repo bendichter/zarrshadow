@@ -301,6 +301,25 @@ hdmf-zarr writes the file's structure: the groups, attributes, object ids, refer
 
 The scaling of a series stays in NWB's `conversion`, `offset`, and `channel_conversion`, so the file's integers are referenced as they are. Continuous integration writes a SpikeGLX recording from GIN this way and compares both series with NEO's reads.
 
+### From NeuroConv
+
+`zindi.neuroconv_bridge.virtualize` takes an NWB file that [NeuroConv](https://neuroconv.readthedocs.io) built in memory and swaps its data iterators for references, so NeuroConv supplies the metadata and the tables, and the signals stay in the source files.
+
+```python
+from neuroconv.datainterfaces import SpikeGLXRecordingInterface
+from zindi.neuroconv_bridge import virtualize
+from zindi.nwb import write_virtual_nwb
+
+interface = SpikeGLXRecordingInterface(folder_path="Noise4Sam_g0", stream_id="imec0.ap")
+nwbfile = interface.create_nwbfile(metadata=interface.get_metadata())
+virtualize(nwbfile)
+write_virtual_nwb(nwbfile, "session.nwb.zindi")
+```
+
+It covers recordings that SpikeInterface reads through a NEO reader with the buffer description API, and raises `NotVirtualizable` for anything else. Continuous integration compares the result with NeuroConv's own conversion for SpikeGLX (AP band and NIDQ), Open Ephys binary, Neuroscope, and MCS raw: every dataset is equal except the file's creation time.
+
+This is experimental. As of October 2026, SpikeInterface requires `zarr<3` and zindi needs Zarr v3, so NeuroConv and zindi install together only with that requirement overridden (`uv pip install --override`), and NeuroConv 0.10 reads `zarr.codec_registry` at import, which Zarr v3 removed. `tests/test_neuroconv_bridge.py` shows the environment and the one-line workaround.
+
 ## Materializing
 
 `materialize` reads the bytes a reference file system points at and writes them into an ordinary Zarr store, which then no longer depends on the source files.
@@ -417,6 +436,7 @@ zindi/
 ├── neo_rawio.py             # NEO raw readers → reference file system, through RfsBuilder
 ├── virtual.py               # VirtualArray: slicing and stacking arrays stored in other files
 ├── nwb.py                   # Virtual NWB files, written through hdmf-zarr
+├── neuroconv_bridge.py      # NeuroConv's in-memory NWB files → virtual NWB files
 ├── materialize.py           # Reference file system → ordinary Zarr store
 ├── open_rfs.py              # Open RFS as zarr.Group
 ├── rfs_store.py             # Zarr v3 Store backed by reference file system
