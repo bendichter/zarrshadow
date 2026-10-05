@@ -9,7 +9,7 @@ Write an NWB file whose large datasets are references to bytes in the original a
 ## What Exists
 
 - zarrshadow generators for HDF5, TIFF, and the 13 NEO readers with the buffer description API, tested in CI on 59 GIN recordings.
-- A refs format that records several source files with size and ETag, plus `gen`, `indexes`, and (in https://github.com/bendichter/zindi/pull/18) `selections`.
+- A refs format that records several source files with size and ETag, plus `gen`, `indexes`, and (in https://github.com/bendichter/zarrshadow/pull/18) `selections`.
 - `RfsStore`, which `NWBZarrIO` reads, and which reads byte ranges of a chunk as ranges.
 - Partial reads of uncompressed chunks in zarr-python (https://github.com/zarr-developers/zarr-python/pull/4458, in review), zarrita.js (branch), and zarr-matlab (merged).
 - An experiment showing that hdmf-zarr 0.14.0 supports skeleton and graft with no change: an empty data iterator wrapped in `ZarrDataIO` writes an array's metadata and no chunks, and the grafted file reads back, validates, and stays lazy. Two source files in one NWB file worked.

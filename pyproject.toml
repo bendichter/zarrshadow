@@ -5,7 +5,8 @@ build-backend = "hatchling.build"
 [project]
 name = "zarrshadow"
 version = "0.1.0"
-description = "Represent remote HDF5 NWB files as Zarr v3 via reference file systems"
+description = "Zarr stores that reference the bytes of existing files without copying them"
+readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "zarr>=3.1.3",
@@ -16,6 +17,9 @@ dependencies = [
     "tqdm",
     "requests",
 ]
+
+[project.urls]
+Repository = "https://github.com/bendichter/zarrshadow"
 
 [project.optional-dependencies]
 tiff = [
