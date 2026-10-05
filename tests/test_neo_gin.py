@@ -229,7 +229,7 @@ def test_stream_arrays_match_neo(name, path):
     assert compared == len(arrays) > 0
 
 
-def test_spikeglx_as_virtual_nwb():
+def test_spikeglx_as_virtual_nwb(tmp_path):
     """A SpikeGLX recording as an NWB file: the neural channels and the sync channel of one file, as two series."""
     pynwb = pytest.importorskip("pynwb")
     pytest.importorskip("hdmf_zarr.nwb")
@@ -238,7 +238,7 @@ def test_spikeglx_as_virtual_nwb():
     from hdmf_zarr import NWBZarrIO
     from pynwb.ecephys import ElectricalSeries
 
-    from zindi import RfsStore, virtual_arrays_neo
+    from zindi import RfsStore, materialize, virtual_arrays_neo
     from zindi.nwb import write_virtual_nwb
 
     reader = _reader("SpikeGLXRawIO", "spikeglx/Noise4Sam_g0")
@@ -279,6 +279,17 @@ def test_spikeglx_as_virtual_nwb():
     }
     streams = [str(s) for s in reader.header["signal_streams"]["id"]]
     with NWBZarrIO(RfsStore(rfs), mode="r") as io:
+        read = io.read()
+        for series, stream in (("ElectricalSeriesAP", "imec0.ap"), ("sync", "imec0.ap-SYNC")):
+            expected = reader.get_analogsignal_chunk(block_index=0, seg_index=0, stream_index=streams.index(stream))
+            np.testing.assert_array_equal(read.acquisition[series].data[...], expected)
+        assert pynwb.validate(io=io) == []
+
+    # Materialized, it is an ordinary NWB Zarr file, compressed, that no longer needs the recording
+    report = materialize(rfs, str(tmp_path / "session.nwb.zarr"))
+    ap_report = report["acquisition/ElectricalSeriesAP/data"]
+    assert ap_report["nbytes"] == ap.shape[0] * 384 * 2 and ap_report["nbytes_stored"] < ap_report["nbytes"]
+    with NWBZarrIO(str(tmp_path / "session.nwb.zarr"), mode="r") as io:
         read = io.read()
         for series, stream in (("ElectricalSeriesAP", "imec0.ap"), ("sync", "imec0.ap-SYNC")):
             expected = reader.get_analogsignal_chunk(block_index=0, seg_index=0, stream_index=streams.index(stream))

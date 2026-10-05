@@ -95,6 +95,7 @@ A column permutation needs no selection: the `electrodes` region of an `Electric
 
 0. Done: generators, selections, partial reads, hdmf-zarr feasibility.
 1. Done: `VirtualArray` with slicing and stacking, NEO arrays per stream (`virtual_arrays_neo`), and `write_virtual_nwb`, tested on the GIN recordings and on a SpikeGLX recording written as NWB. Generators still write into a builder; `VirtualArray.from_rfs` takes an array from what they build.
+   Also done: `materialize`, which writes a virtual file into an ordinary Zarr store with a chosen chunking and compression. It reads through `RfsStore` only, so the same function can run in an upload client or on the archive.
 2. NeuroConv bridge for the formats the NEO buffer API already covers: SpikeGLX, Open Ephys binary, Neuroscope, MCS raw, and Axon. Test against ordinary NeuroConv conversions. The hooks are `recording_extractor.neo_reader`, `.stream_id`, `.block_index`, and `.inverted_gain`, and `recording._kwargs` for binary extractors. NeuroConv may wrap the extractor in a channel slice or a concatenation, so the bridge walks to the parent.
 3. Imaging: the TIFF family (ScanImage, Bruker, Micro-Manager, Thor) through the extractors' page tables, and HDF5 imaging. This is the largest data volume NeuroConv handles, and it brings in the transpose work that every other imaging format reuses.
 4. New ephys generators, in this order:
