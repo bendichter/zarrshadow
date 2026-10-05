@@ -23,7 +23,7 @@ import numpy as np
 from tqdm import tqdm
 
 from .attr_conversion import h5_attr_to_zarr
-from .builder import DEFAULT_CODECS, RfsBuilder
+from .builder import DEFAULT_CODECS, RfsBuilder, contiguous_chunk_shape, metadata_key, zarr_data_type
 from .chunk_index import build_index
 from .h5_chunk_utils import (
     apply_to_all_chunk_info,
@@ -112,6 +112,38 @@ def generate_rfs(
     return builder.build(record_sources=record_sources)
 
 
+def add_hdf5_dataset(
+    builder: RfsBuilder,
+    path: str,
+    local_path: str,
+    dataset_path: str,
+    *,
+    url: str | None = None,
+    attributes: dict | None = None,
+    dimension_names: list[str] | None = None,
+    chunk_index_threshold: int | None = 1000,
+    contiguous_chunk_bytes: int | None = 4 * 2**20,
+) -> None:
+    """Add one dataset of an HDF5 file to builder at path.
+
+    The array's attributes are the dataset's HDF5 attributes updated with
+    attributes. References point to url, which defaults to local_path.
+    """
+    with h5py.File(local_path, "r") as h5f:
+        shift = _detect_offset_shift(h5f, _raw_reader(local_path))
+        _process_dataset(
+            h5f[dataset_path], path, builder, url or local_path, h5f,
+            chunk_index_threshold=chunk_index_threshold,
+            contiguous_chunk_bytes=contiguous_chunk_bytes,
+            offset_shift=shift,
+        )
+    meta = json.loads(builder.refs[metadata_key(path)])
+    meta.setdefault("attributes", {}).update(attributes or {})
+    if dimension_names is not None:
+        meta["dimension_names"] = list(dimension_names)
+    builder.set_metadata(path, meta)
+
+
 # ---------------------------------------------------------------------------
 # Walking the file
 # ---------------------------------------------------------------------------
@@ -177,7 +209,7 @@ def _process_dataset(
     if ds.chunks:
         chunks = list(ds.chunks)
     else:
-        chunks = _contiguous_chunk_shape(ds.shape, ds.dtype.itemsize, contiguous_chunk_bytes)
+        chunks = contiguous_chunk_shape(ds.shape, ds.dtype.itemsize, contiguous_chunk_bytes)
     chunks = [max(c, 1) for c in chunks]  # Zarr doesn't allow zero-size chunks
 
     if ds.dtype.kind == "V" and ds.dtype.fields is not None:
@@ -307,45 +339,16 @@ def _add_chunk_refs(
         return
 
     # Contiguous dataset: one chunk, or equal slabs along the first axis
-    byte_offset, byte_count = get_byte_range_for_contiguous_dataset(ds)
-    byte_offset += offset_shift
-    origin = [0] * ds.ndim
-    if ds.ndim == 0 or chunk_shape[0] >= ds.shape[0]:
-        builder.add_chunk(path, origin, url, byte_offset, byte_count)
-        return
-    slab = chunk_shape[0] * int(np.prod(ds.shape[1:])) * ds.dtype.itemsize
-    n_slabs = -(-ds.shape[0] // chunk_shape[0])
-    # Every chunk a reader decodes must be full size. A short last slab is
-    # read at full length when the file extends that far: zarr discards the
-    # part of an edge chunk past the end of the array. Only a dataset that
-    # ends within one slab of the end of the file keeps a short last ref,
-    # which RfsStore pads.
-    last = byte_offset + (n_slabs - 1) * slab
-    full_last = ds.shape[0] % chunk_shape[0] == 0 or last + slab <= ds.file.id.get_filesize()
-    builder.add_strided_chunks(
-        path, ndim=ds.ndim, url=url, start=byte_offset, stride=slab, length=slab,
-        count=n_slabs if full_last else n_slabs - 1,
+    byte_offset, _ = get_byte_range_for_contiguous_dataset(ds)
+    builder.add_contiguous_chunks(
+        path,
+        url=url,
+        start=byte_offset + offset_shift,
+        shape=ds.shape,
+        chunk_shape=chunk_shape,
+        itemsize=ds.dtype.itemsize,
+        file_size=ds.file.id.get_filesize(),
     )
-    if not full_last:
-        builder.add_chunk(path, [n_slabs - 1] + origin[1:], url, last, byte_offset + byte_count - last)
-
-
-def _contiguous_chunk_shape(
-    shape: tuple[int, ...], itemsize: int, target_bytes: int | None
-) -> list[int]:
-    """Chunk shape for presenting a contiguous dataset: whole, or slabs along axis 0."""
-    shape_list = list(shape)
-    if target_bytes is None or not shape_list:
-        return shape_list
-    row_bytes = itemsize * int(np.prod(shape_list[1:]))
-    if row_bytes == 0 or row_bytes * shape_list[0] <= target_bytes:
-        return shape_list
-    rows = max(1, target_bytes // row_bytes)
-    # Prefer a slab height that divides the first axis, so no slab is short
-    for candidate in range(rows, rows // 2, -1):
-        if shape_list[0] % candidate == 0:
-            return [candidate] + shape_list[1:]
-    return [rows] + shape_list[1:]
 
 
 def _add_chunk_index(
@@ -504,26 +507,7 @@ def _should_inline(ds: h5py.Dataset) -> bool:
 
 def _numpy_dtype_to_zarr_v3(dtype: np.dtype) -> str:
     """Convert a numpy dtype to a zarr v3 data_type string."""
-    kind = dtype.kind
-    itemsize = dtype.itemsize
-    mapping = {
-        ("f", 2): "float16",
-        ("f", 4): "float32",
-        ("f", 8): "float64",
-        ("i", 1): "int8",
-        ("i", 2): "int16",
-        ("i", 4): "int32",
-        ("i", 8): "int64",
-        ("u", 1): "uint8",
-        ("u", 2): "uint16",
-        ("u", 4): "uint32",
-        ("u", 8): "uint64",
-        ("b", 1): "bool",
-    }
-    result = mapping.get((kind, itemsize))
-    if result is None:
-        raise ValueError(f"Unsupported dtype for zarr v3: {dtype}")
-    return result
+    return zarr_data_type(dtype)
 
 
 def _compound_dtype_to_zarr_v3(dtype: np.dtype) -> dict:

@@ -48,6 +48,48 @@ def metadata_key(path: str) -> str:
     return f"{path}/zarr.json" if path else "zarr.json"
 
 
+_ZARR_DATA_TYPES = {
+    ("f", 2): "float16", ("f", 4): "float32", ("f", 8): "float64",
+    ("i", 1): "int8", ("i", 2): "int16", ("i", 4): "int32", ("i", 8): "int64",
+    ("u", 1): "uint8", ("u", 2): "uint16", ("u", 4): "uint32", ("u", 8): "uint64",
+    ("b", 1): "bool",
+}
+
+
+def zarr_data_type(dtype: np.dtype) -> str:
+    """The zarr v3 data_type name for a numeric numpy dtype."""
+    dtype = np.dtype(dtype)
+    result = _ZARR_DATA_TYPES.get((dtype.kind, dtype.itemsize))
+    if result is None:
+        raise ValueError(f"Unsupported dtype for zarr v3: {dtype}")
+    return result
+
+
+def bytes_codecs(dtype: np.dtype) -> list[dict]:
+    """Codecs for uncompressed values in dtype's byte order."""
+    endian = "big" if np.dtype(dtype).byteorder == ">" else "little"
+    return [{"name": "bytes", "configuration": {"endian": endian}}]
+
+
+def contiguous_chunk_shape(shape: Sequence[int], itemsize: int, target_bytes: int | None) -> list[int]:
+    """Chunk shape for a C-ordered array stored in one piece: whole, or slabs along axis 0.
+
+    Slabs hold about target_bytes. A slab height that divides the first axis
+    is preferred, so that no slab is short.
+    """
+    shape_list = [int(s) for s in shape]
+    if target_bytes is None or not shape_list:
+        return shape_list
+    row_bytes = itemsize * int(np.prod(shape_list[1:]))
+    if row_bytes == 0 or row_bytes * shape_list[0] <= target_bytes:
+        return shape_list
+    rows = max(1, target_bytes // row_bytes)
+    for candidate in range(rows, rows // 2, -1):
+        if shape_list[0] % candidate == 0:
+            return [candidate] + shape_list[1:]
+    return [rows] + shape_list[1:]
+
+
 class RfsBuilder:
     """Accumulates Zarr metadata and chunk locations for one reference file system."""
 
@@ -76,6 +118,7 @@ class RfsBuilder:
         codecs: list[dict] | None = None,
         fill_value: Any = 0,
         attributes: dict | None = None,
+        dimension_names: Sequence[str | None] | None = None,
     ) -> dict:
         """Add an array with a regular chunk grid and return its zarr.json.
 
@@ -94,6 +137,8 @@ class RfsBuilder:
             "attributes": attributes or {},
             "storage_transformers": [],
         }
+        if dimension_names is not None:
+            meta["dimension_names"] = list(dimension_names)
         self.set_metadata(path, meta)
         return meta
 
@@ -150,6 +195,43 @@ class RfsBuilder:
             length=str(int(length)),
             dimensions={"i": {"stop": int(count)}},
         )
+
+    def add_contiguous_chunks(
+        self,
+        path: str,
+        *,
+        url: str,
+        start: int,
+        shape: Sequence[int],
+        chunk_shape: Sequence[int],
+        itemsize: int,
+        file_size: int | None = None,
+    ) -> None:
+        """Chunks of an uncompressed C-ordered array stored in one piece at start.
+
+        chunk_shape comes from contiguous_chunk_shape: the whole array, or slabs
+        along the first axis spanning every other axis. The slabs become one gen
+        entry. Every chunk a reader decodes must be full size, so a short last
+        slab is read at full length when file_size shows the file extends that
+        far (zarr discards the part of an edge chunk past the end of the array);
+        otherwise it is a short ref, which RfsStore pads.
+        """
+        shape = [int(s) for s in shape]
+        total = int(np.prod(shape)) * itemsize
+        origin = [0] * len(shape)
+        if not shape or chunk_shape[0] >= shape[0]:
+            self.add_chunk(path, origin, url, start, total)
+            return
+        slab = int(chunk_shape[0]) * int(np.prod(shape[1:])) * itemsize
+        n_slabs = -(-shape[0] // int(chunk_shape[0]))
+        last = start + (n_slabs - 1) * slab
+        full_last = shape[0] % int(chunk_shape[0]) == 0 or (file_size is not None and last + slab <= file_size)
+        self.add_strided_chunks(
+            path, ndim=len(shape), url=url, start=start, stride=slab, length=slab,
+            count=n_slabs if full_last else n_slabs - 1,
+        )
+        if not full_last:
+            self.add_chunk(path, [n_slabs - 1] + origin[1:], url, last, start + total - last)
 
     def add_chunks(
         self,

@@ -197,6 +197,23 @@ frame = root["0"][100]      # series 0; a pyramid has its levels at "0/0", "0/1"
 
 Series `i` is stored at path `"i"`, the layout bioformats2raw uses for OME-Zarr. The pages of an uncompressed stack are usually evenly spaced in the file, and then the whole series is one `gen` entry. TIFF deflate and zstd chunks are ordinary zlib and zstd streams, so they get the standard `numcodecs.zlib` and `zstd` codecs, which any Zarr library can decode. Other compressions, such as LZW, JPEG, and the horizontal predictor, use the Zarr codecs from imagecodecs, which zindi registers when it opens such a file. Other readers need imagecodecs too, and browser readers do not have them. Strips that do not divide the image evenly are read one page at a time when the pages are uncompressed and stored in one piece.
 
+## Electrophysiology Formats Read by NEO
+
+`generate_rfs_neo` builds references from a [NEO](https://neo.readthedocs.io) raw reader, for the formats whose NEO readers describe where their signals are stored: SpikeGLX, Open Ephys binary, Axon, BrainVision, Elan, Micromed, NeuroNexus, Neuroscope, Multi Channel Systems raw, raw binary, WinEDR, WinWCP, and Maxwell. Install it with `pip install zindi[neo]`.
+
+```python
+from neo.rawio import SpikeGLXRawIO
+from zindi import generate_rfs_neo, write_rfs
+
+reader = SpikeGLXRawIO(dirname="Noise4Sam_g0")
+rfs = generate_rfs_neo(reader, url_for=lambda path: "https://my-bucket/" + path)
+write_rfs(rfs, "Noise4Sam_g0.zindi")
+```
+
+Each of NEO's signal buffers becomes one array, time by channel, at `"<buffer id>"` for a recording with one segment and at `"block<b>/segment<s>/<buffer id>"` otherwise. The samples of a raw buffer are evenly spaced in the file, so the whole buffer is one `gen` entry however long the recording is. The array's `neo` attribute lists the streams stored in the buffer, with the columns that belong to each, the sampling rate, `t_start`, and each channel's id, name, units, gain, and offset. `url_for` maps the local paths NEO reads to where the files are hosted.
+
+We checked the arrays against NEO's own reads on NEO's test files for 12 of these formats, with every block, segment, and stream equal. Maxwell recordings are stored in HDF5 with MaxWell's own compression filter, for which there is no Zarr codec, so only uncompressed Maxwell files can be referenced. When a recording ends partway through its last chunk at the end of the file, that chunk is shorter than the others; zindi pads it, but other Zarr readers will not read it.
+
 ## Other File Formats
 
 `generate_rfs` is the generator for HDF5. Everything after it (the store, the directory format, chunk indexes, `gen`, and source checks) works for any format, and a generator for another format builds the same references with `RfsBuilder`. For a raw binary recording with 16 interleaved `int16` channels after a 12-byte header:
@@ -285,6 +302,7 @@ zindi/
 ├── builder.py               # RfsBuilder and write_rfs, independent of the source format
 ├── hdf5.py                  # HDF5 → reference file system, through RfsBuilder
 ├── tiff.py                  # TIFF → reference file system, through tifffile and RfsBuilder
+├── neo_rawio.py             # NEO raw readers → reference file system, through RfsBuilder
 ├── open_rfs.py              # Open RFS as zarr.Group
 ├── rfs_store.py             # Zarr v3 Store backed by reference file system
 ├── chunk_index.py           # Byte-range indexes for arrays with many chunks
