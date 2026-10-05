@@ -67,9 +67,8 @@ The survey found that axis order comes up more often than extra bytes. Every ima
 
 Work items:
 
-- `VirtualArray.transpose(order)`, which picks mechanism 1 when the chunks allow it and the codec otherwise.
-- Lift the NEO generator's restriction to C-ordered, time-first buffers.
-- A test that reads data through `TransposeCodec` in an hdmf-zarr file.
+- Done: `VirtualArray.transpose`, which uses mechanism 1 when the chunks allow it and the codec otherwise, and a test that writes a TIFF stack as a `TwoPhotonSeries` through hdmf-zarr and reads it back through the codec.
+- Lift the NEO generator's restriction to C-ordered, time-first buffers. None of the 13 readers on GIN needs it, so there is no real file to test it on yet.
 
 ## Values and Gaps
 
@@ -101,7 +100,7 @@ A column permutation needs no selection: the `electrodes` region of an `Electric
    Two things stand between the prototype and something users can install:
    - SpikeInterface requires `zarr<3` (0.105.1), and zindi needs Zarr v3. Zarr v3 support is in progress at https://github.com/SpikeInterface/spikeinterface/pull/4260. Until then the two install together only with the requirement overridden.
    - NeuroConv 0.10.2 reads `zarr.codec_registry` at import, which Zarr v3 removed. Building an NWB file in memory works once that one attribute is put back, and the bridge needs nothing else from NeuroConv. NeuroConv's own Zarr backend was not tested under Zarr v3. NeuroConv pins `zarr<3` on its main branch. Zarr v3 support is tracked in https://github.com/catalystneuro/neuroconv/issues/2076, and https://github.com/catalystneuro/neuroconv/pull/1749 is a draft port of its Zarr backend.
-3. Imaging: the TIFF family (ScanImage, Bruker, Micro-Manager, Thor) through the extractors' page tables, and HDF5 imaging. This is the largest data volume NeuroConv handles, and it brings in the transpose work that every other imaging format reuses.
+3. Imaging. Done in zindi: a TIFF stack as an NWB series, through `VirtualArray.from_rfs`, `stack` for one file per frame, and `transpose`. Remaining: the NeuroConv side, for the TIFF family (ScanImage, Bruker, Micro-Manager, Thor) through the extractors' page tables, and HDF5 imaging. This is the largest data volume NeuroConv handles, and it brings in the transpose work that every other imaging format reuses.
 4. New ephys generators, in this order:
    - Blackrock nsX, specs 2.1 to 3.0: one contiguous block per segment.
    - SpikeGadgets: per-sample packets, the direct use of selections. The same rule covers Blackrock PTP files.
@@ -153,6 +152,7 @@ The survey read NeuroConv at a development checkout (v0.10.1-18), NEO 0.14.4, Sp
 ## Open Questions
 
 - Hosting. A virtual file is useful only while its sources stay at stable URLs. Where do raw acquisition files live, and does DANDI accept them alongside the refs file?
+- Publishing on DANDI. DANDI accepts and encourages Zarr v3, so a materialized NWB Zarr file can be uploaded. As of October 2026 it has no way to publish a Zarr-based dataset, that is, to create a persistent version of one.
 - Several files in one series. Zarr's regular chunk grid joins files along an axis only when their lengths line up. The alternative is one series per file.
 - Local use. HDF5 external storage would give an NWB (or NIX) HDF5 file that existing readers open unchanged, for local files only. Is that worth a second output format?
 - NIX. No NIX reader reads Zarr, so a virtual NIX file would use HDF5 external storage, and NEO's NIX reader expects one array per channel.

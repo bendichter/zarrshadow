@@ -129,3 +129,45 @@ def test_file_without_virtual_arrays():
     assert rfs["version"] == 1 and "sources" in rfs and rfs["sources"] == {}
     with NWBZarrIO(RfsStore(rfs), mode="r") as io:
         np.testing.assert_array_equal(io.read().acquisition["position"].data[...], np.arange(10.0))
+
+
+@pytest.mark.parametrize("options", [{}, {"compression": "zlib"}])
+def test_tiff_movie_as_two_photon_series(tmp_path, options):
+    """A TIFF stack as a TwoPhotonSeries, whose frames NWB orders (frame, x, y) where the file has (page, row, column)."""
+    tifffile = pytest.importorskip("tifffile")
+    pytest.importorskip("imagecodecs")
+    from pynwb.ophys import OpticalChannel, TwoPhotonSeries
+
+    from zindi import generate_rfs_tiff
+
+    x = np.random.default_rng(2).integers(0, 4000, (30, 48, 64)).astype("uint16")
+    tifffile.imwrite(tmp_path / "movie.tif", x, **options)
+    pages = VirtualArray.from_rfs(generate_rfs_tiff(str(tmp_path / "movie.tif")), "0")
+
+    nwbfile = _nwbfile()
+    device = nwbfile.create_device("microscope")
+    plane = nwbfile.create_imaging_plane(
+        name="plane",
+        optical_channel=OpticalChannel(name="green", description="GCaMP", emission_lambda=510.0),
+        description="a plane",
+        device=device,
+        excitation_lambda=920.0,
+        indicator="GCaMP6f",
+        location="V1",
+    )
+    nwbfile.add_acquisition(
+        TwoPhotonSeries(
+            name="TwoPhotonSeries", data=pages.transpose(0, 2, 1).placeholder(), imaging_plane=plane, rate=30.0, unit="a.u."
+        )
+    )
+    rfs = write_virtual_nwb(nwbfile)
+    codecs = json.loads(rfs["refs"]["acquisition/TwoPhotonSeries/data/zarr.json"])["codecs"]
+    assert codecs[0] == {"name": "transpose", "configuration": {"order": [0, 2, 1]}}
+    assert len(codecs) == (3 if options else 2)
+
+    with NWBZarrIO(RfsStore(rfs), mode="r") as io:
+        data = io.read().acquisition["TwoPhotonSeries"].data
+        assert data.shape == (30, 64, 48)
+        np.testing.assert_array_equal(data[...], x.transpose(0, 2, 1))
+        np.testing.assert_array_equal(data[7, 10:20, 5], x[7, 5, 10:20])
+        assert pynwb.validate(io=io) == []

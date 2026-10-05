@@ -117,3 +117,17 @@ def test_virtual_nwb(tmp_path):
     stored = root["consolidated_metadata"]["metadata"]["acquisition/raw/data"]
     assert stored["chunk_grid"]["configuration"]["chunk_shape"] == list(data.chunks)
     assert len(stored["codecs"]) == 2
+
+
+def test_transposed_array(tmp_path):
+    """What is written has the array's own axis order and no transpose codec."""
+    x = np.random.default_rng(2).integers(0, 4000, (40, 6, 8)).astype("<u2")
+    (tmp_path / "movie.bin").write_bytes(x.tobytes())
+    movie = VirtualArray.contiguous(str(tmp_path / "movie.bin"), shape=x.shape, dtype="<u2", chunk_bytes=960)
+    builder = RfsBuilder()
+    builder.add_group("")
+    movie.transpose(0, 2, 1).add_to(builder, "movie")
+    materialize(builder.build(), str(tmp_path / "real.zarr"))
+    written = zarr.open_group(str(tmp_path / "real.zarr"), mode="r")["movie"]
+    assert written.shape == (40, 8, 6) and "transpose" not in json.dumps(written.metadata.to_dict()["codecs"])
+    np.testing.assert_array_equal(written[...], x.transpose(0, 2, 1))

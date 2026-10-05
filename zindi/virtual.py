@@ -13,6 +13,9 @@ bytes:
     channels = [VirtualArray.contiguous(path, offset=16384, shape=[n], dtype="int16") for path in files]
     signal = stack(channels, axis=1)        # one file per channel -> (time, channel)
 
+    movie = VirtualArray.from_rfs(generate_rfs_tiff("movie.tif"), "0")     # (frame, row, column)
+    movie = movie.transpose(0, 2, 1)                                       # (frame, column, row)
+
 add_to writes one into an RfsBuilder, and zindi.nwb puts them in an NWB file.
 """
 
@@ -126,8 +129,36 @@ class VirtualArray:
     def __getitem__(self, key: Any) -> VirtualArray:
         raise NotImplementedError(
             "Only arrays made with VirtualArray.contiguous can be sliced: slicing a chunked, "
-            "compressed, or stacked array would need its data"
+            "compressed, stacked, or transposed array would need its data"
         )
+
+    def transpose(self, *axes: int) -> VirtualArray:
+        """Put the axes in another order, like numpy.transpose.
+
+        The chunks stay as the file has them. Where they hold more than one
+        element along two or more axes whose order changes, the array gets
+        the Zarr transpose codec, which tells a reader the order the values
+        are stored in. Otherwise the bytes are the same in either order and
+        only the chunk coordinates change, as for a file that stores one
+        channel after another read as time by channel with one-column chunks.
+
+        zarr-python reads a whole chunk at a time from an array with the
+        transpose codec, so this suits arrays with small chunks, such as one
+        frame of a movie.
+        """
+        if len(axes) == 1 and not isinstance(axes[0], int):
+            axes = tuple(axes[0])
+        if not axes:
+            axes = tuple(reversed(range(self.ndim)))
+        axes = tuple(int(a) % self.ndim if -self.ndim <= int(a) < self.ndim else int(a) for a in axes)
+        if sorted(axes) != list(range(self.ndim)):
+            raise ValueError(f"axes {axes} is not an ordering of the {self.ndim} axes")
+        array = self
+        if isinstance(self, _Transposed):  # reorder the array underneath once
+            array, axes = self._array, tuple(self._axes[a] for a in axes)
+        if axes == tuple(range(self.ndim)):
+            return array
+        return _Transposed(array, axes)
 
     def add_to(
         self,
@@ -349,6 +380,32 @@ class _Stacked(VirtualArray):
         axis = self._axis
         for j, array in enumerate(self._arrays):
             array._add_chunks(builder, path, lambda coords, j=j: place([*coords[:axis], j, *coords[axis:]]))
+
+
+class _Transposed(VirtualArray):
+    """An array with its axes in another order."""
+
+    def __init__(self, array: VirtualArray, axes: tuple[int, ...]) -> None:
+        self._array, self._axes = array, axes
+        self.shape = tuple(array.shape[a] for a in axes)
+        self.chunk_shape = tuple(array.chunk_shape[a] for a in axes)
+        self.data_type, self.fill_value = array.data_type, array.fill_value
+        self.attributes = dict(array.attributes)
+        # A chunk's bytes depend only on the order of the axes it extends along
+        extended = [a for a in axes if array.chunk_shape[a] > 1]
+        if extended == sorted(extended):
+            self.codecs = array.codecs
+        else:
+            # The codec's order takes this array's axes to the stored ones
+            stored = [axes.index(a) for a in range(len(axes))]
+            self.codecs = [{"name": "transpose", "configuration": {"order": stored}}, *array.codecs]
+
+    def _selection(self) -> dict | None:
+        return self._array._selection()
+
+    def _add_chunks(self, builder: RfsBuilder, path: str, place: _Place) -> None:
+        axes = self._axes
+        self._array._add_chunks(builder, path, lambda coords: place([coords[a] for a in axes]))
 
 
 def stack(arrays: Sequence[VirtualArray], axis: int = 0) -> VirtualArray:
