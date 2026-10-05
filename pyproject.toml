@@ -33,3 +33,9 @@ dev = [
     "tifffile>=2025.1.1",
     "imagecodecs",
 ]
+
+[tool.pytest.ini_options]
+markers = [
+    "gin: tests that download NEO's testing data from GIN (run with -m gin)",
+]
+addopts = "-m 'not gin'"

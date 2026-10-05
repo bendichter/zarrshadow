@@ -1,0 +1,53 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1"  # Mondays, to catch changes in NEO and its testing data
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Unit tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e ".[dev]"
+      - run: pytest -v
+
+  gin:
+    name: NEO generator on GIN data
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install zindi, datalad, and git-annex
+        run: |
+          pip install -e ".[dev]" datalad git-annex
+          git config --global user.name "CI"
+          git config --global user.email "ci@example.org"
+      - name: Get the current commit of NEO's testing data
+        id: ephy
+        run: echo "hash=$(git ls-remote https://gin.g-node.org/NeuralEnsemble/ephy_testing_data.git HEAD | cut -f1)" >> "$GITHUB_OUTPUT"
+      - name: Cache the testing data
+        uses: actions/cache@v4
+        with:
+          path: ~/ephy_testing_data
+          key: ephy-testing-data-${{ steps.ephy.outputs.hash }}-${{ hashFiles('tests/test_neo_gin.py') }}
+          restore-keys: ephy-testing-data-
+      - run: pytest -m gin -v
