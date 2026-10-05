@@ -25,6 +25,10 @@ tiff = [
 neo = [
     "neo>=0.14",
 ]
+nwb = [
+    "pynwb",
+    "hdmf-zarr>=0.14.0",
+]
 dev = [
     "neo>=0.14",
     "pytest",

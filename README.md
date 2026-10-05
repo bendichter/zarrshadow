@@ -240,6 +240,67 @@ Each of NEO's signal buffers becomes one array, time by channel, at `"<buffer id
 
 Continuous integration checks the arrays against NEO's own reads on the recordings NEO tests these readers with, which are hosted on [GIN](https://gin.g-node.org/NeuralEnsemble/ephy_testing_data): 59 recordings across 12 of these formats, with every block, segment, and stream equal. Run the same tests locally with `pytest -m gin`, which downloads about 300 MB with datalad. Maxwell recordings are stored in HDF5 with MaxWell's own compression filter, for which there is no Zarr codec, so only uncompressed Maxwell files can be referenced. When a recording ends partway through its last chunk at the end of the file, that chunk is shorter than the others; zindi pads it, but other Zarr readers will not read it.
 
+## Virtual Arrays
+
+A `VirtualArray` describes an array stored in other files: its shape, data type, and chunking, and where its chunks are. It holds no data. It can be sliced and stacked like an array, and the result is another `VirtualArray` that points at the same bytes.
+
+```python
+from zindi import RfsBuilder, VirtualArray, stack
+
+raw = VirtualArray.contiguous("run_g0_t0.imec0.ap.bin", shape=[n_samples, 385], dtype="int16")
+neural = raw[:, :384]             # drop the sync channel
+sync = raw[:, 384]
+first_minute = neural[: 60 * 30_000]
+
+# One file per channel becomes a time by channel array
+channels = [VirtualArray.contiguous(path, shape=[n_samples], dtype="int16", offset=16384) for path in paths]
+signal = stack(channels, axis=1)
+
+builder = RfsBuilder()
+builder.add_group("")
+neural.add_to(builder, "neural", dimension_names=["time", "channel"])
+rfs = builder.build()
+```
+
+A slice along the first axis of a contiguous array moves the byte range. A slice or a list of indices along a later axis becomes a selection. `stack` joins arrays of the same shape, data type, and chunking along a new axis: each keeps its chunks, which get one more coordinate. `VirtualArray.from_rfs(rfs, path)` takes an array from a reference file system that a generator built, which can be placed in another file or stacked. Only contiguous arrays can be sliced, because slicing a chunked, compressed, or stacked array would need its data. Joining arrays end to end along an existing axis is not supported.
+
+`virtual_arrays_neo(reader)` returns one `VirtualArray` for each signal stream of a NEO reader, holding only that stream's channels, with the stream's sampling rate and channel information in `attributes`. `generate_rfs_neo` describes each buffer as the file stores it.
+
+## Virtual NWB Files
+
+`zindi.nwb` writes an NWB file whose large datasets are references to the acquisition files, so that no signal data is read or copied. Build the `NWBFile` with [pynwb](https://pynwb.readthedocs.io) as usual and give each large dataset a `VirtualArray`'s placeholder as its data. Install with `pip install zindi[nwb]`.
+
+```python
+from hdmf_zarr import NWBZarrIO
+from neo.rawio import SpikeGLXRawIO
+from pynwb.ecephys import ElectricalSeries
+from zindi import RfsStore, load_rfs, virtual_arrays_neo
+from zindi.nwb import write_virtual_nwb
+
+arrays = virtual_arrays_neo(SpikeGLXRawIO(dirname="Noise4Sam_g0"))
+ap = arrays["imec0.ap"]           # 384 neural channels of the 385 in the file
+
+nwbfile = ...                     # an NWBFile with a device, an electrode group, and 384 electrodes
+nwbfile.add_acquisition(
+    ElectricalSeries(
+        name="ElectricalSeries",
+        data=ap.placeholder(),
+        electrodes=nwbfile.create_electrode_table_region(list(range(384)), "all electrodes"),
+        rate=ap.attributes["sampling_rate"],
+        conversion=1e-6,
+        channel_conversion=ap.attributes["gain"],
+    )
+)
+write_virtual_nwb(nwbfile, "session.nwb.zindi")
+
+with NWBZarrIO(RfsStore(load_rfs("session.nwb.zindi")), mode="r") as io:
+    nwbfile = io.read()
+```
+
+hdmf-zarr writes the file's structure: the groups, attributes, object ids, references, the cached specification, and every dataset that holds real data. For a placeholder it writes only the array's metadata, and `write_virtual_nwb` adds the chunk locations. One file can draw on any number of source files. The result reads through `NWBZarrIO`, passes `pynwb.validate`, and can be exported to an ordinary NWB file with `NWBZarrIO.export` or `NWBHDF5IO.export`, passing `write_args={"link_data": False}` so that the data is copied.
+
+The scaling of a series stays in NWB's `conversion`, `offset`, and `channel_conversion`, so the file's integers are referenced as they are. Continuous integration writes a SpikeGLX recording from GIN this way and compares both series with NEO's reads.
+
 ## Other File Formats
 
 `generate_rfs` is the generator for HDF5. Everything after it (the store, the directory format, chunk indexes, `gen`, and source checks) works for any format, and a generator for another format builds the same references with `RfsBuilder`. For a raw binary recording with 16 interleaved `int16` channels after a 12-byte header:
@@ -329,6 +390,8 @@ zindi/
 ├── hdf5.py                  # HDF5 → reference file system, through RfsBuilder
 ├── tiff.py                  # TIFF → reference file system, through tifffile and RfsBuilder
 ├── neo_rawio.py             # NEO raw readers → reference file system, through RfsBuilder
+├── virtual.py               # VirtualArray: slicing and stacking arrays stored in other files
+├── nwb.py                   # Virtual NWB files, written through hdmf-zarr
 ├── open_rfs.py              # Open RFS as zarr.Group
 ├── rfs_store.py             # Zarr v3 Store backed by reference file system
 ├── chunk_index.py           # Byte-range indexes for arrays with many chunks

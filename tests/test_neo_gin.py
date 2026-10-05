@@ -195,57 +195,92 @@ def test_every_reader_with_buffer_api_is_listed():
     assert readers == set(FILES) | set(UNSUPPORTED_FILES)
 
 
-def _stream_columns(reader, stream_id, n_columns):
-    """The columns of its buffer that a stream holds, or None when it holds all of them."""
-    spec = reader._stream_buffer_slice.get(stream_id)
-    if spec is None:
-        return None
-    columns = list(range(*spec.indices(n_columns))) if isinstance(spec, slice) else [int(c) for c in spec]
-    return None if columns == list(range(n_columns)) else columns
+def _stream_key(reader, block, seg, stream):
+    name = str(stream["id"]).replace("/", "_")
+    single = reader.block_count() == 1 and reader.segment_count(0) == 1
+    return name if single else f"block{block}/segment{seg}/{name}"
 
 
 @pytest.mark.parametrize(("name", "path"), _cases(FILES))
-def test_stream_selections_match_neo(name, path):
-    """A stream that is some of the columns of its buffer reads the same through a selection as through NEO."""
-    from zindi import RfsBuilder
-    from zindi.builder import bytes_codecs, columns_selection, contiguous_chunk_shape, zarr_data_type
+def test_stream_arrays_match_neo(name, path):
+    """Each stream as its own array, holding only its channels, reads the same as through NEO."""
+    from zindi import RfsBuilder, virtual_arrays_neo
 
     reader = _reader(name, path)
+    arrays = virtual_arrays_neo(reader, chunk_bytes=2**20)
     builder = RfsBuilder()
     builder.add_group("")
-    expected = {}
+    for i, array in enumerate(arrays.values()):
+        array.add_to(builder, f"a{i}", dimension_names=["time", "channel"])
+    root = open_rfs(builder.build())
+    paths = {key: f"a{i}" for i, key in enumerate(arrays)}
+    compared = 0
     for block in range(reader.block_count()):
         for seg in range(reader.segment_count(block)):
             for stream_index, stream in enumerate(reader.header["signal_streams"]):
-                desc = reader.get_analogsignal_buffer_description(
-                    block_index=block, seg_index=seg, buffer_id=str(stream["buffer_id"])
-                )
-                if desc["type"] != "raw":
-                    continue
-                n_rows, n_columns = (int(n) for n in desc["shape"])
-                columns = _stream_columns(reader, str(stream["id"]), n_columns)
-                if columns is None or n_rows == 0:
-                    continue
-                dtype = np.dtype(desc["dtype"])
-                shape = [n_rows, len(columns)]
-                chunk_shape = contiguous_chunk_shape(shape, dtype.itemsize, 2**20)
-                record_size, keep = columns_selection(n_columns, dtype.itemsize, columns)
-                array_path = f"a{len(expected)}"
-                builder.add_array(
-                    array_path, shape=shape, data_type=zarr_data_type(dtype), chunk_shape=chunk_shape,
-                    codecs=bytes_codecs(dtype),
-                )
-                builder.add_selection(array_path, record_size, keep)
-                builder.add_contiguous_chunks(
-                    array_path, url=str(desc["file_path"]), start=int(desc["file_offset"]), shape=shape,
-                    chunk_shape=chunk_shape, itemsize=dtype.itemsize, row_bytes=record_size,
-                    file_size=os.path.getsize(desc["file_path"]),
-                )
-                expected[array_path] = reader.get_analogsignal_chunk(
-                    block_index=block, seg_index=seg, stream_index=stream_index
-                )
-    if not expected:
-        pytest.skip("every stream of this recording holds all the columns of its buffer")
-    root = open_rfs(builder.build())
-    for array_path, data in expected.items():
-        np.testing.assert_array_equal(root[array_path][...], data)
+                key = _stream_key(reader, block, seg, stream)
+                expected = reader.get_analogsignal_chunk(block_index=block, seg_index=seg, stream_index=stream_index)
+                assert arrays[key].shape == expected.shape
+                np.testing.assert_array_equal(root[paths[key]][...], expected)
+                channels = reader.header["signal_channels"]
+                n_channels = int((channels["stream_id"] == stream["id"]).sum())
+                assert len(arrays[key].attributes["channel_ids"]) == n_channels == expected.shape[1]
+                compared += 1
+    assert compared == len(arrays) > 0
+
+
+def test_spikeglx_as_virtual_nwb():
+    """A SpikeGLX recording as an NWB file: the neural channels and the sync channel of one file, as two series."""
+    pynwb = pytest.importorskip("pynwb")
+    pytest.importorskip("hdmf_zarr.nwb")
+    from datetime import datetime, timezone
+
+    from hdmf_zarr import NWBZarrIO
+    from pynwb.ecephys import ElectricalSeries
+
+    from zindi import RfsStore, virtual_arrays_neo
+    from zindi.nwb import write_virtual_nwb
+
+    reader = _reader("SpikeGLXRawIO", "spikeglx/Noise4Sam_g0")
+    arrays = virtual_arrays_neo(reader)
+    ap, sync = arrays["imec0.ap"], arrays["imec0.ap-SYNC"]
+    assert ap.shape[1] == 384 and sync.shape[1] == 1
+
+    nwbfile = pynwb.NWBFile(
+        session_description="SpikeGLX test recording",
+        identifier="Noise4Sam_g0",
+        session_start_time=datetime(2020, 11, 3, tzinfo=timezone.utc),
+    )
+    device = nwbfile.create_device("Neuropixels")
+    group = nwbfile.create_electrode_group("imec0", description="probe", location="unknown", device=device)
+    for _ in range(ap.shape[1]):
+        nwbfile.add_electrode(group=group, location="unknown")
+    nwbfile.add_acquisition(
+        ElectricalSeries(
+            name="ElectricalSeriesAP",
+            data=ap.placeholder(),
+            electrodes=nwbfile.create_electrode_table_region(list(range(ap.shape[1])), "all electrodes"),
+            rate=ap.attributes["sampling_rate"],
+            starting_time=ap.attributes["t_start"],
+            conversion=1e-6,
+            channel_conversion=ap.attributes["gain"],
+        )
+    )
+    nwbfile.add_acquisition(
+        pynwb.TimeSeries(name="sync", data=sync.placeholder(), unit="a.u.", rate=sync.attributes["sampling_rate"])
+    )
+    rfs = write_virtual_nwb(nwbfile)
+
+    # Both series point into the one .ap.bin file, each keeping its own bytes of every sample
+    assert len(rfs["sources"]) == 1
+    assert rfs["selections"] == {
+        "acquisition/ElectricalSeriesAP/data": {"record_size": 770, "keep": [[0, 768]]},
+        "acquisition/sync/data": {"record_size": 770, "keep": [[768, 770]]},
+    }
+    streams = [str(s) for s in reader.header["signal_streams"]["id"]]
+    with NWBZarrIO(RfsStore(rfs), mode="r") as io:
+        read = io.read()
+        for series, stream in (("ElectricalSeriesAP", "imec0.ap"), ("sync", "imec0.ap-SYNC")):
+            expected = reader.get_analogsignal_chunk(block_index=0, seg_index=0, stream_index=streams.index(stream))
+            np.testing.assert_array_equal(read.acquisition[series].data[...], expected)
+        assert pynwb.validate(io=io) == []
