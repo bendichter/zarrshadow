@@ -21,8 +21,8 @@ jobs:
       matrix:
         python-version: ["3.11", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[dev]"
@@ -32,8 +32,8 @@ jobs:
     name: NEO generator on GIN data
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Install zindi, datalad, and git-annex
@@ -45,7 +45,7 @@ jobs:
         id: ephy
         run: echo "hash=$(git ls-remote https://gin.g-node.org/NeuralEnsemble/ephy_testing_data.git HEAD | cut -f1)" >> "$GITHUB_OUTPUT"
       - name: Cache the testing data
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/ephy_testing_data
           key: ephy-testing-data-${{ steps.ephy.outputs.hash }}-${{ hashFiles('tests/test_neo_gin.py') }}

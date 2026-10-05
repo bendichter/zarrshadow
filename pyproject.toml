@@ -29,7 +29,7 @@ dev = [
     "neo>=0.14",
     "pytest",
     "pynwb",
-    "hdmf-zarr>=0.14.0",
+    "hdmf-zarr>=0.14.0; python_version >= '3.12'",
     "tifffile>=2025.1.1",
     "imagecodecs",
 ]
