@@ -12,7 +12,7 @@ Series i is stored at path "i": an array, or for a pyramid a group of levels
 TIFF deflate and zstd chunks are ordinary zlib and zstd streams, so they are
 written with the standard codec names every Zarr library reads. Other TIFF
 compressions (LZW, JPEG, the horizontal predictor, and so on) use the Zarr
-codecs from imagecodecs, which zindi registers when it opens such a file.
+codecs from imagecodecs, which zarrshadow registers when it opens such a file.
 Other readers need imagecodecs too.
 """
 
@@ -60,14 +60,14 @@ def generate_rfs_tiff(
     Returns
     -------
     dict
-        A reference file system dict; see zindi.builder.
+        A reference file system dict; see zarrshadow.builder.
     """
     import tifffile
 
     if url_or_path.startswith(("http://", "https://")):
-        from .remfile import ZindiRemfile
+        from .remfile import ZarrShadowRemfile
 
-        handle: Any = ZindiRemfile(url_or_path)
+        handle: Any = ZarrShadowRemfile(url_or_path)
     else:
         handle = open(url_or_path, "rb")
     try:

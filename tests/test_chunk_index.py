@@ -11,8 +11,8 @@ import numpy as np
 import pytest
 import zarr
 
-from zindi import generate_rfs, open_rfs, write_rfs
-from zindi.chunk_index import INDEX_BLOCK_ENTRIES, MISSING, index_block_shape
+from zarrshadow import generate_rfs, open_rfs, write_rfs
+from zarrshadow.chunk_index import INDEX_BLOCK_ENTRIES, MISSING, index_block_shape
 
 THRESHOLD = 50
 
@@ -72,11 +72,11 @@ def test_roundtrip(rfs, h5_path, tmp_path, form):
     if form == "memory":
         root = open_rfs(rfs)
     elif form == "directory":
-        write_rfs(rfs, str(tmp_path / "test.zindi"))
-        root = open_rfs(str(tmp_path / "test.zindi"))
+        write_rfs(rfs, str(tmp_path / "test.zarrshadow"))
+        root = open_rfs(str(tmp_path / "test.zarrshadow"))
     else:
-        write_rfs(rfs, str(tmp_path / "test.zindi.json"))
-        root = open_rfs(str(tmp_path / "test.zindi.json"))
+        write_rfs(rfs, str(tmp_path / "test.zarrshadow.json"))
+        root = open_rfs(str(tmp_path / "test.zarrshadow.json"))
     for name, expected in _expected(h5_path).items():
         np.testing.assert_array_equal(root[name][...], expected, err_msg=name)
     # Partial reads touch only some chunks
@@ -92,7 +92,7 @@ def test_json_expansion_matches_unindexed(h5_path, rfs, tmp_path):
 
 
 def test_directory_layout(rfs, tmp_path):
-    out = str(tmp_path / "test.zindi")
+    out = str(tmp_path / "test.zarrshadow")
     write_rfs(rfs, out)
     with open(os.path.join(out, "refs.json")) as f:
         header = json.load(f)
@@ -117,7 +117,7 @@ def test_write_refuses_foreign_directory(rfs, tmp_path):
 
 
 def test_directory_open_reads_no_index(rfs, tmp_path):
-    out = str(tmp_path / "test.zindi")
+    out = str(tmp_path / "test.zarrshadow")
     write_rfs(rfs, out)
     root = open_rfs(out)
     store = root.store
@@ -153,7 +153,7 @@ def test_index_block_shape():
 
 
 def test_open_directory_over_http(rfs, h5_path, tmp_path):
-    out = tmp_path / "served" / "test.zindi"
+    out = tmp_path / "served" / "test.zarrshadow"
     write_rfs(rfs, str(out))
     handler = functools.partial(
         http.server.SimpleHTTPRequestHandler, directory=str(tmp_path / "served")
@@ -163,7 +163,7 @@ def test_open_directory_over_http(rfs, h5_path, tmp_path):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        root = open_rfs(f"http://127.0.0.1:{server.server_port}/test.zindi/")
+        root = open_rfs(f"http://127.0.0.1:{server.server_port}/test.zarrshadow/")
         expected = _expected(h5_path)
         np.testing.assert_array_equal(root["sparse"][...], expected["sparse"])
         np.testing.assert_array_equal(root["matrix"][...], expected["matrix"])
@@ -172,7 +172,7 @@ def test_open_directory_over_http(rfs, h5_path, tmp_path):
 
 
 def test_index_path_must_stay_inside_directory(rfs, tmp_path):
-    out = tmp_path / "test.zindi"
+    out = tmp_path / "test.zarrshadow"
     write_rfs(rfs, str(out))
     header = json.loads((out / "refs.json").read_text())
     header["indexes"]["series"]["index"] = "../elsewhere/series"

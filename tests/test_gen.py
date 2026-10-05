@@ -10,9 +10,9 @@ import pytest
 import zarr
 from zarr.core.sync import _collect_aiterator, sync
 
-from zindi import generate_rfs, open_rfs, write_rfs
-from zindi.gen import Generator, evaluate, render
-from zindi.rfs_store import RfsStore
+from zarrshadow import generate_rfs, open_rfs, write_rfs
+from zarrshadow.gen import Generator, evaluate, render
+from zarrshadow.rfs_store import RfsStore
 
 
 def test_evaluate_arithmetic():
@@ -158,10 +158,10 @@ def test_gen_written_forms(contiguous_h5, tmp_path):
     expected = _expected(contiguous_h5)["matrix"]
 
     # Directory: gen kept, version 2
-    write_rfs(rfs, str(tmp_path / "c.zindi"))
-    header = json.loads((tmp_path / "c.zindi" / "refs.json").read_text())
+    write_rfs(rfs, str(tmp_path / "c.zarrshadow"))
+    header = json.loads((tmp_path / "c.zarrshadow" / "refs.json").read_text())
     assert header["version"] == 2 and len(header["gen"]) == 1
-    np.testing.assert_array_equal(open_rfs(str(tmp_path / "c.zindi"))["matrix"][...], expected)
+    np.testing.assert_array_equal(open_rfs(str(tmp_path / "c.zarrshadow"))["matrix"][...], expected)
 
     # Single JSON: version 1 with every slab listed, readable by stock fsspec
     write_rfs(rfs, str(tmp_path / "c.json"))

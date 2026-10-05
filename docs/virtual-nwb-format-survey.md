@@ -7,7 +7,7 @@ Research survey for virtual (reference-based) NWB datasets. Nothing here is impl
 | Package | Version read | Where |
 |---|---|---|
 | neuroconv | dev checkout `v0.10.1-18-g9daf94e46` (pip metadata still says 0.9.4) | `src/neuroconv` |
-| neo | 0.14.4 (neuroconv dev asks for >=0.14.5; the buffer-API reader set is the same 13 in 0.14.5, per the zindi CI run) | `neo/rawio` |
+| neo | 0.14.4 (neuroconv dev asks for >=0.14.5; the buffer-API reader set is the same 13 in 0.14.5, per the zarrshadow CI run) | `neo/rawio` |
 | spikeinterface | 0.103.1 (neuroconv dev asks for >=0.104.7) | `spikeinterface` |
 | roiextractors | 0.5.12 installed; 0.10.0 sdist unpacked for the extractors missing from 0.5.12 (Femtonics, Minian, MultiTIFF, OME) | `roiextractors` |
 | GIN ephy_testing_data | commit `d7796f594` | https://gin.g-node.org/NeuralEnsemble/ephy_testing_data |
@@ -18,13 +18,13 @@ Verification marks: **[F]** verified on a GIN file, **[S]** verified in reader s
 
 ## Classes
 
-- **A** covered by an existing zindi generator (HDF5, TIFF, NEO buffer API)
+- **A** covered by an existing zarrshadow generator (HDF5, TIFF, NEO buffer API)
 - **B** one contiguous raw block; a trivial new generator
 - **C** fixed-size records, one chunk per record (strided chunks, which `gen` entries express)
 - **D** needs the byte-selection rule (keep some bytes of every N)
 - **E** needs a custom codec or is not feasible
 - **F** nothing to gain (already external, or small and restructured)
-- **+T** also needs the Zarr v3 `transpose` codec, which zindi does not emit yet and which turns off the bytes-only partial-read path
+- **+T** also needs the Zarr v3 `transpose` codec, which zarrshadow does not emit yet and which turns off the bytes-only partial-read path
 - **+S** needs a scale/offset or sign change carried in NWB `conversion`/`offset`, so the stored values differ from what NeuroConv writes
 
 ## Table
@@ -35,13 +35,13 @@ NeuroConv writes `ElectricalSeries.data` as (time, channel) in the source intege
 
 | Format | NeuroConv -> extractor -> reader | On-disk layout of the signal | Mismatch with what NeuroConv writes | NEO buffer API | Class | Mark |
 |---|---|---|---|---|---|---|
-| SpikeGLX | `SpikeGLXRecordingInterface` -> `SpikeGLXRecordingExtractor` -> `SpikeGLXRawIO` | no header, int16 LE, (time, channel), one block per .bin | the sync word is the last column of the same block and is a separate stream; the AP/LF stream must drop it | yes | A + D | [F] (zindi GIN tests) |
-| Open Ephys binary | `OpenEphysBinaryRecordingInterface` -> `OpenEphysBinaryRecordingExtractor` -> `OpenEphysBinaryRawIO` | `continuous.dat`, no header, int16 LE, (time, channel) | neural and ADC/non-neural channels share one file and are split into streams by column | yes | A, + D when the file mixes channel kinds | [F] (zindi GIN tests) |
+| SpikeGLX | `SpikeGLXRecordingInterface` -> `SpikeGLXRecordingExtractor` -> `SpikeGLXRawIO` | no header, int16 LE, (time, channel), one block per .bin | the sync word is the last column of the same block and is a separate stream; the AP/LF stream must drop it | yes | A + D | [F] (zarrshadow GIN tests) |
+| Open Ephys binary | `OpenEphysBinaryRecordingInterface` -> `OpenEphysBinaryRecordingExtractor` -> `OpenEphysBinaryRawIO` | `continuous.dat`, no header, int16 LE, (time, channel) | neural and ADC/non-neural channels share one file and are split into streams by column | yes | A, + D when the file mixes channel kinds | [F] (zarrshadow GIN tests) |
 | Open Ephys legacy | `OpenEphysLegacyRecordingInterface` -> `OpenEphysLegacyRecordingExtractor` -> `OpenEphysRawIO` | one `.continuous` file per channel: 1024-byte header, then 2070-byte records = int64 timestamp, uint16 n, uint16 rec_num, 1024 samples **big-endian** int16, 10 marker bytes | one file per channel, so the array is (time, 1)-column chunks over many files | no | C | [F] `101_CH0.continuous` |
-| Neuroscope | `NeuroScopeRecordingInterface`/`LFPInterface` -> `NeuroScopeRecordingExtractor` -> `NeuroScopeRawIO` | no header, int16 (or int32) LE, (time, channel) | none | yes | A | [F] (zindi GIN tests) |
+| Neuroscope | `NeuroScopeRecordingInterface`/`LFPInterface` -> `NeuroScopeRecordingExtractor` -> `NeuroScopeRawIO` | no header, int16 (or int32) LE, (time, channel) | none | yes | A | [F] (zarrshadow GIN tests) |
 | CellExplorer recording | `CellExplorerRecordingInterface` -> `BinaryRecordingExtractor` | raw binary described by `session.mat` | none | n/a (hook: `recording._kwargs`: `file_paths`, `dtype`, `file_offset`, `time_axis`, `num_channels`) | B | [S] `cellexplorerdatainterface.py:298-313` |
 | WhiteMatter | `WhiteMatterRecordingInterface` -> `WhiteMatterRecordingExtractor` (a `BinaryRecordingExtractor`) | 8-byte header, int16 LE, (time, channel) | none | n/a (same `_kwargs` hook) | B | [F] stub file, 25000 x 64 |
-| MCS raw | `MCSRawRecordingInterface` -> `MCSRawRecordingExtractor` -> `RawMCSRawIO` | text header, then one (time, channel) block | none | yes | A | [F] (zindi GIN tests) |
+| MCS raw | `MCSRawRecordingInterface` -> `MCSRawRecordingExtractor` -> `RawMCSRawIO` | text header, then one (time, channel) block | none | yes | A | [F] (zarrshadow GIN tests) |
 | Blackrock nsX, spec 2.1 | `BlackrockRecordingInterface` -> `BlackrockRecordingExtractor` -> `BlackrockRawIO` | header of 32 + 4*n_ch bytes, then one int16 LE (time, channel) block | NEO drops the last sample row | no | B | [F] `l101210-001.ns5` |
 | Blackrock nsX, spec 2.2, 2.3, 3.0 | same | headers, then data blocks: a 9-byte (2.x) or 13-byte (3.0) block header (flag, timestamp, n points) followed by n x n_ch int16 | one block per pause; each block is a NEO segment | no | B per block (one array per segment) | [F] `FileSpec2.3001.ns5`, `file_spec_3_0.ns6`, `pause_correct.ns2` (2 blocks) |
 | Blackrock nsX, 3.0 PTP | same | per-sample packets: 13 bytes (reserved, uint64 timestamp, uint32 n=1) + n_ch int16 | 13 extra bytes on every sample | no | D | [F] `20231027-125608-001.ns6`, packet 143 B |
@@ -58,7 +58,7 @@ NeuroConv writes `ElectricalSeries.data` as (time, channel) in the source intege
 | MEArec | `MEArecRecordingInterface` -> `MEArecRecordingExtractor` -> `MEArecRawIO` | HDF5 dataset `recordings`, (time, channel) float32, contiguous, uncompressed in the GIN file | none | no | A (HDF5) | [F] `mearec_test_10s.h5` |
 | Biocam `.brw` | `BiocamRecordingInterface` -> `BiocamRecordingExtractor` -> `BiocamRawIO` | HDF5. `3BData/Raw` or `Well_*/Raw`: a **flat 1-D** uint16 dataset of frames*channels in time-major order (format 100 is 2-D). Contiguous and uncompressed in the GIN files | needs a 2-D view of a 1-D dataset; when `SignalInversion` is -1 the reader returns `4096 - raw` | no | A/B (take the dataset offset and treat it as a raw block) +S | [F] two files; inversion [S] `biocamrawio.py:332-342` |
 | Biocam, event-based sparse | same | `EventsBasedSparseRaw`, a custom sparse encoding | must be decoded | no | E | [F] `BioCAM_BrainWave5_HW_3.0_FW_1.7.brw` |
-| Maxwell | `MaxOneRecordingInterface` -> `MaxwellRecordingExtractor` -> `MaxwellRawIO` | HDF5 with compression filter 401 | no Zarr codec for the filter | yes | E | [F] (zindi GIN tests) |
+| Maxwell | `MaxOneRecordingInterface` -> `MaxwellRecordingExtractor` -> `MaxwellRawIO` | HDF5 with compression filter 401 | no Zarr codec for the filter | yes | E | [F] (zarrshadow GIN tests) |
 | Plexon `.plx` | `PlexonRecordingInterface` -> `PlexonRecordingExtractor` -> `PlexonRawIO` | data blocks with a 16-byte header and n1*n2 int16 words; continuous, spike and event blocks of all channels are interleaved, and block sizes vary | variable-length blocks cannot be a regular chunk grid | no | E | [S] `plexonrawio.py:219-225, 473-479` |
 | Plexon2 `.pl2` | `Plexon2RecordingInterface` -> `Plexon2RawIO` | read through the vendor DLL (Wine off Windows) | layout not available | no | E | [S] `plexon2rawio.py:4-6` |
 | Spike2 `.smr`/`.smrx` | `Spike2RecordingInterface` -> `CedRecordingExtractor` -> `CedRawIO` (closed-source `sonpy`) | linked lists of per-channel blocks | layout not available from the reader NeuroConv uses | no | E | [S] `cedrawio.py:70-72` |
@@ -70,7 +70,7 @@ NeuroConv writes `ElectricalSeries.data` as (time, channel) in the source intege
 
 | Format | Chain | Layout | Mismatch | NEO buffer API | Class | Mark |
 |---|---|---|---|---|---|---|
-| Axon ABF | `AbfInterface` -> `neo.AxonIO` (legacy icephys path) | header, then int16 or float32 (time, channel) interleaved; one region per sweep | NeuroConv writes one `PatchClampSeries` per sweep **per channel** (`tools/neo/neo.py:305-332`), so every series is one column; stimulus series are synthesized from the protocol and are not in the file | yes | A for the source; D per series when there is more than one ADC channel; stimulus F | layout [F] (zindi GIN tests), NWB mapping [S] |
+| Axon ABF | `AbfInterface` -> `neo.AxonIO` (legacy icephys path) | header, then int16 or float32 (time, channel) interleaved; one region per sweep | NeuroConv writes one `PatchClampSeries` per sweep **per channel** (`tools/neo/neo.py:305-332`), so every series is one column; stimulus series are synthesized from the protocol and are not in the file | yes | A for the source; D per series when there is more than one ADC channel; stimulus F | layout [F] (zarrshadow GIN tests), NWB mapping [S] |
 
 ### Optical physiology, imaging
 
@@ -143,7 +143,7 @@ NeuroConv writes traces as (time, ROI) and rebuilds the masks into the plane seg
 
 ## Cross-cutting findings
 
-- **The transpose codec is needed more often than the byte-selection rule.** All imaging, Intan header-attached, EDF, Suite2p and CaImAn traces need it. zindi does not emit it, and zarr-python's uncompressed partial read does not apply when it is present.
+- **The transpose codec is needed more often than the byte-selection rule.** All imaging, Intan header-attached, EDF, Suite2p and CaImAn traces need it. zarrshadow does not emit it, and zarr-python's uncompressed partial read does not apply when it is present.
 - **Of NeuroConv's ephys formats, NEO's buffer API covers six**: SpikeGLX, Open Ephys binary, Neuroscope, MCS raw, Axon and Maxwell (not usable). The other seven buffer-API readers (BrainVision, Elan, Micromed, NeuroNexus, raw binary, WinEDR, WinWCP) have no NeuroConv interface.
 - **Hooks from an interface to the layout.** `interface.recording_extractor.neo_reader`, `.stream_id`, `.stream_index`, `.block_index`, `.inverted_gain` (`neobaseextractor.py:27, 224-225, 254`); for binary extractors `recording._kwargs`; for TIFF `extractor._frames_to_ifd_table`. NeuroConv may wrap the extractor (channel slices, segment concatenation), so the hook has to walk to the parent.
 - **A column permutation never needs a codec**: the `electrodes` region of an `ElectricalSeries` can list electrodes in file order. A column subset does.

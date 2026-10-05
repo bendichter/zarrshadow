@@ -8,7 +8,7 @@ Write an NWB file whose large datasets are references to bytes in the original a
 
 ## What Exists
 
-- zindi generators for HDF5, TIFF, and the 13 NEO readers with the buffer description API, tested in CI on 59 GIN recordings.
+- zarrshadow generators for HDF5, TIFF, and the 13 NEO readers with the buffer description API, tested in CI on 59 GIN recordings.
 - A refs format that records several source files with size and ETag, plus `gen`, `indexes`, and (in https://github.com/bendichter/zindi/pull/18) `selections`.
 - `RfsStore`, which `NWBZarrIO` reads, and which reads byte ranges of a chunk as ranges.
 - Partial reads of uncompressed chunks in zarr-python (https://github.com/zarr-developers/zarr-python/pull/4458, in review), zarrita.js (branch), and zarr-matlab (merged).
@@ -16,7 +16,7 @@ Write an NWB file whose large datasets are references to bytes in the original a
 
 ## Design
 
-### 1. VirtualArray (zindi)
+### 1. VirtualArray (zarrshadow)
 
 One object that describes an array stored in other files: shape, dtype, chunk shape, codecs, fill value, where its chunks are (refs, a `gen` entry, or an index), its selection if any, and its sources. Generators return these instead of writing straight into a builder.
 
@@ -34,7 +34,7 @@ It supports basic slicing, which returns another `VirtualArray`:
 
 Each generator gains a function that returns `VirtualArray`s. For NEO that is one per stream per segment, with the stream's columns selected from its buffer, so the sync channel of a SpikeGLX file is its own array and the neural channels are another.
 
-### 3. write_virtual_nwb (zindi[nwb])
+### 3. write_virtual_nwb (zarrshadow[nwb])
 
 1. Find every placeholder in the in-memory `NWBFile`.
 2. Write the file with `NWBZarrIO` to a `MemoryStore`. hdmf-zarr produces the specs, object IDs, references, and attributes.
@@ -52,11 +52,11 @@ NeuroConv keeps building the `NWBFile` and its metadata. The bridge replaces eac
 - `BinaryRecordingExtractor` exposes file paths, dtype, and offset directly.
 - roiextractors TIFF and HDF5 imaging extractors expose the file path and series or dataset.
 
-Channel subsets and orderings that the interface applies become slices of the `VirtualArray`. This starts as a module in zindi that depends on NeuroConv, and moves into NeuroConv as a backend once the interface is stable.
+Channel subsets and orderings that the interface applies become slices of the `VirtualArray`. This starts as a module in zarrshadow that depends on NeuroConv, and moves into NeuroConv as a backend once the interface is stable.
 
 ## Axis Order
 
-A reference describes bytes in the order the file has them, and NWB fixes the order of a dataset's axes. Two mechanisms cover the difference, and neither is specific to zindi.
+A reference describes bytes in the order the file has them, and NWB fixes the order of a dataset's axes. Two mechanisms cover the difference, and neither is specific to zarrshadow.
 
 1. Chunk layout. When each chunk is a run along a single axis, the chunk grid expresses the layout and nothing is reordered. Channel-major data (all of channel 0, then all of channel 1) becomes a time-by-channel array with one-column chunks, where chunk `j` along the channel axis points at channel `j`'s bytes. ROI-by-time traces work the same way. Partial reads keep working.
 2. The Zarr v3 `transpose` codec, when a chunk spans two axes in the wrong order, as with image frames stored (y, x) for a dataset NWB wants as (x, y). It composes with a selection: the store selects bytes, then the codecs decode and transpose. hdmf-zarr writes a `TransposeCodec` given through `ZarrDataIO(filters=...)`; reading data back through one is still to test. zarr-python turns off partial reads for an array with this codec, so use it where chunks are small (one frame) and prefer the chunk layout elsewhere.
@@ -95,12 +95,12 @@ A column permutation needs no selection: the `electrodes` region of an `Electric
 0. Done: generators, selections, partial reads, hdmf-zarr feasibility.
 1. Done: `VirtualArray` with slicing and stacking, NEO arrays per stream (`virtual_arrays_neo`), and `write_virtual_nwb`, tested on the GIN recordings and on a SpikeGLX recording written as NWB. Generators still write into a builder; `VirtualArray.from_rfs` takes an array from what they build.
    Also done: `materialize`, which writes a virtual file into an ordinary Zarr store with a chosen chunking and compression. It reads through `RfsStore` only, so the same function can run in an upload client or on the archive.
-2. Prototype done: `zindi.neuroconv_bridge.virtualize` swaps the data iterators in an NWB file that NeuroConv built for references. It finds each iterator's SpikeInterface recording, walks through channel slices to the recording that holds the NEO reader, and takes that stream's array from `virtual_arrays_neo`. Compared with NeuroConv's own conversion on GIN data, every dataset is equal except the file's creation time, for SpikeGLX (AP band and NIDQ), Open Ephys binary with and without a sync channel, Neuroscope, and MCS raw. Recordings whose samples SpikeInterface negates, and iterators that return scaled values, are refused.
+2. Prototype done: `zarrshadow.neuroconv_bridge.virtualize` swaps the data iterators in an NWB file that NeuroConv built for references. It finds each iterator's SpikeInterface recording, walks through channel slices to the recording that holds the NEO reader, and takes that stream's array from `virtual_arrays_neo`. Compared with NeuroConv's own conversion on GIN data, every dataset is equal except the file's creation time, for SpikeGLX (AP band and NIDQ), Open Ephys binary with and without a sync channel, Neuroscope, and MCS raw. Recordings whose samples SpikeInterface negates, and iterators that return scaled values, are refused.
 
    Two things stand between the prototype and something users can install:
-   - SpikeInterface requires `zarr<3` (0.105.1), and zindi needs Zarr v3. Zarr v3 support is in progress at https://github.com/SpikeInterface/spikeinterface/pull/4260. Until then the two install together only with the requirement overridden.
+   - SpikeInterface requires `zarr<3` (0.105.1), and zarrshadow needs Zarr v3. Zarr v3 support is in progress at https://github.com/SpikeInterface/spikeinterface/pull/4260. Until then the two install together only with the requirement overridden.
    - NeuroConv 0.10.2 reads `zarr.codec_registry` at import, which Zarr v3 removed. Building an NWB file in memory works once that one attribute is put back, and the bridge needs nothing else from NeuroConv. NeuroConv's own Zarr backend was not tested under Zarr v3. NeuroConv pins `zarr<3` on its main branch. Zarr v3 support is tracked in https://github.com/catalystneuro/neuroconv/issues/2076, and https://github.com/catalystneuro/neuroconv/pull/1749 is a draft port of its Zarr backend.
-3. Imaging. Done in zindi: a TIFF stack as an NWB series, through `VirtualArray.from_rfs`, `stack` for one file per frame, and `transpose`. Remaining: the NeuroConv side, for the TIFF family (ScanImage, Bruker, Micro-Manager, Thor) through the extractors' page tables, and HDF5 imaging. This is the largest data volume NeuroConv handles, and it brings in the transpose work that every other imaging format reuses.
+3. Imaging. Done in zarrshadow: a TIFF stack as an NWB series, through `VirtualArray.from_rfs`, `stack` for one file per frame, and `transpose`. Remaining: the NeuroConv side, for the TIFF family (ScanImage, Bruker, Micro-Manager, Thor) through the extractors' page tables, and HDF5 imaging. This is the largest data volume NeuroConv handles, and it brings in the transpose work that every other imaging format reuses.
 4. New ephys generators, in this order:
    - Blackrock nsX, specs 2.1 to 3.0: one contiguous block per segment.
    - SpikeGadgets: per-sample packets, the direct use of selections. The same rule covers Blackrock PTP files.
@@ -111,7 +111,7 @@ A column permutation needs no selection: the `electrodes` region of an `Electric
 
 ## Source Formats
 
-Classes: A, an existing zindi generator covers it. B, one contiguous raw block. C, fixed-size records, one chunk per record. D, needs a selection. E, not feasible. F, nothing to gain. "+T" needs the transpose codec, and "+S" needs a sign or offset carried in `conversion` and `offset`. The evidence column says whether the layout was checked against NEO's read on a GIN file or read in the reader's source only.
+Classes: A, an existing zarrshadow generator covers it. B, one contiguous raw block. C, fixed-size records, one chunk per record. D, needs a selection. E, not feasible. F, nothing to gain. "+T" needs the transpose codec, and "+S" needs a sign or offset carried in `conversion` and `offset`. The evidence column says whether the layout was checked against NEO's read on a GIN file or read in the reader's source only.
 
 | Format | Layout | Class | Evidence |
 |---|---|---|---|

@@ -6,8 +6,8 @@ import h5py
 import numpy as np
 import pytest
 
-from zindi import LocalCache, generate_rfs, open_rfs
-from zindi.local_cache import ChunkTooLargeError
+from zarrshadow import LocalCache, generate_rfs, open_rfs
+from zarrshadow.local_cache import ChunkTooLargeError
 
 
 class TestLocalCacheDirect:

@@ -18,9 +18,9 @@ pytest.importorskip("hdmf_zarr.nwb")
 from hdmf.data_utils import DataChunkIterator  # noqa: E402
 from hdmf_zarr import NWBZarrIO  # noqa: E402
 
-from zindi import RfsStore, open_rfs  # noqa: E402
-from zindi.neuroconv_bridge import NotVirtualizable, virtualize  # noqa: E402
-from zindi.nwb import write_virtual_nwb  # noqa: E402
+from zarrshadow import RfsStore, open_rfs  # noqa: E402
+from zarrshadow.neuroconv_bridge import NotVirtualizable, virtualize  # noqa: E402
+from zarrshadow.nwb import write_virtual_nwb  # noqa: E402
 
 
 def _import_neuroconv():

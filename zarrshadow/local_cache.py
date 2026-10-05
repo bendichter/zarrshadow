@@ -22,7 +22,7 @@ class LocalCache:
     Parameters
     ----------
     cache_dir : str or None
-        Directory to store the cache database. Defaults to ``~/.zindi/cache``.
+        Directory to store the cache database. Defaults to ``~/.zarrshadow/cache``.
     max_size_bytes : int or None
         Maximum total size of cached data in bytes. When exceeded, the
         least-recently-accessed chunks are evicted. None means no limit.
@@ -32,11 +32,11 @@ class LocalCache:
         self, *, cache_dir: str | None = None, max_size_bytes: int | None = None
     ):
         if cache_dir is None:
-            cache_dir = os.path.expanduser("~/.zindi/cache")
+            cache_dir = os.path.expanduser("~/.zarrshadow/cache")
         self._cache_dir = cache_dir
         os.makedirs(self._cache_dir, exist_ok=True)
         self._sqlite_client = _LocalCacheSQLiteClient(
-            db_fname=os.path.join(self._cache_dir, "zindi_cache.db"),
+            db_fname=os.path.join(self._cache_dir, "zarrshadow_cache.db"),
             max_size_bytes=max_size_bytes,
         )
 

@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import zarr
 
-from zindi import RfsBuilder, VirtualArray, materialize, open_rfs, write_rfs
+from zarrshadow import RfsBuilder, VirtualArray, materialize, open_rfs, write_rfs
 
 
 @pytest.fixture
@@ -30,7 +30,7 @@ def test_materialize(virtual, tmp_path):
     rfs, x = virtual
     report = materialize(rfs, str(tmp_path / "real.zarr"), chunk_bytes=2**18)
 
-    # An ordinary Zarr store, with no references and nothing specific to zindi
+    # An ordinary Zarr store, with no references and nothing specific to zarrshadow
     root = zarr.open_group(str(tmp_path / "real.zarr"), mode="r")
     assert dict(root.attrs) == {"session": "a"}
     signal = root["acquisition/signal"]
@@ -52,9 +52,9 @@ def test_materialize(virtual, tmp_path):
 
 def test_from_a_written_file_into_a_store(virtual, tmp_path):
     rfs, x = virtual
-    write_rfs(rfs, str(tmp_path / "virtual.zindi"))
+    write_rfs(rfs, str(tmp_path / "virtual.zarrshadow"))
     store = zarr.storage.MemoryStore()
-    materialize(str(tmp_path / "virtual.zindi"), store, verify=True)
+    materialize(str(tmp_path / "virtual.zarrshadow"), store, verify=True)
     np.testing.assert_array_equal(zarr.open_group(store, mode="r")["acquisition/signal"][...], x[:, :16])
 
 
@@ -92,7 +92,7 @@ def test_virtual_nwb(tmp_path):
     pytest.importorskip("hdmf_zarr.nwb")
     from hdmf_zarr import NWBZarrIO
 
-    from zindi.nwb import write_virtual_nwb
+    from zarrshadow.nwb import write_virtual_nwb
 
     x = np.cumsum(np.random.default_rng(1).integers(-3, 4, (40_000, 8)), axis=0).astype("<i2")
     (tmp_path / "raw.bin").write_bytes(x.tobytes())

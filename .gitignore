@@ -219,5 +219,5 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# zindi
-examples/*.zindi.json
+# zarrshadow
+examples/*.zarrshadow.json

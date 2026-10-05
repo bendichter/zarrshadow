@@ -1,4 +1,4 @@
-"""End-to-end tests for zindi: HDF5 → zarr v3 RFS → read back."""
+"""End-to-end tests for zarrshadow: HDF5 → zarr v3 RFS → read back."""
 
 import json
 import math
@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import zarr
 
-from zindi import generate_rfs, open_rfs
+from zarrshadow import generate_rfs, open_rfs
 
 
 def _create_test_hdf5(path: str) -> None:
@@ -448,9 +448,9 @@ class TestBasicRoundtrip:
 
     def test_write_and_read_json(self):
         """RFS can be written to JSON and read back."""
-        from zindi import write_rfs
+        from zarrshadow import write_rfs
 
-        json_path = f"{self.tmpdir}/test.zindi.json"
+        json_path = f"{self.tmpdir}/test.zarrshadow.json"
         write_rfs(self.rfs, json_path)
 
         root = open_rfs(json_path)

@@ -5,7 +5,7 @@ import json
 import numpy as np
 import pytest
 
-from zindi import RfsBuilder, VirtualArray, open_rfs, stack
+from zarrshadow import RfsBuilder, VirtualArray, open_rfs, stack
 
 HEADER = 12
 
@@ -253,7 +253,7 @@ def test_transpose_tiff(tmp_path, options):
     """A TIFF stack, stored (page, row, column), read as (page, column, row)."""
     tifffile = pytest.importorskip("tifffile")
     pytest.importorskip("imagecodecs")
-    from zindi import generate_rfs_tiff
+    from zarrshadow import generate_rfs_tiff
 
     x = np.random.default_rng(6).integers(0, 4000, (20, 48, 64)).astype("uint16")
     tifffile.imwrite(tmp_path / "movie.tif", x, **options)

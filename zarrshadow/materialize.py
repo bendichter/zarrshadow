@@ -5,7 +5,7 @@ those bytes and writes them into a Zarr store of their own, with the
 chunking and compression chosen here, so the result no longer depends on
 the files it came from:
 
-    materialize("session.nwb.zindi", "session.nwb.zarr")
+    materialize("session.nwb.zarrshadow", "session.nwb.zarr")
 
 Everything that is stored in the reference file system itself (groups,
 attributes, small datasets) is copied as it is. An array whose chunks are

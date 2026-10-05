@@ -21,7 +21,7 @@ neo_rawio = pytest.importorskip("neo.rawio")
 
 from neo.rawio.baserawio import BaseRawWithBufferApiIO  # noqa: E402
 
-from zindi import generate_rfs_neo, open_rfs  # noqa: E402
+from zarrshadow import generate_rfs_neo, open_rfs  # noqa: E402
 
 pytestmark = pytest.mark.gin
 
@@ -204,7 +204,7 @@ def _stream_key(reader, block, seg, stream):
 @pytest.mark.parametrize(("name", "path"), _cases(FILES))
 def test_stream_arrays_match_neo(name, path):
     """Each stream as its own array, holding only its channels, reads the same as through NEO."""
-    from zindi import RfsBuilder, virtual_arrays_neo
+    from zarrshadow import RfsBuilder, virtual_arrays_neo
 
     reader = _reader(name, path)
     arrays = virtual_arrays_neo(reader, chunk_bytes=2**20)
@@ -238,8 +238,8 @@ def test_spikeglx_as_virtual_nwb(tmp_path):
     from hdmf_zarr import NWBZarrIO
     from pynwb.ecephys import ElectricalSeries
 
-    from zindi import RfsStore, materialize, virtual_arrays_neo
-    from zindi.nwb import write_virtual_nwb
+    from zarrshadow import RfsStore, materialize, virtual_arrays_neo
+    from zarrshadow.nwb import write_virtual_nwb
 
     reader = _reader("SpikeGLXRawIO", "spikeglx/Noise4Sam_g0")
     arrays = virtual_arrays_neo(reader)

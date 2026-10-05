@@ -1,7 +1,7 @@
 """A minimal read-only zarr v3 Store over plain HTTP.
 
 Used to read the chunk index arrays of an RFS directory hosted on a web
-server or S3 bucket. It reuses zindi's URL resolution and retry logic instead
+server or S3 bucket. It reuses zarrshadow's URL resolution and retry logic instead
 of requiring aiohttp for fsspec's HTTP filesystem.
 """
 

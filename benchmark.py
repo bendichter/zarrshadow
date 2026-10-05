@@ -1,4 +1,4 @@
-"""Benchmark: remfile vs zindi for cold reads of remote NWB data.
+"""Benchmark: remfile vs zarrshadow for cold reads of remote NWB data.
 
 Reads the first minute of acquisition/ElectricalSeries from a DANDI asset.
 Single cold run for each approach — no caching, no warm-up.
@@ -42,10 +42,10 @@ def read_with_remfile():
     return data, t_open, t_read
 
 
-def read_with_zindi(rfs):
-    """Read via NWBZarrIO + zindi RfsStore (no cache)."""
+def read_with_zarrshadow(rfs):
+    """Read via NWBZarrIO + zarrshadow RfsStore (no cache)."""
     from hdmf_zarr import NWBZarrIO
-    from zindi import RfsStore
+    from zarrshadow import RfsStore
 
     store = RfsStore(rfs)
 
@@ -68,12 +68,12 @@ def read_with_zindi(rfs):
 if __name__ == "__main__":
     import warnings
 
-    from zindi import generate_rfs, write_rfs
+    from zarrshadow import generate_rfs, write_rfs
 
     warnings.filterwarnings("ignore")
 
     # Pre-generate RFS (one-time cost, not part of the benchmark)
-    rfs_path = "/tmp/bench_rfs.zindi.json"
+    rfs_path = "/tmp/bench_rfs.zarrshadow.json"
     try:
         import json
         with open(rfs_path) as f:
@@ -100,12 +100,12 @@ if __name__ == "__main__":
         rf_data = None
     print()
 
-    # --- zindi ---
+    # --- zarrshadow ---
     print("=" * 60)
-    print("NWBZarrIO + zindi (cold, pre-generated RFS, no cache)")
+    print("NWBZarrIO + zarrshadow (cold, pre-generated RFS, no cache)")
     print("=" * 60)
     try:
-        z_data, z_open, z_read = read_with_zindi(rfs)
+        z_data, z_open, z_read = read_with_zarrshadow(rfs)
         print(f"  Open:  {z_open:.1f}s")
         print(f"  Read:  {z_read:.1f}s")
         print(f"  Total: {z_open + z_read:.1f}s")
