@@ -24,6 +24,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+import numpy as np
+
 from .neo_rawio import virtual_arrays_neo
 from .virtual import VirtualArray
 
@@ -86,6 +88,8 @@ def _array_for_iterator(
     chunk_bytes: int,
 ) -> VirtualArray:
     """The VirtualArray holding what a NeuroConv data iterator would read."""
+    if getattr(iterator, "imaging_extractor", None) is not None:
+        return _array_for_imaging(iterator, url_for)
     recording = getattr(iterator, "recording", None)
     if recording is None:
         raise NotVirtualizable(f"{type(iterator).__name__} does not read a SpikeInterface recording")
@@ -133,3 +137,134 @@ def _array_for_iterator(
         array = array[:, columns]
         array.attributes = attributes
     return array
+
+
+def _array_for_imaging(iterator: Any, url_for: Callable[[str], str] | None) -> VirtualArray:
+    """The VirtualArray holding the frames a NeuroConv imaging iterator would read.
+
+    The frames come from TIFF pages or from an HDF5 dataset, one frame to a
+    chunk. NeuroConv writes frames as (frame, width, height) and, for
+    volumes, (frame, width, height, plane), where the files hold (rows,
+    columns), so the result is transposed.
+    """
+    extractor = iterator.imaging_extractor
+    url_for = url_for or (lambda path: path)
+    if hasattr(extractor, "_mov_field"):
+        frames = _hdf5_frames(extractor, url_for)
+    else:
+        frames = _tiff_frames(extractor, url_for)
+    array = frames.transpose(0, 2, 1, 3) if frames.ndim == 4 else frames.transpose(0, 2, 1)
+    expected = tuple(int(n) for n in iterator.maxshape)
+    # the byte order of the file is in the array's codecs, not its data type
+    expected_dtype = np.dtype(iterator.dtype).newbyteorder("=")
+    if array.shape != expected or array.dtype != expected_dtype:
+        raise NotVirtualizable(
+            f"The files give {array.shape} {array.dtype}, and NeuroConv writes {expected} {expected_dtype}"
+        )
+    return array
+
+
+def _frame_pages(extractor: Any) -> list[list[tuple[str, int]]]:
+    """For each frame of a roiextractors TIFF extractor, the (file, page) of each of its planes."""
+    parts = getattr(extractor, "_imaging_extractors", None)
+    if parts is not None:
+        # several extractors one after another in time, as for Bruker's one file per frame
+        if getattr(extractor, "is_volumetric", False):
+            raise NotVirtualizable(f"{type(extractor).__name__} assembles volumes from several extractors")
+        return [pages for part in parts for pages in _frame_pages(part)]
+
+    table = getattr(extractor, "_frames_to_ifd_table", None)
+    file_paths = getattr(extractor, "_file_paths", None) or getattr(extractor, "file_paths", None)
+    if table is not None and file_paths is not None:
+        # a table of which page of which file holds each plane of each frame, ordered by frame and then plane
+        num_planes = int(extractor.get_num_planes()) if getattr(extractor, "is_volumetric", False) else 1
+        num_samples = int(extractor.get_num_samples())
+        if len(table) < num_samples * num_planes:
+            raise NotVirtualizable(f"{type(extractor).__name__} lists fewer pages than its frames need")
+        return [
+            [
+                (str(file_paths[int(row["file_index"])]), int(row["IFD_index"]))
+                for row in table[sample * num_planes : (sample + 1) * num_planes]
+            ]
+            for sample in range(num_samples)
+        ]
+
+    file_path = getattr(extractor, "file_path", None)
+    if file_path is not None:
+        # one file whose pages are the frames, in order
+        return [[(str(file_path), page)] for page in range(int(extractor.get_num_samples()))]
+    raise NotVirtualizable(f"{type(extractor).__name__} does not say which pages of which files hold its frames")
+
+
+def _tiff_frames(extractor: Any, url_for: Callable[[str], str]) -> VirtualArray:
+    """Frames stored as TIFF pages, as (frame, rows, columns) or (frame, rows, columns, plane)."""
+    import tifffile
+
+    pages = _frame_pages(extractor)
+    volumetric = bool(getattr(extractor, "is_volumetric", False))
+    shape_of = getattr(extractor, "get_frame_shape", None) or extractor.get_image_shape
+    rows, columns = (int(n) for n in shape_of()[:2])
+
+    wanted: dict[str, set[int]] = {}
+    for planes in pages:
+        for path, page in planes:
+            wanted.setdefault(path, set()).add(page)
+    located: dict[tuple[str, int], tuple[int, int]] = {}
+    dtype = None
+    for path, indices in wanted.items():
+        with tifffile.TiffFile(path, _multifile=False) as tif:
+            for index in sorted(indices):
+                try:
+                    page = tif.pages[index]
+                except IndexError as e:
+                    raise NotVirtualizable(f"{path} has no page {index}") from e
+                page_dtype = np.dtype(page.dtype).newbyteorder(tif.byteorder)
+                nbytes = rows * columns * page_dtype.itemsize
+                if page.shape != (rows, columns):
+                    raise NotVirtualizable(
+                        f"Page {index} of {path} is {page.shape} and a frame is {(rows, columns)}: "
+                        "frames that are part of a page cannot be referenced yet"
+                    )
+                # uncompressed, and its strips one after another with nothing between them
+                if page.compression != 1 or not page.is_contiguous or sum(page.databytecounts) != nbytes:
+                    raise NotVirtualizable(
+                        f"Page {index} of {path} is compressed or stored in several pieces, "
+                        "so it cannot be referenced as one chunk"
+                    )
+                if dtype is not None and page_dtype != dtype:
+                    raise NotVirtualizable("The pages do not all have the same data type")
+                dtype = page_dtype
+                located[path, index] = (int(page.dataoffsets[0]), nbytes)
+
+    num_planes = len(pages[0]) if pages else 1
+    chunks: dict[tuple[int, ...], tuple[str, int, int]] = {}
+    for sample, planes in enumerate(pages):
+        for plane, (path, index) in enumerate(planes):
+            chunks[(sample, 0, 0, plane) if volumetric else (sample, 0, 0)] = (url_for(path), *located[path, index])
+    shape = (len(pages), rows, columns, num_planes) if volumetric else (len(pages), rows, columns)
+    chunk_shape = (1, rows, columns, 1) if volumetric else (1, rows, columns)
+    return VirtualArray.from_chunks(chunks, shape=shape, chunk_shape=chunk_shape, dtype=dtype)
+
+
+def _hdf5_frames(extractor: Any, url_for: Callable[[str], str]) -> VirtualArray:
+    """Frames of roiextractors' Hdf5ImagingExtractor, which reads channel 0 of a (channel, frame, rows, columns) dataset."""
+    import h5py
+
+    path = str(extractor.filepath)
+    with h5py.File(path, "r") as f:
+        dataset = f[extractor._mov_field]
+        offset = dataset.id.get_offset()
+        if dataset.ndim != 4 or dataset.chunks is not None or offset is None:
+            raise NotVirtualizable(
+                f"Dataset {extractor._mov_field!r} of {path} is chunked or not (channel, frame, rows, columns)"
+            )
+        _, num_samples, rows, columns = (int(n) for n in dataset.shape)
+        dtype = dataset.dtype
+    # channel 0 is the first run of frames in the dataset; one frame to a chunk
+    return VirtualArray.contiguous(
+        url_for(path),
+        shape=(num_samples, rows, columns),
+        dtype=dtype,
+        offset=int(offset),
+        chunk_bytes=rows * columns * dtype.itemsize,
+    )

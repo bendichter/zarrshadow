@@ -244,8 +244,10 @@ def test_transpose_composes(movie, recording):
     )
     with pytest.raises(ValueError, match="not an ordering"):
         array.transpose(0, 1)
+    # whole chunks of a transposed array can be taken, but not part of one
+    np.testing.assert_array_equal(_read(array.transpose(0, 2, 1)[:10]), x.transpose(0, 2, 1)[:10])
     with pytest.raises(NotImplementedError, match="contiguous can be sliced"):
-        array.transpose(0, 2, 1)[:10]
+        array.transpose(0, 2, 1)[:5]
 
 
 @pytest.mark.parametrize("options", [{}, {"compression": "zlib"}, {"tile": (16, 16), "compression": "zlib"}])
@@ -260,3 +262,121 @@ def test_transpose_tiff(tmp_path, options):
     pages = VirtualArray.from_rfs(generate_rfs_tiff(str(tmp_path / "movie.tif")), "0")
     assert pages.shape == (20, 48, 64)
     np.testing.assert_array_equal(_read(pages.transpose(0, 2, 1)), x.transpose(0, 2, 1))
+
+
+@pytest.fixture
+def chunked(tmp_path):
+    """An array listed chunk by chunk, 4 rows to a chunk, from a reference file system."""
+    x = np.random.default_rng(7).integers(0, 255, (20, 6)).astype("u1")
+    (tmp_path / "chunked.bin").write_bytes(x.tobytes())
+    builder = RfsBuilder()
+    builder.add_group("")
+    builder.add_array("a", shape=[20, 6], data_type="uint8", chunk_shape=[4, 6], codecs=[{"name": "bytes"}])
+    for i in range(5):
+        builder.add_chunk("a", (i, 0), str(tmp_path / "chunked.bin"), i * 24, 24)
+    return VirtualArray.from_rfs(builder.build(), "a"), x
+
+
+def test_take_whole_chunks(chunked):
+    array, x = chunked
+    taken = array[4:12]
+    assert taken.shape == (8, 6) and taken.chunk_shape == (4, 6)
+    np.testing.assert_array_equal(_read(taken), x[4:12])
+    np.testing.assert_array_equal(_read(array[16:]), x[16:])
+    assert array[:] is array and array[0:20] is array
+    np.testing.assert_array_equal(_read(array[[4, 5, 6, 7]]), x[4:8])  # a list that covers one whole chunk
+    for key in (np.s_[2:10], np.s_[4:10], np.s_[::2], np.s_[:, :3], np.s_[[4, 5, 6]]):
+        with pytest.raises(NotImplementedError, match="contiguous can be sliced"):
+            array[key]
+    with pytest.raises(NotImplementedError, match="slices or lists"):
+        array[0]
+    with pytest.raises(IndexError, match="Too many indices"):
+        array[:, :, 0]
+
+
+@pytest.mark.parametrize("options", [{}, {"compression": "zlib"}, {"tile": (16, 16), "compression": "zlib"}])
+@pytest.mark.parametrize("key", [np.s_[5:9], np.s_[::3], np.s_[1::2], [7, 2, 2, 11], np.s_[-1:]])
+def test_take_tiff_pages(tmp_path, options, key):
+    """Along an axis with one element per chunk, such as the pages of a TIFF stack, any chunks can be picked."""
+    tifffile = pytest.importorskip("tifffile")
+    pytest.importorskip("imagecodecs")
+    from zarrshadow import generate_rfs_tiff
+
+    x = np.random.default_rng(8).integers(0, 4000, (12, 48, 64)).astype("uint16")
+    tifffile.imwrite(tmp_path / "movie.tif", x, **options)
+    pages = VirtualArray.from_rfs(generate_rfs_tiff(str(tmp_path / "movie.tif")), "0")
+    taken = pages[key]
+    assert taken.shape == x[key].shape
+    np.testing.assert_array_equal(_read(taken), x[key])
+    # and then the frames can be reordered into the axis order NWB wants
+    np.testing.assert_array_equal(_read(taken.transpose(0, 2, 1)), x[key].transpose(0, 2, 1))
+
+
+def test_take_from_evenly_spaced_and_indexed_chunks(tmp_path):
+    """Picking from chunks described by a gen entry or a chunk index, and how the result is stored."""
+    x = np.random.default_rng(9).integers(0, 255, (3000, 4)).astype("u1")
+    (tmp_path / "frames.bin").write_bytes(x.tobytes())
+    builder = RfsBuilder()
+    builder.add_group("")
+    builder.add_array("a", shape=[3000, 4], data_type="uint8", chunk_shape=[1, 4], codecs=[{"name": "bytes"}])
+    builder.add_strided_chunks("a", ndim=2, url=str(tmp_path / "frames.bin"), start=0, stride=4, length=4, count=3000)
+    strided = VirtualArray.from_rfs(builder.build(), "a")
+
+    every_third = strided[::3]
+    np.testing.assert_array_equal(_read(every_third), x[::3])
+    # evenly spaced chunks of one file stay one gen entry
+    (entry,) = _build(every_third)["gen"]
+    assert entry["offset"] == "{{0 + i * 12}}" and entry["dimensions"] == {"i": {"stop": 1000}}
+
+    scattered = strided[np.random.default_rng(0).permutation(3000)[:2500]]
+    assert list(_build(scattered)["indexes"]) == ["data"]  # more than 1,000 chunks, unevenly spaced
+    assert _read(scattered).shape == (2500, 4)
+
+    indexed = VirtualArray.from_rfs(_build(scattered), "data")
+    np.testing.assert_array_equal(_read(indexed[10:20]), _read(scattered)[10:20])
+
+
+def test_take_from_stacked_files(channel_files):
+    """Chunks of a stack come from several files, so the result lists each one."""
+    arrays, x = channel_files
+    stacked = stack(arrays, axis=1)  # chunks of 2,500 samples by one channel
+    taken = stacked[2500:7500, [3, 0]]
+    assert taken.shape == (5000, 2)
+    np.testing.assert_array_equal(_read(taken), x[2500:7500][:, [3, 0]])
+    assert len(_build(taken)["sources"]) == 2
+
+
+def test_from_chunks(tmp_path):
+    """Chunks given one by one, here frames stored in two files with a header before each."""
+    x = np.random.default_rng(10).integers(0, 4000, (6, 5, 7)).astype(">u2")
+    chunks = {}
+    for name, frames in (("first.bin", range(0, 4)), ("second.bin", range(4, 6))):
+        with open(tmp_path / name, "wb") as f:
+            for frame in frames:
+                f.write(b"HEADER")
+                chunks[(frame, 0, 0)] = (str(tmp_path / name), f.tell(), x[frame].nbytes)
+                f.write(x[frame].tobytes())
+    del chunks[(2, 0, 0)]  # a chunk left out reads as zeros
+    array = VirtualArray.from_chunks(chunks, shape=x.shape, chunk_shape=(1, 5, 7), dtype=">u2")
+    expected = x.copy()
+    expected[2] = 0
+    assert array.shape == (6, 5, 7) and array.dtype == np.dtype("uint16")
+    np.testing.assert_array_equal(_read(array), expected)
+    assert len(_build(array)["sources"]) == 2
+    # like any array, its chunks can be picked and its axes reordered
+    np.testing.assert_array_equal(_read(array[[5, 0]].transpose(0, 2, 1)), expected[[5, 0]].transpose(0, 2, 1))
+
+    with pytest.raises(ValueError, match="outside the chunk grid"):
+        VirtualArray.from_chunks({(6, 0, 0): ("a", 0, 70)}, shape=x.shape, chunk_shape=(1, 5, 7), dtype=">u2")
+    with pytest.raises(ValueError, match="does not fit"):
+        VirtualArray.from_chunks({}, shape=x.shape, chunk_shape=(1, 5), dtype=">u2")
+
+
+def test_from_chunks_in_one_file_is_stored_compactly(tmp_path):
+    x = np.random.default_rng(11).integers(0, 255, (2000, 3)).astype("u1")
+    (tmp_path / "rows.bin").write_bytes(x.tobytes())
+    chunks = {(i, 0): (str(tmp_path / "rows.bin"), 3 * i, 3) for i in range(2000)}
+    array = VirtualArray.from_chunks(chunks, shape=x.shape, chunk_shape=(1, 3), dtype="u1")
+    rfs = _build(array)
+    assert len(rfs["gen"]) == 1 and not any(key.startswith("data/c/") for key in rfs["refs"])
+    np.testing.assert_array_equal(_read(array), x)

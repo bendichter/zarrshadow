@@ -21,6 +21,7 @@ add_to writes one into an RfsBuilder, and zarrshadow.nwb puts them in an NWB fil
 
 from __future__ import annotations
 
+import itertools
 import json
 from collections.abc import Callable, Sequence
 from typing import Any
@@ -35,6 +36,8 @@ from .builder import (
     contiguous_chunk_shape,
     zarr_data_type,
 )
+from .chunk_index import ChunkIndex
+from .gen import Generator
 
 # Maps a chunk's coordinates in an array to its coordinates in the array being
 # written, which differ when the array is part of a stack. Coordinates may be
@@ -94,6 +97,33 @@ class VirtualArray:
         return _Contiguous(url, int(offset), shape, np.dtype(dtype), file_size, chunk_bytes, attributes)
 
     @staticmethod
+    def from_chunks(
+        chunks: dict[tuple[int, ...], tuple[str, int, int]],
+        *,
+        shape: Sequence[int],
+        chunk_shape: Sequence[int],
+        dtype: Any,
+        attributes: dict | None = None,
+    ) -> VirtualArray:
+        """An uncompressed array whose chunks are given one by one.
+
+        Parameters
+        ----------
+        chunks : dict
+            For each chunk, its coordinates in the chunk grid and where it is:
+            (URL or local path, offset, length). Chunks left out read as zeros.
+        shape, chunk_shape : sequence of int
+            The array's shape and the shape of one chunk. Each chunk holds its
+            values in C order.
+        dtype : numpy dtype
+            The values' type, with their byte order.
+
+        The pages of a TIFF stack, each stored in one piece, are chunks of one
+        page each: shape (pages, rows, columns) with chunk_shape (1, rows, columns).
+        """
+        return _Listed(chunks, shape, chunk_shape, np.dtype(dtype), attributes)
+
+    @staticmethod
     def from_rfs(rfs: dict, path: str) -> VirtualArray:
         """The array at path in a reference file system, such as one generate_rfs returned."""
         return _Referenced(rfs, path)
@@ -127,10 +157,50 @@ class VirtualArray:
     # -- Use --
 
     def __getitem__(self, key: Any) -> VirtualArray:
-        raise NotImplementedError(
-            "Only arrays made with VirtualArray.contiguous can be sliced: slicing a chunked, "
-            "compressed, stacked, or transposed array would need its data"
-        )
+        """Select whole chunks.
+
+        Along an axis whose chunks are one element long, any slice or list of
+        indices selects chunks, as for the pages of a TIFF stack. Along other
+        axes a slice must start and stop on chunk boundaries. Anything else
+        would need the data; only arrays made with VirtualArray.contiguous
+        can be sliced freely.
+        """
+        key = key if isinstance(key, tuple) else (key,)
+        if len(key) > self.ndim:
+            raise IndexError(f"Too many indices for an array with {self.ndim} dimensions")
+        picks: list[np.ndarray | None] = []
+        shape = []
+        for axis, (length, chunk) in enumerate(zip(self.shape, self.chunk_shape)):
+            k = key[axis] if axis < len(key) else slice(None)
+            n_chunks = -(-length // chunk)
+            if isinstance(k, slice) and k == slice(None):
+                picks.append(None)
+                shape.append(length)
+                continue
+            if isinstance(k, slice):
+                start, stop, step = k.indices(length)
+                indices = np.arange(start, stop, step)
+            elif isinstance(k, (list, np.ndarray)) and np.asarray(k).ndim == 1 and np.asarray(k).dtype.kind in "iu":
+                indices = np.asarray(k) % length if length else np.asarray(k)
+            else:
+                raise NotImplementedError(_NOT_SLICEABLE + "; index with slices or lists of integers")
+            if chunk == 1:
+                chosen = indices
+                new_length = len(indices)
+            else:
+                # whole chunks only: a run of elements that starts and stops on chunk boundaries
+                run = len(indices) and np.array_equal(indices, np.arange(indices[0], indices[-1] + 1))
+                if not run or indices[0] % chunk or ((indices[-1] + 1) % chunk and indices[-1] + 1 != length):
+                    raise NotImplementedError(_NOT_SLICEABLE)
+                chosen = np.arange(indices[0] // chunk, -(-(indices[-1] + 1) // chunk))
+                new_length = len(indices)
+            if len(chosen) == 0:
+                raise IndexError("The selection is empty")
+            picks.append(None if np.array_equal(chosen, np.arange(n_chunks)) else chosen)
+            shape.append(new_length)
+        if all(p is None for p in picks):
+            return self
+        return _Taken(self, picks, tuple(shape))
 
     def transpose(self, *axes: int) -> VirtualArray:
         """Put the axes in another order, like numpy.transpose.
@@ -380,6 +450,118 @@ class _Stacked(VirtualArray):
         axis = self._axis
         for j, array in enumerate(self._arrays):
             array._add_chunks(builder, path, lambda coords, j=j: place([*coords[:axis], j, *coords[axis:]]))
+
+
+_NOT_SLICEABLE = (
+    "Only arrays made with VirtualArray.contiguous can be sliced inside their chunks: slicing a chunked, "
+    "compressed, stacked, or transposed array there would need its data"
+)
+
+
+def _chunk_refs(array: VirtualArray) -> dict[tuple[int, ...], Any]:
+    """Every chunk of an array by its coordinates: [url, offset, length], or the text of a chunk stored inline."""
+    builder = RfsBuilder()
+    array._add_chunks(builder, "a", lambda coords: coords)
+    refs: dict[tuple[int, ...], Any] = {}
+
+    def coords_of(key: str) -> tuple[int, ...]:
+        return tuple(int(part) for part in key[len("a/c/") :].split("/")) if key != "a/c" else ()
+
+    for key, value in builder.refs.items():
+        refs[coords_of(key)] = value
+    for entry in builder.gen:
+        for key, ref in Generator(entry, {}).items():
+            refs[coords_of(key)] = ref
+    for entry in builder.indexes.values():
+        for coords, offset, nbytes in ChunkIndex(entry["url"], entry["index"]).iter_chunks():
+            refs[tuple(int(c) for c in coords)] = [entry["url"], int(offset), int(nbytes)]
+    return refs
+
+
+class _Taken(VirtualArray):
+    """Some of the chunks of an array, in a chosen order."""
+
+    def __init__(self, array: VirtualArray, picks: list[np.ndarray | None], shape: tuple[int, ...]) -> None:
+        self._array, self._picks = array, picks
+        self.shape = shape
+        self.chunk_shape = array.chunk_shape
+        self.data_type, self.codecs, self.fill_value = array.data_type, array.codecs, array.fill_value
+        self.attributes = dict(array.attributes)
+        self.dimension_names = array.dimension_names
+
+    def _selection(self) -> dict | None:
+        return self._array._selection()
+
+    def _add_chunks(self, builder: RfsBuilder, path: str, place: _Place) -> None:
+        _add_listed_chunks(builder, path, place, self._picked_chunks(), self.shape, self.chunk_shape)
+
+    def _picked_chunks(self) -> dict[tuple[int, ...], Any]:
+        # where each of the array's chunks goes, along each axis that chunks were picked on
+        positions: list[dict[int, list[int]] | None] = []
+        for pick in self._picks:
+            if pick is None:
+                positions.append(None)
+                continue
+            where: dict[int, list[int]] = {}
+            for new, old in enumerate(pick.tolist()):
+                where.setdefault(old, []).append(new)
+            positions.append(where)
+        chunks: dict[tuple[int, ...], Any] = {}
+        for old, ref in _chunk_refs(self._array).items():
+            options = [[c] if where is None else where.get(c, []) for c, where in zip(old, positions)]
+            for new in itertools.product(*options):
+                chunks[tuple(new)] = ref
+        return chunks
+
+
+def _add_listed_chunks(
+    builder: RfsBuilder,
+    path: str,
+    place: _Place,
+    chunks: dict[tuple[int, ...], Any],
+    shape: Sequence[int],
+    chunk_shape: Sequence[int],
+) -> None:
+    """Write chunks given one by one, each [url, offset, length] or the text of a chunk stored inline."""
+    grid = [-(-length // chunk) for length, chunk in zip(shape, chunk_shape)]
+    urls = {ref[0] for ref in chunks.values() if isinstance(ref, list)}
+    in_place = place(list(range(len(grid)))) == list(range(len(grid)))
+    if in_place and len(urls) == 1 and all(isinstance(ref, list) and len(ref) == 3 for ref in chunks.values()):
+        # one file: let the builder store the chunks in its most compact form
+        builder.add_chunks(path, grid, urls.pop(), {c: (ref[1], ref[2]) for c, ref in chunks.items()})
+        return
+    for coords, ref in chunks.items():
+        builder.refs[chunk_key(path, place(list(coords)))] = ref
+
+
+class _Listed(VirtualArray):
+    """An uncompressed array whose chunks were given one by one."""
+
+    def __init__(
+        self,
+        chunks: dict[tuple[int, ...], tuple[str, int, int]],
+        shape: Sequence[int],
+        chunk_shape: Sequence[int],
+        dtype: np.dtype,
+        attributes: dict | None,
+    ) -> None:
+        self.shape = tuple(int(n) for n in shape)
+        self.chunk_shape = tuple(int(n) for n in chunk_shape)
+        if len(self.shape) != len(self.chunk_shape) or any(c < 1 for c in self.chunk_shape):
+            raise ValueError(f"chunk_shape {self.chunk_shape} does not fit an array of shape {self.shape}")
+        grid = [-(-length // chunk) for length, chunk in zip(self.shape, self.chunk_shape)]
+        self._chunks: dict[tuple[int, ...], Any] = {}
+        for coords, (url, offset, length) in chunks.items():
+            coords = tuple(int(c) for c in coords)
+            if len(coords) != len(grid) or any(not 0 <= c < n for c, n in zip(coords, grid)):
+                raise ValueError(f"Chunk {coords} is outside the chunk grid {tuple(grid)}")
+            self._chunks[coords] = [url, int(offset), int(length)]
+        self.data_type = zarr_data_type(dtype)
+        self.codecs = bytes_codecs(dtype)
+        self.attributes = dict(attributes or {})
+
+    def _add_chunks(self, builder: RfsBuilder, path: str, place: _Place) -> None:
+        _add_listed_chunks(builder, path, place, self._chunks, self.shape, self.chunk_shape)
 
 
 class _Transposed(VirtualArray):

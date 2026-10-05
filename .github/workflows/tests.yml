@@ -83,7 +83,8 @@ jobs:
           pip install uv
           printf 'zarr>=3.1.3\nnumcodecs>=0.15\n' > overrides.txt
           uv pip install --system --override overrides.txt -e ".[dev]" \
-            "neuroconv[spikeglx,openephys,neuroscope,mcsraw]" datalad git-annex
+            "neuroconv[spikeglx,openephys,neuroscope,mcsraw,tiff,scanimage,brukertiff,thor,micromanagertiff,hdf5]" \
+            datalad git-annex
           git config --global user.name "CI"
           git config --global user.email "ci@example.org"
       - name: Get the current commit of NEO's testing data
@@ -95,4 +96,21 @@ jobs:
           path: ~/ephy_testing_data
           key: ephy-testing-data-${{ steps.ephy.outputs.hash }}-${{ hashFiles('tests/test_neo_gin.py') }}
           restore-keys: ephy-testing-data-
+      # The imaging cases use NeuroConv's ophys testing data. The tests download the folders they need.
+      - name: Get the current commit of the ophys testing data
+        id: ophys
+        run: echo "hash=$(git ls-remote https://gin.g-node.org/CatalystNeuro/ophys_testing_data.git HEAD | cut -f1)" >> "$GITHUB_OUTPUT"
+      - name: Restore the cached ophys testing data
+        id: ophys-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/ophys_testing_data
+          key: ophys-testing-data-${{ steps.ophys.outputs.hash }}-${{ hashFiles('tests/test_neuroconv_bridge.py') }}
+          restore-keys: ophys-testing-data-
       - run: pytest -m gin -v tests/test_neuroconv_bridge.py
+      - name: Cache the ophys testing data
+        if: steps.ophys.outputs.hash != '' && steps.ophys-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ~/ophys_testing_data
+          key: ophys-testing-data-${{ steps.ophys.outputs.hash }}-${{ hashFiles('tests/test_neuroconv_bridge.py') }}
