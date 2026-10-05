@@ -12,6 +12,7 @@ These tests download about 300 MB and are not run by default. Run them with
 
 import functools
 import os
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -118,12 +119,28 @@ def _cases(files):
 
 @functools.cache
 def _download(folder):
-    """Download one top-level folder of the testing data and return the data root."""
-    pytest.importorskip("datalad")
+    """Download one top-level folder of the testing data and return the data root.
+
+    A complete local copy is used as it is, without contacting GIN, so that a
+    cached copy still works when GIN refuses the connection. Set
+    EPHY_TESTING_DATA_UPDATE=1 to bring an existing copy up to date.
+    """
     from neo.utils.datasets import download_dataset, get_local_testing_data_folder
 
-    download_dataset(remote_path=folder)
-    return str(get_local_testing_data_folder())
+    root = Path(get_local_testing_data_folder())
+    update = os.environ.get("EPHY_TESTING_DATA_UPDATE", "") not in ("", "0")
+    if update or not _is_complete(root / folder):
+        pytest.importorskip("datalad")
+        download_dataset(remote_path=folder)
+    return str(root)
+
+
+def _is_complete(folder):
+    """Whether a folder exists and holds the content of every file in it.
+
+    A file whose content has not been downloaded is a broken link.
+    """
+    return folder.is_dir() and all(path.exists() for path in folder.rglob("*"))
 
 
 def _reader(name, path):

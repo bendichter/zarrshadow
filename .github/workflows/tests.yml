@@ -41,13 +41,25 @@ jobs:
           pip install -e ".[dev]" datalad git-annex
           git config --global user.name "CI"
           git config --global user.email "ci@example.org"
+      # GIN sometimes refuses connections from GitHub's runners. When it does,
+      # the hash is empty and the tests run on the most recent cached copy.
       - name: Get the current commit of NEO's testing data
         id: ephy
         run: echo "hash=$(git ls-remote https://gin.g-node.org/NeuralEnsemble/ephy_testing_data.git HEAD | cut -f1)" >> "$GITHUB_OUTPUT"
-      - name: Cache the testing data
-        uses: actions/cache@v5
+      - name: Restore the cached testing data
+        id: cache
+        uses: actions/cache/restore@v5
         with:
           path: ~/ephy_testing_data
           key: ephy-testing-data-${{ steps.ephy.outputs.hash }}-${{ hashFiles('tests/test_neo_gin.py') }}
           restore-keys: ephy-testing-data-
       - run: pytest -m gin -v
+        env:
+          # Update the copy only when GIN answered and has a newer commit.
+          EPHY_TESTING_DATA_UPDATE: ${{ steps.ephy.outputs.hash != '' && steps.cache.outputs.cache-hit != 'true' && '1' || '0' }}
+      - name: Cache the testing data
+        if: steps.ephy.outputs.hash != '' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ~/ephy_testing_data
+          key: ephy-testing-data-${{ steps.ephy.outputs.hash }}-${{ hashFiles('tests/test_neo_gin.py') }}

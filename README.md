@@ -186,7 +186,7 @@ Pass `chunk_index_threshold=None` to `generate_rfs` to list every chunk in `refs
 
 ## TIFF Files
 
-`generate_rfs_tiff` builds references for a TIFF file with [tifffile](https://github.com/cgohlke/tifffile), which handles strips and tiles, multi-page series, and OME and other pyramids. Install it with `pip install zindi[tiff]`.
+`generate_rfs_tiff` builds references for a TIFF file with [tifffile](https://github.com/cgohlke/tifffile), which handles strips and tiles, multi-page series, and OME and other pyramids. Install it with `pip install zindi[tiff]`, which needs Python 3.12 or later.
 
 ```python
 from zindi import generate_rfs_tiff, open_rfs

@@ -19,7 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 tiff = [
-    "tifffile>=2025.1.1",
+    "tifffile>=2026.4.11",
     "imagecodecs",
 ]
 neo = [
@@ -30,7 +30,7 @@ dev = [
     "pytest",
     "pynwb",
     "hdmf-zarr>=0.14.0; python_version >= '3.12'",
-    "tifffile>=2025.1.1",
+    "tifffile>=2026.4.11; python_version >= '3.12'",
     "imagecodecs",
 ]
 
