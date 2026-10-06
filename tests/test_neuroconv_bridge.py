@@ -350,12 +350,28 @@ def _local_source(dataset, source):
         if not key.endswith("_path"):
             local[key] = value
             continue
-        if dataset == EPHYS:
-            fetch(dataset, value.split("/")[0])
-        else:
-            fetch(dataset, value if key == "folder_path" else os.path.dirname(value))
+        fetch(dataset, _to_download(dataset, key, value))
         local[key] = os.path.join(folder(dataset), value)
     return local
+
+
+def _to_download(dataset, key, value):
+    """The folder to download for one path argument of an interface."""
+    if dataset == EPHYS:
+        return value.split("/")[0]
+    return value if key == "folder_path" else os.path.dirname(value)
+
+
+# Everything these tests read from GIN, for gin_data.py to download ahead of them
+GIN_PATHS = sorted(
+    {
+        (dataset, _to_download(dataset, key, value))
+        for dataset, source in [(case[0], case[2]) for case in CASES.values()]
+        + [(OPHYS, case[1]) for case in REFUSED.values()]
+        for key, value in source.items()
+        if key.endswith("_path")
+    }
+)
 
 
 @pytest.mark.gin

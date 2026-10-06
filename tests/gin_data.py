@@ -4,10 +4,16 @@ The datasets are NEO's electrophysiology files and NeuroConv's optical
 physiology files. Each is kept in one local folder, which an environment
 variable can move. A file or folder that is already complete is used as it
 is, without contacting GIN, which is sometimes slow or unreachable.
+
+Run as a script, this downloads everything the tests marked gin read, which
+continuous integration does once, ahead of the tests, on several runners:
+
+    python tests/gin_data.py
 """
 
 import functools
 import os
+import sys
 import warnings
 
 import pytest
@@ -66,3 +72,18 @@ def fetch(dataset, relative_path):
                 raise
             warnings.warn(f"Could not check {path} against GIN, so it is used as it is: {e}")
     return path
+
+
+def required():
+    """Every file or folder the tests marked gin read, as (dataset, relative path)."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import test_neo_gin
+    import test_neuroconv_bridge
+
+    return sorted(set(test_neo_gin.GIN_PATHS) | set(test_neuroconv_bridge.GIN_PATHS))
+
+
+if __name__ == "__main__":
+    for dataset, relative_path in required():
+        print(f"{dataset}: {relative_path}", flush=True)
+        fetch(dataset, relative_path)

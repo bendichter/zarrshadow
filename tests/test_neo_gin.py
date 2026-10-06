@@ -3,8 +3,8 @@
 The recordings are NEO's testing data, hosted on GIN at
 https://gin.g-node.org/NeuralEnsemble/ephy_testing_data. They are downloaded
 with datalad to the folder NEO uses, ~/ephy_testing_data, or the folder named
-by the EPHY_TESTING_DATA_FOLDER environment variable; see gin_data.py. The files listed for
-each reader are the ones NEO tests that reader with.
+by the EPHY_TESTING_DATA_FOLDER environment variable; see gin_data.py. The
+files listed for each reader are the ones NEO tests that reader with.
 
 These tests download about 300 MB and are not run by default. Run them with
 ``pytest -m gin``.
@@ -127,6 +127,17 @@ UNSUPPORTED_FILES = {
         "maxwell/MaxTwo_data/Network/000028/data.raw.h5",
     ],
 }
+
+
+# Everything these tests read from GIN, for gin_data.py to download ahead of them: each format's folder
+GIN_PATHS = sorted(
+    {
+        ("ephys", path.split("/")[0])
+        for files in (FILES, MAPPED_FILES, UNSUPPORTED_FILES)
+        for paths in files.values()
+        for path in paths
+    }
+)
 
 
 def _cases(files):
