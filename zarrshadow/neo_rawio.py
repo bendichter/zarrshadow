@@ -27,7 +27,7 @@ from typing import Any
 import numpy as np
 
 from .builder import RfsBuilder, bytes_codecs, contiguous_chunk_shape, zarr_data_type
-from .virtual import VirtualArray
+from .virtual import VirtualArray, memmap_location
 
 
 def generate_rfs_neo(
@@ -122,17 +122,34 @@ def virtual_arrays_neo(
     segment, and otherwise by "block<b>/segment<s>/<stream id>". The
     parameters are those of generate_rfs_neo. Only raw binary buffers are
     supported.
+
+    Two readers without the buffer description API are supported, through
+    the memory maps NEO reads them with: Blackrock, whose files hold one block
+    of samples per segment or one packet per sample, and SpikeGadgets, whose
+    files hold one packet per sample.
     """
     if getattr(reader, "header", None) is None:
         reader.parse_header()
-    if not reader.has_buffer_description_api():
-        raise ValueError(
-            f"{type(reader).__name__} does not describe its signal buffers, so its "
-            "files cannot be referenced; zarrshadow supports the NEO readers that do"
-        )
     url_for = url_for or (lambda path: path)
     n_blocks = reader.block_count()
     single = n_blocks == 1 and reader.segment_count(0) == 1
+    if not reader.has_buffer_description_api():
+        stream_array = _STREAM_ARRAYS.get(type(reader).__name__)
+        if stream_array is None:
+            raise ValueError(
+                f"{type(reader).__name__} does not describe its signal buffers, so its "
+                "files cannot be referenced; zarrshadow supports the NEO readers that do"
+            )
+        arrays = {}
+        for block in range(n_blocks):
+            for seg in range(reader.segment_count(block)):
+                for stream_index, stream in enumerate(reader.header["signal_streams"]):
+                    array = stream_array(reader, block, seg, str(stream["id"]), url_for, chunk_bytes)
+                    array.attributes = _stream_attributes(reader, block, seg, stream_index, columns=None)
+                    del array.attributes["columns"]
+                    name = str(stream["id"]).replace("/", "_")
+                    arrays[name if single else f"block{block}/segment{seg}/{name}"] = array
+        return arrays
     buffers = {str(buffer["id"]): buffer for buffer in reader.header["signal_buffers"]}
     arrays: dict[str, VirtualArray] = {}
     for block in range(n_blocks):
@@ -168,6 +185,47 @@ def virtual_arrays_neo(
                 name = stream_id.replace("/", "_")
                 arrays[name if single else f"block{block}/segment{seg}/{name}"] = array
     return arrays
+
+
+def _blackrock_stream(
+    reader: Any, block: int, seg: int, stream_id: str, url_for: Callable[[str], str], chunk_bytes: int
+) -> VirtualArray:
+    """One nsX file's samples for a segment. NEO maps them time by channel; the stream id is the nsX number."""
+    data = reader.nsx_datas[int(stream_id)][seg]
+    path, _, _ = memmap_location(data)
+    return VirtualArray.from_memmap(data, url=url_for(path), chunk_bytes=chunk_bytes)
+
+
+def _spikegadgets_stream(
+    reader: Any, block: int, seg: int, stream_id: str, url_for: Callable[[str], str], chunk_bytes: int
+) -> VirtualArray:
+    """One stream of a .rec file, which stores a packet per sample.
+
+    NEO maps the packets as bytes and keeps, for each stream, a mask of the
+    bytes of a packet that are its samples, two for each channel.
+    """
+    packets = reader._raw_memmap
+    path, start, _ = memmap_location(packets)
+    places = np.nonzero(reader._mask_streams[stream_id])[0]
+    if len(places) % 2 or np.any(places[1::2] != places[::2] + 1):
+        raise NotImplementedError(f"The bytes of stream {stream_id!r} are not pairs that each hold one sample")
+    return VirtualArray.records(
+        url_for(path),
+        shape=(packets.shape[0], len(places) // 2),
+        dtype="<i2",
+        record_size=packets.shape[1],
+        value_offsets=places[::2],
+        offset=start,
+        file_size=os.path.getsize(path),
+        chunk_bytes=chunk_bytes,
+    )
+
+
+# For NEO readers without the buffer description API: how to find a stream's samples in the files
+_STREAM_ARRAYS: dict[str, Callable[..., VirtualArray]] = {
+    "BlackrockRawIO": _blackrock_stream,
+    "SpikeGadgetsRawIO": _spikegadgets_stream,
+}
 
 
 def _check_raw_layout(desc: dict) -> None:
@@ -245,26 +303,13 @@ def _add_hdf5_buffer(
 def _buffer_attributes(reader: Any, block: int, seg: int, buffer: Any, desc: dict) -> dict:
     """What NEO knows about the streams stored in one buffer, in JSON form."""
     header = reader.header
-    channels = header["signal_channels"]
     buffer_id = str(buffer["id"])
     streams = []
     for stream_index, stream in enumerate(header["signal_streams"]):
         if str(stream["buffer_id"]) != buffer_id:
             continue
-        stream_id = str(stream["id"])
-        chans = channels[channels["stream_id"] == stream["id"]]
-        streams.append({
-            "id": stream_id,
-            "name": str(stream["name"]),
-            "columns": _columns(reader._stream_buffer_slice.get(stream_id)),
-            "sampling_rate": float(chans["sampling_rate"][0]) if len(chans) else None,
-            "t_start": float(reader.get_signal_t_start(block, seg, stream_index)),
-            "channel_ids": [str(c) for c in chans["id"]],
-            "channel_names": [str(c) for c in chans["name"]],
-            "units": [str(c) for c in chans["units"]],
-            "gain": [float(c) for c in chans["gain"]],
-            "offset": [float(c) for c in chans["offset"]],
-        })
+        columns = _columns(reader._stream_buffer_slice.get(str(stream["id"])))
+        streams.append(_stream_attributes(reader, block, seg, stream_index, columns=columns))
     return {
         "rawio": type(reader).__name__,
         "block": block,
@@ -273,6 +318,25 @@ def _buffer_attributes(reader: Any, block: int, seg: int, buffer: Any, desc: dic
         "buffer_name": str(buffer["name"]),
         "time_axis": int(desc.get("time_axis", 0)),
         "streams": streams,
+    }
+
+
+def _stream_attributes(reader: Any, block: int, seg: int, stream_index: int, *, columns: Any) -> dict:
+    """What NEO knows about one stream and its channels, in JSON form."""
+    stream = reader.header["signal_streams"][stream_index]
+    channels = reader.header["signal_channels"]
+    chans = channels[channels["stream_id"] == stream["id"]]
+    return {
+        "id": str(stream["id"]),
+        "name": str(stream["name"]),
+        "columns": columns,
+        "sampling_rate": float(chans["sampling_rate"][0]) if len(chans) else None,
+        "t_start": float(reader.get_signal_t_start(block, seg, stream_index)),
+        "channel_ids": [str(c) for c in chans["id"]],
+        "channel_names": [str(c) for c in chans["name"]],
+        "units": [str(c) for c in chans["units"]],
+        "gain": [float(c) for c in chans["gain"]],
+        "offset": [float(c) for c in chans["offset"]],
     }
 
 

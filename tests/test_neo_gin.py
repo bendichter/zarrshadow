@@ -101,6 +101,24 @@ FILES = {
     ],
 }
 
+# Readers without the buffer description API, whose signals zarrshadow finds through the memory maps NEO
+# reads them with. Only virtual_arrays_neo supports these.
+MAPPED_FILES = {
+    "BlackrockRawIO": [
+        "blackrock/FileSpec2.3001",
+        "blackrock/blackrock_2_1/l101210-001",
+        "blackrock/blackrock_3_0/file_spec_3_0",
+        "blackrock/blackrock_3_0_ptp/20231027-125608-001",
+        "blackrock/segment/PauseCorrect/pause_correct",
+    ],
+    "SpikeGadgetsRawIO": [
+        "spikegadgets/20210225_em8_minirec2_ac.rec",
+        "spikegadgets/W122_06_09_2019_1_fromSD.rec",
+        "spikegadgets/SpikeGadgets_test_data_2xNpix1.0_20240318_173658.rec",
+        "spikegadgets/SL18_D19_S01_F01_BOX_SLP_20230503_112642_stubbed.rec",
+    ],
+}
+
 # Maxwell stores its signals in HDF5 with a proprietary compression filter,
 # which has no Zarr codec, so its files cannot be referenced.
 UNSUPPORTED_FILES = {
@@ -181,7 +199,7 @@ def _stream_key(reader, block, seg, stream):
     return name if single else f"block{block}/segment{seg}/{name}"
 
 
-@pytest.mark.parametrize(("name", "path"), _cases(FILES))
+@pytest.mark.parametrize(("name", "path"), _cases(FILES) + _cases(MAPPED_FILES))
 def test_stream_arrays_match_neo(name, path):
     """Each stream as its own array, holding only its channels, reads the same as through NEO."""
     from zarrshadow import RfsBuilder, virtual_arrays_neo

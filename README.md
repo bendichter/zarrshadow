@@ -276,7 +276,17 @@ rfs = builder.build()
 
 A slice along the first axis of a contiguous array moves the byte range. A slice or a list of indices along a later axis becomes a selection. Any other array can be indexed by whole chunks: any slice or list along an axis with one element per chunk, such as the pages of a TIFF stack (`pages[::2]`), and slices that start and stop on chunk boundaries elsewhere. `VirtualArray.from_chunks` makes an uncompressed array from chunks given one by one, each a file, an offset, and a length. `stack` joins arrays of the same shape, data type, and chunking along a new axis: each keeps its chunks, which get one more coordinate. `transpose` puts the axes in another order, as for a TIFF stack stored (page, row, column) that an NWB `TwoPhotonSeries` wants as (frame, x, y): `pages.transpose(0, 2, 1)`. The chunks stay as the file has them, and the array gets the Zarr `transpose` codec when a chunk's bytes depend on the order, which they do not when the chunk extends along one axis only. zarr-python reads whole chunks from an array with that codec, so it suits small chunks such as one frame. `VirtualArray.from_rfs(rfs, path)` takes an array from a reference file system that a generator built, which can be placed in another file or stacked. Only contiguous arrays can be sliced inside their chunks, and before they are stacked or transposed, because slicing inside the chunks of any other array would need its data. Joining arrays end to end along an existing axis is not supported.
 
-`virtual_arrays_neo(reader)` returns one `VirtualArray` for each signal stream of a NEO reader, holding only that stream's channels, with the stream's sampling rate and channel information in `attributes`. `generate_rfs_neo` describes each buffer as the file stores it.
+Some formats store a packet for every sample, with a header before the values. `VirtualArray.records` describes those: each row of the array is in one record of fixed size, after `skip` bytes. `VirtualArray.from_memmap` takes a `numpy.memmap`, or a view of one, and returns the part of the file it shows, which is a short way to reference what a reader already maps into memory.
+
+```python
+# 13 bytes of header, then 64 int16 samples, in every packet
+signal = VirtualArray.records(path, shape=[n_samples, 64], dtype="int16", record_size=141, skip=13, offset=header_size)
+
+packets = np.memmap(path, dtype=[("header", "u1", 13), ("samples", "<i2", 64)], mode="r", offset=header_size)
+signal = VirtualArray.from_memmap(packets["samples"])
+```
+
+`virtual_arrays_neo(reader)` returns one `VirtualArray` for each signal stream of a NEO reader, holding only that stream's channels, with the stream's sampling rate and channel information in `attributes`. `generate_rfs_neo` describes each buffer as the file stores it. `virtual_arrays_neo` also covers Blackrock and SpikeGadgets, whose NEO readers do not describe their buffers but read them through memory maps.
 
 ## Virtual NWB Files
 
@@ -328,9 +338,9 @@ virtualize(nwbfile)
 write_virtual_nwb(nwbfile, "session.nwb.zarrshadow")
 ```
 
-For electrophysiology it covers recordings that SpikeInterface reads through a NEO reader with the buffer description API. For imaging it covers roiextractors' TIFF extractors (plain TIFF stacks, ScanImage, Thor, Micro-Manager, and Bruker with one file per frame), which keep a table of the page that holds each frame, and its HDF5 extractor. Each TIFF page becomes one chunk, and the frames are transposed into the (frame, width, height) order NeuroConv writes. Anything else raises `NotVirtualizable`: compressed TIFF pages, frames cropped out of a page, Bruker volumes, and readers that do not say where their data is. With `strict=False` those are left for NeuroConv to copy.
+For electrophysiology it covers recordings that SpikeInterface reads through a NEO reader that `virtual_arrays_neo` supports. For imaging it covers roiextractors' TIFF extractors (plain TIFF stacks, ScanImage, Thor, Micro-Manager, and Bruker with one file per frame), which keep a table of the page that holds each frame, and its HDF5 extractor. Each TIFF page becomes one chunk, and the frames are transposed into the (frame, width, height) order NeuroConv writes. Anything else raises `NotVirtualizable`: compressed TIFF pages, frames cropped out of a page, Bruker volumes, and readers that do not say where their data is. With `strict=False` those are left for NeuroConv to copy.
 
-Continuous integration compares the result with NeuroConv's own conversion on GIN data, for SpikeGLX (AP band and NIDQ), Open Ephys binary, Neuroscope, MCS raw, a TIFF stack, ScanImage (single and two channels, planes, and volumes), an HDF5 movie, Bruker, Thor, and Micro-Manager. Every dataset is equal except the file's creation time.
+Continuous integration compares the result with NeuroConv's own conversion on GIN data, for SpikeGLX (AP band and NIDQ), Open Ephys binary, Neuroscope, MCS raw, Blackrock, SpikeGadgets, a TIFF stack, ScanImage (single and two channels, planes, and volumes), an HDF5 movie, Bruker, Thor, and Micro-Manager. Every dataset is equal except the file's creation time.
 
 This is experimental. As of October 2026, SpikeInterface requires `zarr<3` and zarrshadow needs Zarr v3, so NeuroConv and zarrshadow install together only with that requirement overridden (`uv pip install --override`), and NeuroConv 0.10 reads `zarr.codec_registry` at import, which Zarr v3 removed. `tests/test_neuroconv_bridge.py` shows the environment and the one-line workaround.
 

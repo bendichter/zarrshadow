@@ -380,3 +380,78 @@ def test_from_chunks_in_one_file_is_stored_compactly(tmp_path):
     rfs = _build(array)
     assert len(rfs["gen"]) == 1 and not any(key.startswith("data/c/") for key in rfs["refs"])
     np.testing.assert_array_equal(_read(array), x)
+
+
+@pytest.fixture
+def packets(tmp_path):
+    """Samples stored a packet at a time: a 13-byte header, five int16 samples, three more bytes."""
+    x = np.random.default_rng(12).integers(-500, 500, (5000, 5)).astype("<i2")
+    dtype = np.dtype([("header", "u1", 13), ("samples", "<i2", 5), ("trailer", "u1", 3)])
+    records = np.zeros(len(x), dtype=dtype)
+    records["header"], records["samples"], records["trailer"] = 7, x, 9
+    path = tmp_path / "packets.bin"
+    path.write_bytes(b"HDR!" * 25 + records.tobytes())
+    return str(path), x, dtype
+
+
+def test_records(packets):
+    path, x, _ = packets
+    array = VirtualArray.records(path, shape=x.shape, dtype="<i2", record_size=26, skip=13, offset=100, chunk_bytes=2600)
+    assert array.shape == (5000, 5) and array.chunk_shape == (250, 5)
+    assert _build(array)["selections"] == {"data": {"record_size": 26, "keep": [[13, 23]]}}
+    np.testing.assert_array_equal(_read(array), x)
+    # sliced like a contiguous array: rows move the byte range, and columns narrow what is kept of a record
+    part = array[1000:4000, [4, 0]]
+    assert _build(part)["selections"] == {"data": {"record_size": 26, "keep": [[21, 23], [13, 15]]}}
+    np.testing.assert_array_equal(_read(part), x[1000:4000][:, [4, 0]])
+    np.testing.assert_array_equal(_read(array[:, 2]), x[:, 2])
+
+    # values that are not one after another in the record
+    scattered = VirtualArray.records(
+        path, shape=(5000, 2), dtype="<i2", record_size=26, value_offsets=[19, 13], offset=100
+    )
+    np.testing.assert_array_equal(_read(scattered), x[:, [3, 0]])
+    # a record that holds only the row is a plain contiguous array
+    plain = VirtualArray.records(path, shape=(100, 13), dtype="u1", record_size=13)
+    assert "selections" not in _build(plain)
+
+    with pytest.raises(ValueError, match="does not fit in a record"):
+        VirtualArray.records(path, shape=x.shape, dtype="<i2", record_size=26, skip=17)
+    with pytest.raises(ValueError, match="value_offsets must give 2 places"):
+        VirtualArray.records(path, shape=(5000, 2), dtype="<i2", record_size=26, value_offsets=[13, 25])
+
+
+def test_from_memmap(packets, tmp_path):
+    """A memory map, or a view of one, says where its data is in the file."""
+    path, x, dtype = packets
+    mapped = np.memmap(path, dtype=dtype, mode="r", offset=100, shape=len(x))
+    # one field of a structured map: the rest of each record is skipped
+    samples = VirtualArray.from_memmap(mapped["samples"])
+    assert _build(samples)["selections"] == {"data": {"record_size": 26, "keep": [[13, 23]]}}
+    np.testing.assert_array_equal(_read(samples), x)
+    np.testing.assert_array_equal(_read(VirtualArray.from_memmap(mapped["samples"][100:200])), x[100:200])
+
+    # a whole file mapped as bytes, then viewed as the array it holds after a header
+    y = np.arange(60_000, dtype=">i4").reshape(6000, 10)
+    (tmp_path / "block.bin").write_bytes(b"\0" * 64 + y.tobytes())
+    file_bytes = np.memmap(tmp_path / "block.bin", dtype="uint8", mode="r")
+    view = file_bytes[64:].view(">i4").reshape(-1, 10)
+    local = VirtualArray.from_memmap(view[100:5000])
+    assert "selections" not in _build(local)
+    np.testing.assert_array_equal(_read(local), y[100:5000])
+    # with a URL, the references point there in place of the local path
+    block = VirtualArray.from_memmap(view[100:5000], url="https://example.org/block.bin", chunk_bytes=40_000)
+    (entry,) = _rfs_without_sources(block)["gen"]
+    assert entry["url"] == "https://example.org/block.bin"
+
+    with pytest.raises(TypeError, match="numpy.memmap"):
+        VirtualArray.from_memmap(np.zeros((3, 3)))
+    with pytest.raises(NotImplementedError, match="whole rows in C order"):
+        VirtualArray.from_memmap(view[:, ::2])
+
+
+def _rfs_without_sources(virtual):
+    builder = RfsBuilder()
+    builder.add_group("")
+    virtual.add_to(builder, "data")
+    return builder.build(record_sources=False)

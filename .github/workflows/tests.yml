@@ -85,7 +85,7 @@ jobs:
           pip install uv
           printf 'zarr>=3.1.3\nnumcodecs>=0.15\n' > overrides.txt
           uv pip install --system --override overrides.txt -e ".[dev]" \
-            "neuroconv[spikeglx,openephys,neuroscope,mcsraw,tiff,scanimage,brukertiff,thor,micromanagertiff,hdf5]" \
+            "neuroconv[spikeglx,openephys,neuroscope,mcsraw,blackrock,spikegadgets,tiff,scanimage,brukertiff,thor,micromanagertiff,hdf5]" \
             datalad git-annex
           git config --global user.name "CI"
           git config --global user.email "ci@example.org"

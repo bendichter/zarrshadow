@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import os
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -32,7 +33,6 @@ from .builder import (
     RfsBuilder,
     bytes_codecs,
     chunk_key,
-    columns_selection,
     contiguous_chunk_shape,
     zarr_data_type,
 )
@@ -95,6 +95,118 @@ class VirtualArray:
             whole array one chunk.
         """
         return _Contiguous(url, int(offset), shape, np.dtype(dtype), file_size, chunk_bytes, attributes)
+
+    @staticmethod
+    def records(
+        url: str,
+        *,
+        shape: Sequence[int],
+        dtype: Any,
+        record_size: int,
+        skip: int = 0,
+        value_offsets: Sequence[int] | None = None,
+        offset: int = 0,
+        file_size: int | None = None,
+        chunk_bytes: int | None = 4 * 2**20,
+        attributes: dict | None = None,
+    ) -> VirtualArray:
+        """An uncompressed array whose rows are stored in records of fixed size, with other bytes around them.
+
+        Each row of the array, along its first axis, is in one record of
+        record_size bytes: skip bytes of something else, then the row's
+        values in C order, then whatever fills the rest of the record. A
+        recording stored in packets, each with a header before its samples,
+        is like this. When the values of a row are not one after another in
+        the record, value_offsets says where each one starts. The result can
+        be sliced like a contiguous array.
+
+        Parameters
+        ----------
+        url : str
+            The file's URL or local path.
+        shape : sequence of int
+            The array's shape. The first axis counts records.
+        dtype : numpy dtype
+            The values' type, with their byte order.
+        record_size : int
+            The size of a record in the file, in bytes.
+        skip : int
+            How many bytes of a record come before the row's values.
+        value_offsets : sequence of int or None
+            Where each value of a row starts within the record, in the row's
+            C order, in place of skip.
+        offset : int
+            Where the first record starts in the file.
+        file_size, chunk_bytes
+            As for contiguous.
+        """
+        dtype = np.dtype(dtype)
+        shape = tuple(int(n) for n in shape)
+        row_values = int(np.prod(shape[1:]))
+        if value_offsets is not None:
+            offsets = np.asarray(value_offsets, dtype=np.int64)
+            if offsets.size != row_values or offsets.min() < 0 or offsets.max() + dtype.itemsize > record_size:
+                raise ValueError(f"value_offsets must give {row_values} places within a record of {record_size} bytes")
+            offsets = offsets.reshape(shape[1:])
+        else:
+            if skip < 0 or skip + row_values * dtype.itemsize > record_size:
+                raise ValueError(
+                    f"A row of {row_values * dtype.itemsize} bytes after {skip} does not fit in a record of {record_size}"
+                )
+            offsets = (int(skip) + np.arange(row_values) * dtype.itemsize).reshape(shape[1:])
+        in_order = np.array_equal(offsets.ravel(), np.arange(row_values) * dtype.itemsize)
+        whole_record = in_order and row_values * dtype.itemsize == record_size
+        return _Contiguous(
+            url, int(offset), shape, dtype, file_size, chunk_bytes, attributes,
+            record_bytes=int(record_size), element_offsets=None if whole_record else offsets,
+        )
+
+    @staticmethod
+    def from_memmap(
+        array: np.ndarray,
+        *,
+        url: str | None = None,
+        chunk_bytes: int | None = 4 * 2**20,
+        attributes: dict | None = None,
+    ) -> VirtualArray:
+        """The part of a file that a numpy.memmap, or a view of one, shows.
+
+        Readers that map a file into memory, as many of NEO's do, say with
+        that array where the data is: the file, the offset, the type, and
+        the shape. The view may take a field of a structured memmap, which
+        is how samples stored in packets are read; the result then skips
+        the rest of each packet.
+
+        Parameters
+        ----------
+        array : numpy.ndarray
+            A numpy.memmap or a view of one. Its rows must follow one another
+            at a fixed distance in the file, each in C order.
+        url : str or None
+            The URL the references should point to. By default the local
+            path of the mapped file.
+        """
+        path, start, root = memmap_location(array)
+        if array.ndim == 0:
+            raise ValueError("The array needs at least one dimension")
+        itemsize = array.dtype.itemsize
+        row_bytes = int(np.prod(array.shape[1:])) * itemsize
+        expected = tuple(itemsize * int(np.prod(array.shape[k + 1 :])) for k in range(1, array.ndim))
+        stride = array.strides[0] if array.shape[0] > 1 else row_bytes
+        if array.dtype.hasobject or array.strides[1:] != expected or stride < row_bytes:
+            raise NotImplementedError("The view does not take whole rows in C order at a fixed distance in the file")
+        kwargs: dict[str, Any] = {
+            "shape": array.shape,
+            "dtype": array.dtype,
+            "file_size": os.path.getsize(path),
+            "chunk_bytes": chunk_bytes,
+            "attributes": attributes,
+        }
+        if stride == row_bytes:
+            return VirtualArray.contiguous(url or path, offset=start, **kwargs)
+        # rows inside larger records: a field of a structured memmap whose items are the records
+        skip = (start - int(root.offset)) % stride if root.dtype.itemsize == stride else 0
+        return VirtualArray.records(url or path, record_size=stride, skip=skip, offset=start - skip, **kwargs)
 
     @staticmethod
     def from_chunks(
@@ -275,8 +387,19 @@ class VirtualArray:
         raise NotImplementedError
 
 
+def memmap_location(array: np.ndarray) -> tuple[str, int, np.memmap]:
+    """The file a numpy.memmap, or a view of one, maps, where the view's first value is in it, and the memmap."""
+    root = array
+    while isinstance(getattr(root, "base", None), np.ndarray):
+        root = root.base
+    if not isinstance(root, np.memmap) or root.filename is None:
+        raise TypeError("Expected a numpy.memmap or a view of one")
+    delta = array.__array_interface__["data"][0] - root.__array_interface__["data"][0]
+    return str(root.filename), int(root.offset) + int(delta), root
+
+
 class _Contiguous(VirtualArray):
-    """An uncompressed block of one file."""
+    """Rows stored one after another in one file, uncompressed, each in a record of fixed size."""
 
     def __init__(
         self,
@@ -287,27 +410,25 @@ class _Contiguous(VirtualArray):
         file_size: int | None,
         chunk_bytes: int | None,
         attributes: dict | None,
-        columns: np.ndarray | None = None,
-        row_shape: tuple[int, ...] | None = None,
+        record_bytes: int | None = None,
+        element_offsets: np.ndarray | None = None,
     ) -> None:
         shape = tuple(int(n) for n in shape)
         if not shape:
             raise ValueError("A contiguous array needs at least one dimension")
         self._url, self._offset, self._dtype = url, offset, dtype
         self._file_size, self._chunk_bytes = file_size, chunk_bytes
-        # The shape of one row in the file, and which of its values, in what
-        # arrangement, a row of this array holds (None: all of them, as stored)
-        self._row_shape = tuple(shape[1:]) if row_shape is None else row_shape
-        self._columns = columns
+        # A row of the array is read from one record of the file. element_offsets
+        # gives, for each value of a row, where it starts within the record; None
+        # means the record holds the row's values and nothing else, in order.
+        row_bytes = int(np.prod(shape[1:])) * dtype.itemsize
+        self._record_bytes = row_bytes if record_bytes is None else int(record_bytes)
+        self._element_offsets = element_offsets
         self.shape = shape
         self.data_type = zarr_data_type(dtype)
         self.codecs = bytes_codecs(dtype)
         self.chunk_shape = tuple(max(c, 1) for c in contiguous_chunk_shape(shape, dtype.itemsize, chunk_bytes))
         self.attributes = dict(attributes or {})
-
-    @property
-    def _row_bytes(self) -> int:
-        return int(np.prod(self._row_shape)) * self._dtype.itemsize
 
     def __getitem__(self, key: Any) -> VirtualArray:
         key = key if isinstance(key, tuple) else (key,)
@@ -325,34 +446,41 @@ class _Contiguous(VirtualArray):
             raise IndexError("The first axis of a contiguous array cannot be sliced with a step")
         n_rows = max(0, stop - start)
 
-        columns = self._columns
+        offsets = self._element_offsets
+        row_shape = self.shape[1:]
         if len(key) > 1:
-            if columns is None:
-                columns = np.arange(int(np.prod(self._row_shape))).reshape(self._row_shape)
-            columns = columns[tuple(key[1:])]
-            if columns.size == 0:
+            if offsets is None:
+                offsets = (np.arange(int(np.prod(row_shape))) * self._dtype.itemsize).reshape(row_shape)
+            offsets = offsets[tuple(key[1:])]
+            if offsets.size == 0:
                 raise IndexError("The selection is empty")
-            if columns.shape == self._row_shape and np.array_equal(columns.ravel(), np.arange(columns.size)):
-                columns = None  # every value of the row, as stored
+            row_shape = offsets.shape
+            whole_record = offsets.size * self._dtype.itemsize == self._record_bytes
+            if whole_record and np.array_equal(offsets.ravel(), np.arange(offsets.size) * self._dtype.itemsize):
+                offsets = None  # every value of the record, as stored
         return _Contiguous(
             self._url,
-            self._offset + start * self._row_bytes,
-            (n_rows, *(self._row_shape if columns is None else columns.shape)),
+            self._offset + start * self._record_bytes,
+            (n_rows, *row_shape),
             self._dtype,
             self._file_size,
             self._chunk_bytes,
             self.attributes,
-            columns=columns,
-            row_shape=self._row_shape,
+            record_bytes=self._record_bytes,
+            element_offsets=offsets,
         )
 
     def _selection(self) -> dict | None:
-        if self._columns is None:
+        if self._element_offsets is None:
             return None
-        record_size, keep = columns_selection(
-            int(np.prod(self._row_shape)), self._dtype.itemsize, self._columns.ravel().tolist()
-        )
-        return {"record_size": record_size, "keep": keep}
+        itemsize = self._dtype.itemsize
+        keep: list[list[int]] = []
+        for start in self._element_offsets.ravel().tolist():
+            if keep and keep[-1][1] == start:
+                keep[-1][1] = start + itemsize
+            else:
+                keep.append([start, start + itemsize])
+        return {"record_size": self._record_bytes, "keep": keep}
 
     def _add_chunks(self, builder: RfsBuilder, path: str, place: _Place) -> None:
         if self.shape[0] == 0:
@@ -365,7 +493,7 @@ class _Contiguous(VirtualArray):
             chunk_shape=self.chunk_shape,
             itemsize=self._dtype.itemsize,
             file_size=self._file_size,
-            row_bytes=self._row_bytes,
+            row_bytes=self._record_bytes,
             coords=place([None] + [0] * (self.ndim - 1)),
         )
 
