@@ -33,6 +33,7 @@ jobs:
   gin:
     name: NEO generator on GIN data
     runs-on: ubuntu-latest
+    timeout-minutes: 25  # GIN can leave a connection hanging
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -69,6 +70,7 @@ jobs:
   neuroconv:
     name: NeuroConv bridge on GIN data
     runs-on: ubuntu-latest
+    timeout-minutes: 25  # GIN can leave a connection hanging
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6

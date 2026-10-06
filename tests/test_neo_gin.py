@@ -3,16 +3,14 @@
 The recordings are NEO's testing data, hosted on GIN at
 https://gin.g-node.org/NeuralEnsemble/ephy_testing_data. They are downloaded
 with datalad to the folder NEO uses, ~/ephy_testing_data, or the folder named
-by the EPHY_TESTING_DATA_FOLDER environment variable. The files listed for
+by the EPHY_TESTING_DATA_FOLDER environment variable; see gin_data.py. The files listed for
 each reader are the ones NEO tests that reader with.
 
 These tests download about 300 MB and are not run by default. Run them with
 ``pytest -m gin``.
 """
 
-import functools
 import os
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -117,30 +115,12 @@ def _cases(files):
     return [pytest.param(name, path, id=path) for name, paths in files.items() for path in paths]
 
 
-@functools.cache
 def _download(folder):
-    """Download one top-level folder of the testing data and return the data root.
+    """Download one top-level folder of the testing data and return the data root."""
+    from gin_data import fetch
 
-    A complete local copy is used as it is, without contacting GIN, so that a
-    cached copy still works when GIN refuses the connection. Set
-    EPHY_TESTING_DATA_UPDATE=1 to bring an existing copy up to date.
-    """
-    from neo.utils.datasets import download_dataset, get_local_testing_data_folder
-
-    root = Path(get_local_testing_data_folder())
-    update = os.environ.get("EPHY_TESTING_DATA_UPDATE", "") not in ("", "0")
-    if update or not _is_complete(root / folder):
-        pytest.importorskip("datalad")
-        download_dataset(remote_path=folder)
-    return str(root)
-
-
-def _is_complete(folder):
-    """Whether a folder exists and holds the content of every file in it.
-
-    A file whose content has not been downloaded is a broken link.
-    """
-    return folder.is_dir() and all(path.exists() for path in folder.rglob("*"))
+    path = fetch("ephys", folder)
+    return path[: -len(folder)].rstrip("/")
 
 
 def _reader(name, path):

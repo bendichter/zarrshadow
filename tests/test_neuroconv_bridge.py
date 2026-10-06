@@ -164,7 +164,6 @@ def test_imaging_frames_from_hdf5(tmp_path):
 
 
 EPHYS, OPHYS = "ephys", "ophys"
-OPHYS_REPOSITORY = "https://gin.g-node.org/CatalystNeuro/ophys_testing_data"
 
 # Each case: the testing dataset, the NeuroConv interface, its arguments (paths are relative to the dataset),
 # the dataset that virtualize replaces with its shape, and how many source files the references point into.
@@ -309,38 +308,24 @@ REFUSED = {
 }
 
 
-def _is_complete(path):
-    """Whether a file or folder of a datalad dataset has its content; a file without it is a broken link."""
-    if os.path.isdir(path):
-        return all(os.path.exists(os.path.join(root, name)) for root, _, names in os.walk(path) for name in names)
-    return os.path.exists(path)
-
-
 def _local_source(dataset, source):
     """An interface's arguments with its paths downloaded and made absolute.
 
-    A file is downloaded with the rest of its folder, since a recording is often several files.
+    A file is downloaded with the rest of its folder, since a recording is often several files. In the ephys
+    dataset that is the format's whole folder, which the other GIN tests use too.
     """
-    if dataset == EPHYS:
-        from test_neo_gin import _download
+    from gin_data import fetch, folder
 
-        return {
-            key: os.path.join(_download(value.split("/")[0]), value) if key.endswith("_path") else value
-            for key, value in source.items()
-        }
-    root = os.environ.get("OPHYS_TESTING_DATA_FOLDER", os.path.expanduser("~/ophys_testing_data"))
     local = {}
     for key, value in source.items():
         if not key.endswith("_path"):
             local[key] = value
             continue
-        needed = value if key == "folder_path" else os.path.dirname(value)
-        if not _is_complete(os.path.join(root, needed)) or not os.path.exists(os.path.join(root, value)):
-            pytest.importorskip("datalad")
-            from neo.utils.datasets import download_dataset
-
-            download_dataset(repo=OPHYS_REPOSITORY, remote_path=needed, local_folder=root)
-        local[key] = os.path.join(root, value)
+        if dataset == EPHYS:
+            fetch(dataset, value.split("/")[0])
+        else:
+            fetch(dataset, value if key == "folder_path" else os.path.dirname(value))
+        local[key] = os.path.join(folder(dataset), value)
     return local
 
 
