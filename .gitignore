@@ -221,3 +221,6 @@ __marimo__/
 
 # zarrshadow
 examples/*.zarrshadow.json
+
+# JavaScript
+node_modules/

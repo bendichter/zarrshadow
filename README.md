@@ -388,6 +388,19 @@ materialize("session.nwb.zarrshadow", "session.nwb.zarr", layout=layout)
 
 A virtual NWB file materializes into an NWB Zarr file that `NWBZarrIO` opens from its directory. The reading goes through `RfsStore`, so materializing needs none of the libraries that read the source formats, and it can run wherever the references and the source files can be reached. The returned report gives each rewritten array's size and stored size. Pass `verify=True` to read back what was written and compare.
 
+## Reading in JavaScript
+
+`js/` holds a [zarrita.js](https://github.com/manzt/zarrita.js) store that reads these reference files in a browser or in Node, including chunk indexes, `gen` entries, and selections. Its tests read files that the Python package writes and compare every array with what Python reads. See [js/README.md](js/README.md). It is not on npm yet.
+
+```ts
+import * as zarr from "zarrita";
+import { ReferenceStore } from "zarrshadow";
+
+const store = await ReferenceStore.fromUrl("https://example.org/session.nwb.zarrshadow");
+const array = await zarr.open.v3(zarr.root(store).resolve("acquisition/ElectricalSeries/data"), { kind: "array" });
+const first = await zarr.get(array, [zarr.slice(0, 30000), null]);
+```
+
 ## Other File Formats
 
 `generate_rfs` is the generator for HDF5. Everything after it (the store, the directory format, chunk indexes, `gen`, and source checks) works for any format, and a generator for another format builds the same references with `RfsBuilder`. For a raw binary recording with 16 interleaved `int16` channels after a 12-byte header:

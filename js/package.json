@@ -1,0 +1,37 @@
+{
+  "name": "zarrshadow",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Read zarrshadow reference files with zarrita.js",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "default": "./dist/node.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "zarrita": ">=0.7.0"
+  },
+  "dependencies": {
+    "@zarrita/storage": "^0.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0",
+    "vitest": "^3.0.0",
+    "zarrita": "^0.7.5"
+  }
+}
