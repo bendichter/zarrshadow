@@ -84,6 +84,88 @@ def _read(virtual):
     return open_rfs(builder.build())["data"][...]
 
 
+class BinaryRecordingExtractor:
+    """What virtualize uses of SpikeInterface's reader of plain binary files."""
+
+    def __init__(self, path, n_samples, n_channels, dtype, file_offset, time_axis):
+        segment = type("Segment", (), {})()
+        segment.file_path, segment.num_channels, segment.dtype = path, n_channels, dtype
+        segment.file_offset, segment.time_axis = file_offset, time_axis
+        segment.get_num_samples = lambda: n_samples
+        self._recording_segments = [segment]
+        self._channel_ids = [f"ch{i}" for i in range(n_channels)]
+
+    def get_channel_ids(self):
+        return self._channel_ids
+
+
+class WhiteMatterLike(BinaryRecordingExtractor):
+    """A reader built on the binary one, as SpikeInterface's WhiteMatter reader is."""
+
+
+@pytest.mark.parametrize("time_axis", [0, 1])
+def test_binary_recording(tmp_path, time_axis):
+    """Samples after a header in one file, with time along either axis, and a choice of channels."""
+    x = np.random.default_rng(16).integers(-500, 500, (300, 6)).astype("<i2")
+    path = tmp_path / "recording.bin"
+    path.write_bytes(b"\0" * 8 + (x if time_axis == 0 else x.T).tobytes())
+    recording = WhiteMatterLike(str(path), 300, 6, "int16", file_offset=8, time_axis=time_axis)
+
+    def read(**kwargs):
+        iterator = type("Iterator", (DataChunkIterator,), {})(data=iter([np.zeros((1, 1))]))
+        iterator.recording = recording
+        for name, value in kwargs.items():
+            setattr(iterator, name, value)
+        series = pynwb.TimeSeries(name="series", data=iterator, unit="V", rate=1.0)
+        nwbfile = pynwb.NWBFile(
+            session_description="s", identifier="i", session_start_time=datetime(2026, 1, 1, tzinfo=timezone.utc)
+        )
+        nwbfile.add_acquisition(series)
+        (array,) = virtualize(nwbfile).values()
+        return array, open_rfs(write_virtual_nwb(nwbfile))["acquisition/series/data"][...]
+
+    array, values = read()
+    assert array.shape == (300, 6)
+    assert [codec["name"] for codec in array.codecs] == (["bytes"] if time_axis == 0 else ["transpose", "bytes"])
+    np.testing.assert_array_equal(values, x)
+    if time_axis == 0:
+        _, values = read(channel_ids=["ch4", "ch1"])
+        np.testing.assert_array_equal(values, x[:, [4, 1]])
+    with pytest.raises(NotVirtualizable, match="do not match those the file holds"):
+        read(channel_ids=["ch9"])
+    with pytest.raises(NotVirtualizable, match="scaled values"):
+        read(return_scaled=True)
+
+
+def test_memory_mapped_array(tmp_path):
+    """An iterator over a memory map of a file, as NeuroConv makes for a WAV file."""
+    x = np.random.default_rng(17).integers(-500, 500, (400, 2)).astype("<i2")
+    path = tmp_path / "sound.bin"
+    path.write_bytes(b"RIFF" * 11 + x.tobytes())
+    mapped = np.memmap(str(path), dtype="<i2", mode="c", offset=44, shape=(400, 2))
+
+    def nwbfile_with(data, iterator_class=DataChunkIterator):
+        iterator = iterator_class(data=data)
+        nwbfile = pynwb.NWBFile(
+            session_description="s", identifier="i", session_start_time=datetime(2026, 1, 1, tzinfo=timezone.utc)
+        )
+        nwbfile.add_acquisition(pynwb.TimeSeries(name="series", data=iterator, unit="V", rate=1.0))
+        return nwbfile
+
+    nwbfile = nwbfile_with(mapped)
+    (array,) = virtualize(nwbfile).values()
+    assert array.shape == (400, 2)
+    np.testing.assert_array_equal(open_rfs(write_virtual_nwb(nwbfile))["acquisition/series/data"][...], x)
+    # Values in memory, and a view that skips samples, are not what a file holds in order
+    with pytest.raises(NotVirtualizable, match="memory-mapped file"):
+        virtualize(nwbfile_with(np.array(mapped)))
+    with pytest.raises(NotVirtualizable, match="whole rows in C order"):
+        virtualize(nwbfile_with(mapped[:, ::-1]))
+    # An iterator of another class may compute what it writes
+    with pytest.raises(NotVirtualizable, match="memory-mapped file"):
+        virtualize(nwbfile_with(mapped, type("Scaled", (DataChunkIterator,), {})))
+
+
 def test_imaging_frames_from_tiff_pages(tmp_path):
     """Frames are picked out of the pages of several files, and come out as NeuroConv writes them."""
     tifffile = pytest.importorskip("tifffile")
@@ -280,6 +362,24 @@ CASES = {
         ("ElectricalSeries/data", (256, 5)),
         1,
     ),
+    "WhiteMatter": (
+        EPHYS,
+        "WhiteMatterRecordingInterface",
+        {
+            "file_path": "whitematter/HSW_2024_12_12__10_28_23__70min_17sec__hsamp_64ch_25000sps_stub.bin",
+            "sampling_frequency": 25000.0,
+            "num_channels": 64,
+        },
+        ("ElectricalSeries/data", (25000, 64)),
+        1,
+    ),
+    "CellExplorer": (
+        EPHYS,
+        "CellExplorerRecordingInterface",
+        {"folder_path": "cellexplorer/dataset_4/Peter_MS22_180629_110319_concat_stubbed"},
+        ("ElectricalSeries/data", (1000, 128)),
+        1,
+    ),
     "TIFF stack": (
         OPHYS,
         "TiffImagingInterface",
@@ -467,6 +567,37 @@ def test_same_as_neuroconv(case, tmp_path):
     with NWBZarrIO(RfsStore(rfs), mode="r") as io:
         io.read()
         assert pynwb.validate(io=io) == []
+
+
+@pytest.mark.gin  # needs no testing data, but NeuroConv, which only the job that runs these tests installs
+def test_wav_audio_same_as_neuroconv(tmp_path):
+    """A WAV file, which NeuroConv maps into memory, as the AcousticWaveformSeries of a virtual file."""
+    import h5py
+
+    wavfile = pytest.importorskip("scipy.io.wavfile")
+    datainterfaces = _import_neuroconv()
+    samples = np.random.default_rng(15).integers(-3000, 3000, (22050, 2)).astype("<i2")
+    wavfile.write(tmp_path / "sound.wav", 44100, samples)
+    interface = datainterfaces.AudioInterface(file_paths=[tmp_path / "sound.wav"])
+    metadata = interface.get_metadata()
+    metadata["NWBFile"].setdefault("session_start_time", datetime(2026, 1, 1, tzinfo=timezone.utc))
+    interface.run_conversion(nwbfile_path=str(tmp_path / "copied.nwb"), metadata=metadata, overwrite=True)
+
+    nwbfile = interface.create_nwbfile(metadata=metadata)
+    virtual_arrays = virtualize(nwbfile)
+    assert [(name, array.shape) for name, array in virtual_arrays.items()] == [("AcousticWaveformSeries/data", (22050, 2))]
+    rfs = write_virtual_nwb(nwbfile)
+    assert list(rfs["sources"]) == [str(tmp_path / "sound.wav")]
+    series = "stimulus/presentation/AcousticWaveformSeries"
+    virtual = open_rfs(rfs)
+    with h5py.File(tmp_path / "copied.nwb", "r") as copied:
+        np.testing.assert_array_equal(virtual[f"{series}/data"][...], copied[f"{series}/data"][()])
+        np.testing.assert_array_equal(virtual[f"{series}/data"][...], samples)
+        assert virtual[f"{series}/starting_time"][()] == copied[f"{series}/starting_time"][()]
+    # pynwb.validate raises for this file and for the one NeuroConv wrote, because of the ndx-sound
+    # extension, so the file is only read back here.
+    with NWBZarrIO(RfsStore(rfs), mode="r") as io:
+        assert io.read().stimulus["AcousticWaveformSeries"].data.shape == (22050, 2)
 
 
 @pytest.mark.gin
