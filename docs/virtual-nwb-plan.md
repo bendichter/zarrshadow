@@ -111,14 +111,15 @@ A column permutation needs no selection: the `electrodes` region of an `Electric
 
    Neuralynx through NeuroConv is refused in the usual case. With inverted input NEO reports a negative gain, and SpikeInterface negates the samples and keeps the gain positive, so NeuroConv writes values the file does not hold. A virtual file could reference the stored values and negate `conversion`, which gives the same voltages in a file that differs from NeuroConv's. That is a decision about the bridge, not about the format.
 
-   Remaining:
-   - A raw-binary generator taking offset, dtype, and channel count covers WhiteMatter, CellExplorer, and 16-bit WAV in a few lines each.
+   Also done: WhiteMatter, CellExplorer, and 16-bit WAV, in the bridge. These need no generator, because `VirtualArray.contiguous` already describes a plain binary file. SpikeInterface reads WhiteMatter and CellExplorer with its `BinaryRecordingExtractor`, whose segments give the file, offset, data type, and time axis, and NeuroConv maps a WAV file into memory, which `VirtualArray.from_memmap` reads. Compared with NeuroConv's own conversion for all three. A 24-bit WAV file is not mapped and has no Zarr data type.
 5. Readers and hosting. Done: a JavaScript store for zarrita.js in `js/`, which reads everything the Python store reads, selections included, and is tested against files the Python package writes. It read two NWB files from DANDI in Node and in Chrome with the same values as Python. Remaining: the hdmf-zarr conventions (links, object references, compound types) for JavaScript, which belong in a package of their own; selections in the MATLAB reader; and where source files live.
 6. Propose the bridge as a NeuroConv backend.
 
 ## Source Formats
 
 Classes: A, an existing zarrshadow generator covers it. B, one contiguous raw block. C, fixed-size records, one chunk per record. D, needs a selection. E, not feasible. F, nothing to gain. "+T" needs the transpose codec, and "+S" needs a sign or offset carried in `conversion` and `offset`. The evidence column says whether the layout was checked against NEO's read on a GIN file or read in the reader's source only.
+
+As of October 2026 the table's rows are implemented down to EDF, except Axon ABF as one series per sweep per channel, MEArec, and Biocam, which have not been tried through the bridge. The imaging rows for TIFF and HDF5 are implemented as phase 3 describes. TDT, Axona, Scanbox, the segmentation outputs, and Minian are not.
 
 | Format | Layout | Class | Evidence |
 |---|---|---|---|
