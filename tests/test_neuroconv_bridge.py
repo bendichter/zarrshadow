@@ -266,6 +266,20 @@ CASES = {
         ("ElectricalSeries/data", (24320, 64)),
         64,
     ),
+    "Open Ephys legacy": (
+        EPHYS,
+        "OpenEphysLegacyRecordingInterface",
+        {"folder_path": "openephys/openephys_rhythmdata_test_nodes/Record Node 120"},
+        ("ElectricalSeries/data", (67584, 32)),
+        32,
+    ),
+    "EDF": (
+        EPHYS,
+        "EDFRecordingInterface",
+        {"file_path": "edf/edf+C.edf"},
+        ("ElectricalSeries/data", (256, 5)),
+        1,
+    ),
     "TIFF stack": (
         OPHYS,
         "TiffImagingInterface",
@@ -340,9 +354,18 @@ CASES = {
     ),
 }
 
-# Interfaces whose data cannot be referenced, and what the error says
+# Interfaces whose data cannot be referenced: the dataset, the interface, its arguments, and what the error says
 REFUSED = {
+    # NEO gives this recording a negative gain, because its input was inverted, and SpikeInterface
+    # then negates the samples it reads and keeps the gain positive.
+    "Neuralynx, inverted input": (
+        EPHYS,
+        "NeuralynxRecordingInterface",
+        {"folder_path": "neuralynx/Cheetah_v5.4.0/original_data"},
+        "negates this recording's samples",
+    ),
     "Thor, LZW compressed": (
+        OPHYS,
         "ThorImagingInterface",
         {
             "file_path": "imaging_datasets/ThorlabsTiff/multi_channel_multi_plane/lzw_compressed/ChanA_0001_0001_0001_0001.tif",
@@ -351,6 +374,7 @@ REFUSED = {
         "compressed or stored in several pieces",
     ),
     "Bruker volumes": (
+        OPHYS,
         "BrukerTiffMultiPlaneImagingInterface",
         {"folder_path": "imaging_datasets/BrukerTif/NCCR32_2022_11_03_IntoTheVoid_t_series-005"},
         "assembles volumes from several extractors",
@@ -388,7 +412,7 @@ GIN_PATHS = sorted(
     {
         (dataset, _to_download(dataset, key, value))
         for dataset, source in [(case[0], case[2]) for case in CASES.values()]
-        + [(OPHYS, case[1]) for case in REFUSED.values()]
+        + [(case[0], case[2]) for case in REFUSED.values()]
         for key, value in source.items()
         if key.endswith("_path")
     }
@@ -450,8 +474,8 @@ def test_same_as_neuroconv(case, tmp_path):
 def test_refused(case):
     """Data that cannot be referenced raises, and with strict off is left for NeuroConv to copy."""
     datainterfaces = _import_neuroconv()
-    interface_name, source, message = REFUSED[case]
-    interface = getattr(datainterfaces, interface_name)(**_local_source(OPHYS, source))
+    dataset, interface_name, source, message = REFUSED[case]
+    interface = getattr(datainterfaces, interface_name)(**_local_source(dataset, source))
     metadata = interface.get_metadata()
     metadata["NWBFile"].setdefault("session_start_time", datetime(2026, 1, 1, tzinfo=timezone.utc))
     nwbfile = interface.create_nwbfile(metadata=metadata)

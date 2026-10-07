@@ -111,6 +111,16 @@ MAPPED_FILES = {
         "blackrock/blackrock_3_0_ptp/20231027-125608-001",
         "blackrock/segment/PauseCorrect/pause_correct",
     ],
+    "EDFRawIO": [
+        "edf/edf+C.edf",
+        "edf/electrode_and_analog_data/electrode_and_analog_data.edf",
+        "edf/heterogeneous_offsets/autoscaled_offsets.edf",
+        "edf/heterogeneous_offsets/same_unit_offsets_multirate.edf",
+        "edf/heterogeneous_offsets/cross_kind_offsets_corrupt_header.edf",
+        "edf/metadata_annotations/full_metadata.edf",
+        "edf/events/event_edge_cases.edf",
+        "edf/events/test_subsecond.edf",
+    ],
     "IntanRawIO": [
         "intan/intan_rhs_test_1.rhs",
         "intan/intan_rhd_test_1.rhd",
@@ -125,6 +135,23 @@ MAPPED_FILES = {
         "intan/test_fcs_dc_250327_154333/info.rhs",
         "intan/test_fpc_stim_250327_151617/info.rhs",
     ],
+    "NeuralynxRawIO": [
+        "neuralynx/BML/original_data",
+        "neuralynx/BML_unfilledsplit/original_data",
+        "neuralynx/Cheetah_v1.1.0/original_data",
+        "neuralynx/Cheetah_v4.0.2/original_data",
+        "neuralynx/Cheetah_v5.4.0/original_data",
+        "neuralynx/Cheetah_v5.5.1/original_data",
+        "neuralynx/Cheetah_v5.6.3/original_data",
+        "neuralynx/Cheetah_v5.7.4/original_data",
+        "neuralynx/Cheetah_v6.3.2/incomplete_blocks",
+        "neuralynx/two_streams_different_header_encoding",
+    ],
+    "OpenEphysRawIO": [
+        "openephys/OpenEphys_SampleData_1",
+        "openephys/openephys_rhythmdata_test_nodes/Record Node 120",
+        "openephys/openephys_rhythmdata_test_nodes/Record Node 121",
+    ],
     "SpikeGadgetsRawIO": [
         "spikegadgets/20210225_em8_minirec2_ac.rec",
         "spikegadgets/W122_06_09_2019_1_fromSD.rec",
@@ -137,6 +164,14 @@ MAPPED_FILES = {
 # digital channels are the bits of one word, and its stimulation current is decoded from a magnitude and a sign.
 COMPUTED_STREAMS = {
     "IntanRawIO": {"USB board digital input channel", "USB board digital output channel", "Stim channel"},
+}
+
+# Recordings of these readers that cannot be referenced, and what the error says
+MAPPED_REFUSED = {
+    # Records are missing, and NEO fills the gaps with zeros at positions that follow the timestamps
+    ("OpenEphysRawIO", "openephys/OpenEphys_SampleData_2_(multiple_starts)"): "gaps between its records",
+    # BDF, with 24-bit samples
+    ("EDFRawIO", "edf/events/event_markers.bdf"): "24-bit",
 }
 
 # Maxwell stores its signals in HDF5 with a proprietary compression filter,
@@ -157,6 +192,7 @@ GIN_PATHS = sorted(
         for paths in files.values()
         for path in paths
     }
+    | {("ephys", path.split("/")[0]) for _, path in MAPPED_REFUSED}
 )
 
 
@@ -263,6 +299,14 @@ def test_stream_arrays_match_neo(name, path):
                 assert len(arrays[key].attributes["channel_ids"]) == n_channels == expected.shape[1]
                 compared += 1
     assert compared == len(arrays) > 0
+
+
+@pytest.mark.parametrize(("name", "path"), [pytest.param(*case, id=case[1]) for case in MAPPED_REFUSED])
+def test_recordings_that_cannot_be_referenced(name, path):
+    from zarrshadow import virtual_arrays_neo
+
+    with pytest.raises(NotImplementedError, match=MAPPED_REFUSED[(name, path)]):
+        virtual_arrays_neo(_reader(name, path))
 
 
 def test_spikeglx_as_virtual_nwb(tmp_path):
