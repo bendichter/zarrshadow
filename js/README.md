@@ -23,12 +23,24 @@ A DANDI asset download URL redirects to the file in the archive's bucket. The st
 
 When the references record a file's ETag, every request carries `If-Match`, and a file that has changed raises `SourceChangedError`. A browser sends that header to another origin only if the server's CORS configuration allows it, which DANDI's bucket does. `validateSources: false` turns the check off.
 
+zarrita asks for every chunk of a selection at once. The store fetches reads of one file that are close together in a single request, up to `maxMergeSize` (1 MiB) per request and across gaps of up to `mergeGap` (32 KiB). This matters most for formats whose chunks are a few kilobytes. zarrita's own `withRangeCoalescing` merges ranges of one key, and here each chunk is a key of its own, so it does not apply.
+
+The size limit comes from a measurement: one second of an LFP recording on DANDI, 82 chunks of about 100 kB that are next to one another in the file, read from Chrome and from Node (medians of four reads, October 2026).
+
+| `maxMergeSize` | Requests | Chrome | Node |
+|---|---|---|---|
+| 0 (off) | 82 | 1.46 s | 0.76 s |
+| 256 KiB | 39 | 1.06 s | 0.73 s |
+| 1 MiB | 9 | 0.83 s | 0.88 s |
+| 2 MiB | 4 | 1.04 s | 1.15 s |
+| 4 MiB | 2 | 1.51 s | 1.30 s |
+| 50 MiB | 1 | 2.29 s | 2.22 s |
+
 zarrita decodes the codecs that references to HDF5 files use (`numcodecs.zlib`, `numcodecs.shuffle`, `numcodecs.blosc`, `numcodecs.zstd`). The store adds `numcodecs.fletcher32`, which drops the checksum without verifying it.
 
 ## What It Does Not Do
 
 - Arrays with the `struct` data type, which is how compound HDF5 datasets are written, cannot be opened, because zarrita 0.7.5 does not implement that extension (https://github.com/manzt/zarrita.js/pull/464 adds it). The store itself handles them.
-- Requests for chunks that are close together in a file are not merged, as the Python store does. zarrita has a `withRangeCoalescing` extension, which has not been tried with this store.
 - For an array with the `transpose` codec, zarrita returns the chunk's own layout together with the strides that describe it. Index the result with `stride`.
 - The store knows nothing of NWB. Links, object references, and the other conventions of hdmf-zarr are left to the code that uses it.
 

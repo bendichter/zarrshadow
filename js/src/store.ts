@@ -48,6 +48,28 @@ export interface ReferenceStoreOptions {
   validateSources?: boolean;
   /** How many times a failed request is tried again. Default 5. */
   retries?: number;
+  /**
+   * Requests made at the same time for parts of one file are fetched together
+   * when the gap between them is at most this many bytes. zarrita asks for
+   * every chunk of a selection at once, so chunks that are next to one another
+   * in a file can share a request. Default 32 KiB.
+   */
+  mergeGap?: number;
+  /**
+   * The most bytes one merged request may ask for. 0 turns merging off.
+   * Default 1 MiB, which bundles small chunks and still leaves large reads
+   * to several requests in parallel. One request for everything is slower.
+   */
+  maxMergeSize?: number;
+}
+
+/** A read of part of a file that is waiting to be sent, alone or with its neighbors. */
+interface PendingRead {
+  offset: number;
+  length: number;
+  signal?: AbortSignal;
+  resolve: (bytes: Uint8Array) => void;
+  reject: (reason: unknown) => void;
 }
 
 /** A referenced file no longer matches the one the references were made from. */
@@ -56,6 +78,7 @@ export class SourceChangedError extends Error {
 }
 
 const SUPPORTED_VERSIONS = [1, 2];
+const DEFAULT_MAX_MERGE_SIZE = 2 ** 20;
 const ITEM_SIZES: Record<string, number> = {
   int8: 1, uint8: 1, int16: 2, uint16: 2, float16: 2, int32: 4, uint32: 4, float32: 4,
   int64: 8, uint64: 8, float64: 8,
@@ -146,6 +169,7 @@ export class ReferenceStore implements AsyncReadable {
   #selections = new Map<string, Selection>();
   #chunkSizes = new Map<string, number | undefined>();
   #checkedFiles = new Map<string, Promise<void>>();
+  #pending = new Map<string, PendingRead[]>();
   #children: Map<string, Set<string>> | undefined;
 
   constructor(rfs: ReferenceFileSystem, options: ReferenceStoreOptions = {}) {
@@ -325,12 +349,66 @@ export class ReferenceStore implements AsyncReadable {
     opts: GetOptions,
   ): Promise<Uint8Array> {
     if (length === 0) return new Uint8Array(0);
-    if (isUrl(location)) return this.#readUrl(location, offset, length, opts);
+    if (isUrl(location)) {
+      const merging = (this.#options.maxMergeSize ?? DEFAULT_MAX_MERGE_SIZE) > 0;
+      if (!merging || offset === undefined || length === undefined) {
+        return this.#readUrl(location, offset, length, opts);
+      }
+      // Wait for the other reads that are being asked for right now, and send them together
+      return new Promise((resolve, reject) => {
+        if (this.#pending.size === 0) setTimeout(() => this.#sendPending(), 0);
+        if (!this.#pending.has(location)) this.#pending.set(location, []);
+        this.#pending.get(location)?.push({ offset, length, signal: opts.signal, resolve, reject });
+      });
+    }
     if (!this.#options.readFile) {
       throw new Error(`${location} is a local path; pass readFile (see zarrshadow/node) to read it`);
     }
     await this.#checkFile(location);
     return this.#options.readFile(location, offset, length);
+  }
+
+  /** Send the reads that are waiting, one request for each run of reads that are close together in a file. */
+  #sendPending(): void {
+    const gap = this.#options.mergeGap ?? 32 * 1024;
+    const maxSize = this.#options.maxMergeSize ?? DEFAULT_MAX_MERGE_SIZE;
+    const pending = this.#pending;
+    this.#pending = new Map();
+    for (const [url, reads] of pending) {
+      reads.sort((a, b) => a.offset - b.offset);
+      let run: PendingRead[] = [];
+      let start = 0;
+      let end = 0;
+      const send = (group: PendingRead[], from: number, to: number) => {
+        // One caller's signal cannot cancel a request that others share
+        const signal = group.length === 1 ? group[0]?.signal : undefined;
+        this.#readUrl(url, from, to - from, { signal }).then(
+          (bytes) => {
+            for (const read of group) {
+              const at = read.offset - from;
+              // A copy, so that a chunk does not keep the whole response in memory
+              read.resolve(group.length === 1 ? bytes : bytes.slice(at, at + read.length));
+            }
+          },
+          (reason) => {
+            for (const read of group) read.reject(reason);
+          },
+        );
+      };
+      for (const read of reads) {
+        const stop = read.offset + read.length;
+        if (run.length > 0 && read.offset <= end + gap && Math.max(end, stop) - start <= maxSize) {
+          run.push(read);
+          end = Math.max(end, stop);
+          continue;
+        }
+        if (run.length > 0) send(run, start, end);
+        run = [read];
+        start = read.offset;
+        end = stop;
+      }
+      if (run.length > 0) send(run, start, end);
+    }
   }
 
   #checkFile(path: string): Promise<void> {
