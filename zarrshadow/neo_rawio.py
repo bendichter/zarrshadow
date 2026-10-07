@@ -129,7 +129,8 @@ def virtual_arrays_neo(
     hold one block of samples per segment or one packet per sample;
     SpikeGadgets, whose files hold one packet per sample; Intan, in its three
     layouts; and Neuralynx, Open Ephys in its legacy format, and EDF, which
-    store records of a fixed number of samples. A stream whose values NEO
+    store records of a fixed number of samples. MEArec and Biocam files are
+    HDF5 and go through the HDF5 generator. A stream whose values NEO
     computes, such as Intan's digital channels, which it unpacks from the
     bits of one word, has no array in the result. A recording whose values no
     file holds, such as an Open Ephys one with gaps that NEO fills with zeros,
@@ -449,12 +450,77 @@ def _edf_stream(
     return stack(channels, axis=1)
 
 
+def _hdf5_dataset(dataset: Any, url_for: Callable[[str], str], chunk_bytes: int) -> VirtualArray:
+    """A dataset of an HDF5 file a reader has open, as the array the HDF5 generator makes of it."""
+    from .hdf5 import add_hdf5_dataset
+
+    path = dataset.file.filename
+    builder = RfsBuilder()
+    builder.add_group("")
+    add_hdf5_dataset(
+        builder, "data", path, dataset.name, url=url_for(path), contiguous_chunk_bytes=chunk_bytes
+    )
+    array = VirtualArray.from_rfs(builder.build(record_sources=False), "data")
+    array.attributes = {}
+    return array
+
+
+def _mearec_stream(
+    reader: Any, block: int, seg: int, stream_id: str, url_for: Callable[[str], str], chunk_bytes: int
+) -> VirtualArray:
+    """The recordings of a MEArec file: one HDF5 dataset, time by channel."""
+    return _hdf5_dataset(reader._recordings, url_for, chunk_bytes)
+
+
+def _biocam_stream(
+    reader: Any, block: int, seg: int, stream_id: str, url_for: Callable[[str], str], chunk_bytes: int
+) -> VirtualArray:
+    """The signals of a Biocam file, which is HDF5.
+
+    The oldest files hold a dataset of time by channel. Later ones hold the
+    same samples as one long row, a sample of every channel and then the
+    next, which read as time by channel when the dataset is stored in one
+    piece. Files whose values are inverted (NEO returns 4096 minus the stored
+    value) and files that store only events cannot be referenced.
+    """
+    from .hdf5 import _detect_offset_shift, _raw_reader
+
+    function = reader._read_function.__name__
+    if function not in ("readHDF5t_100", "readHDF5t_101", "readHDF5t_brw4"):
+        reason = "inverted" if function.endswith("_i") else "stored as events"
+        raise NotImplementedError(f"The signals of this Biocam file are {reason}, so NEO computes the values it returns")
+    h5f = reader._filehandle
+    if function == "readHDF5t_brw4":
+        (well,) = [key for key in h5f if key.startswith("Well_")][:1]
+        dataset = h5f[well]["Raw"]
+    else:
+        dataset = h5f["3BData/Raw"]
+    if function == "readHDF5t_100":
+        return _hdf5_dataset(dataset, url_for, chunk_bytes)
+    if dataset.chunks is not None or dataset.id.get_offset() is None:
+        raise NotImplementedError("The signals of this Biocam file are one long row stored in chunks")
+    path = h5f.filename
+    n_samples, n_channels = int(reader._num_frames), int(reader._num_channels)
+    if dataset.size < n_samples * n_channels:
+        raise NotImplementedError(f"{path} holds fewer samples than its header says")
+    return VirtualArray.contiguous(
+        url_for(path),
+        shape=(n_samples, n_channels),
+        dtype=dataset.dtype,
+        offset=dataset.id.get_offset() + _detect_offset_shift(h5f, _raw_reader(path)),
+        file_size=os.path.getsize(path),
+        chunk_bytes=chunk_bytes,
+    )
+
+
 # For NEO readers without the buffer description API: how to find a stream's samples in the files.
 # A function returns None for a stream that cannot be referenced.
 _STREAM_ARRAYS: dict[str, Callable[..., VirtualArray | None]] = {
+    "BiocamRawIO": _biocam_stream,
     "BlackrockRawIO": _blackrock_stream,
     "EDFRawIO": _edf_stream,
     "IntanRawIO": _intan_stream,
+    "MEArecRawIO": _mearec_stream,
     "NeuralynxRawIO": _neuralynx_stream,
     "OpenEphysRawIO": _openephys_stream,
     "SpikeGadgetsRawIO": _spikegadgets_stream,

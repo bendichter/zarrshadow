@@ -102,7 +102,7 @@ jobs:
           python-version: "3.12"
       - name: Install zarrshadow, datalad, and git-annex
         run: |
-          pip install -e ".[dev]" datalad git-annex
+          pip install -e ".[dev]" datalad git-annex MEArec
           git config --global user.name "CI"
           git config --global user.email "ci@example.org"
       - name: Restore the cached testing data
@@ -136,7 +136,7 @@ jobs:
           pip install uv
           printf 'zarr>=3.1.3\nnumcodecs>=0.15\n' > overrides.txt
           uv pip install --system --override overrides.txt -e ".[dev]" \
-            "neuroconv[spikeglx,openephys,neuroscope,mcsraw,blackrock,spikegadgets,intan,neuralynx,edf,whitematter,cellexplorer,audio,tiff,scanimage,brukertiff,thor,micromanagertiff,hdf5]" \
+            "neuroconv[spikeglx,openephys,neuroscope,mcsraw,blackrock,spikegadgets,intan,neuralynx,edf,whitematter,cellexplorer,audio,mearec,biocam,tiff,scanimage,brukertiff,thor,micromanagertiff,hdf5]" \
             datalad git-annex
           git config --global user.name "CI"
           git config --global user.email "ci@example.org"
