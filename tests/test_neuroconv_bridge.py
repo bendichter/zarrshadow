@@ -166,7 +166,8 @@ def test_imaging_frames_from_hdf5(tmp_path):
 EPHYS, OPHYS = "ephys", "ophys"
 
 # Each case: the testing dataset, the NeuroConv interface, its arguments (paths are relative to the dataset),
-# the dataset that virtualize replaces with its shape, and how many source files the references point into.
+# the dataset that virtualize replaces with its shape (or a list of them), and how many source files the
+# references point into.
 CASES = {
     "SpikeGLX AP band": (
         EPHYS,
@@ -214,6 +215,34 @@ CASES = {
         "MCSRawRecordingInterface",
         {"file_path": "rawmcs/raw_mcs_with_header_1.raw"},
         ("ElectricalSeries/data", (100000, 60)),
+        1,
+    ),
+    "Blackrock": (
+        EPHYS,
+        "BlackrockRecordingInterface",
+        {"file_path": "blackrock/FileSpec2.3001.ns5"},
+        ("ElectricalSeries/data", (900300, 10)),
+        1,
+    ),
+    "Blackrock with a pause": (
+        EPHYS,
+        "BlackrockRecordingInterface",
+        {"file_path": "blackrock/segment/PauseCorrect/pause_correct.ns2"},
+        [("ElectricalSeries0/data", (4000, 16)), ("ElectricalSeries1/data", (4000, 16))],
+        1,
+    ),
+    "Blackrock with a packet per sample": (
+        EPHYS,
+        "BlackrockRecordingInterface",
+        {"file_path": "blackrock/blackrock_3_0_ptp/20231027-125608-001.ns6"},
+        ("ElectricalSeries/data", (64469, 65)),
+        1,
+    ),
+    "SpikeGadgets": (
+        EPHYS,
+        "SpikeGadgetsRecordingInterface",
+        {"file_path": "spikegadgets/20210225_em8_minirec2_ac.rec"},
+        ("ElectricalSeries/data", (8000, 512)),
         1,
     ),
     "TIFF stack": (
@@ -321,12 +350,28 @@ def _local_source(dataset, source):
         if not key.endswith("_path"):
             local[key] = value
             continue
-        if dataset == EPHYS:
-            fetch(dataset, value.split("/")[0])
-        else:
-            fetch(dataset, value if key == "folder_path" else os.path.dirname(value))
+        fetch(dataset, _to_download(dataset, key, value))
         local[key] = os.path.join(folder(dataset), value)
     return local
+
+
+def _to_download(dataset, key, value):
+    """The folder to download for one path argument of an interface."""
+    if dataset == EPHYS:
+        return value.split("/")[0]
+    return value if key == "folder_path" else os.path.dirname(value)
+
+
+# Everything these tests read from GIN, for gin_data.py to download ahead of them
+GIN_PATHS = sorted(
+    {
+        (dataset, _to_download(dataset, key, value))
+        for dataset, source in [(case[0], case[2]) for case in CASES.values()]
+        + [(OPHYS, case[1]) for case in REFUSED.values()]
+        for key, value in source.items()
+        if key.endswith("_path")
+    }
+)
 
 
 @pytest.mark.gin
@@ -345,7 +390,8 @@ def test_same_as_neuroconv(case, tmp_path):
 
     nwbfile = interface.create_nwbfile(metadata=metadata)
     virtual_arrays = virtualize(nwbfile)
-    assert [(name, array.shape) for name, array in virtual_arrays.items()] == [replaced]
+    expected = replaced if isinstance(replaced, list) else [replaced]
+    assert sorted((name, array.shape) for name, array in virtual_arrays.items()) == expected
     rfs = write_virtual_nwb(nwbfile)
     assert len(rfs["sources"]) == n_sources
 
