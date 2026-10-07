@@ -27,7 +27,7 @@ zarrita decodes the codecs that references to HDF5 files use (`numcodecs.zlib`, 
 
 ## What It Does Not Do
 
-- Arrays with the `struct` data type, which is how compound HDF5 datasets are written, cannot be opened, because zarrita 0.7.5 does not implement that extension. The store itself handles them.
+- Arrays with the `struct` data type, which is how compound HDF5 datasets are written, cannot be opened, because zarrita 0.7.5 does not implement that extension (https://github.com/manzt/zarrita.js/pull/464 adds it). The store itself handles them.
 - Requests for chunks that are close together in a file are not merged, as the Python store does. zarrita has a `withRangeCoalescing` extension, which has not been tried with this store.
 - For an array with the `transpose` codec, zarrita returns the chunk's own layout together with the strides that describe it. Index the result with `stride`.
 - The store knows nothing of NWB. Links, object references, and the other conventions of hdmf-zarr are left to the code that uses it.
