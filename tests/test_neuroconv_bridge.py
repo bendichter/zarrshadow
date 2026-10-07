@@ -245,6 +245,27 @@ CASES = {
         ("ElectricalSeries/data", (8000, 512)),
         1,
     ),
+    "Intan, blocks after the header": (
+        EPHYS,
+        "IntanRecordingInterface",
+        {"file_path": "intan/intan_rhd_test_1.rhd"},
+        ("ElectricalSeries/data", (30000, 192)),
+        1,
+    ),
+    "Intan, one file per signal": (
+        EPHYS,
+        "IntanRecordingInterface",
+        {"file_path": "intan/intan_fps_test_231117_052500/info.rhd"},
+        ("ElectricalSeries/data", (24320, 64)),
+        1,
+    ),
+    "Intan, one file per channel": (
+        EPHYS,
+        "IntanRecordingInterface",
+        {"file_path": "intan/intan_fpc_test_231117_052630/info.rhd"},
+        ("ElectricalSeries/data", (24320, 64)),
+        64,
+    ),
     "TIFF stack": (
         OPHYS,
         "TiffImagingInterface",

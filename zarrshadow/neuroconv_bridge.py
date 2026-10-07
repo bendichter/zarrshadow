@@ -123,7 +123,10 @@ def _array_for_iterator(
     segment = base._recording_segments[getattr(iterator, "segment_index", 0)]
     name = str(base.stream_id).replace("/", "_")
     single = reader.block_count() == 1 and reader.segment_count(0) == 1
-    array = arrays[name if single else f"block{segment.block_index}/segment{segment.segment_index}/{name}"]
+    key = name if single else f"block{segment.block_index}/segment{segment.segment_index}/{name}"
+    if key not in arrays:
+        raise NotVirtualizable(f"Stream {base.stream_id!r} holds values the reader computes, which no file stores")
+    array = arrays[key]
 
     # SpikeInterface names channels by NEO's ids or, for some readers, by its names
     for known in (array.attributes["channel_ids"], array.attributes["channel_names"]):

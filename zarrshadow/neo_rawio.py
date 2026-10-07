@@ -21,13 +21,14 @@ each channel's id, name, units, gain, and offset.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from collections.abc import Callable
 from typing import Any
 
 import numpy as np
 
 from .builder import RfsBuilder, bytes_codecs, contiguous_chunk_shape, zarr_data_type
-from .virtual import VirtualArray, memmap_location
+from .virtual import VirtualArray, memmap_location, stack
 
 
 def generate_rfs_neo(
@@ -123,10 +124,12 @@ def virtual_arrays_neo(
     parameters are those of generate_rfs_neo. Only raw binary buffers are
     supported.
 
-    Two readers without the buffer description API are supported, through
+    Three readers without the buffer description API are supported, through
     the memory maps NEO reads them with: Blackrock, whose files hold one block
-    of samples per segment or one packet per sample, and SpikeGadgets, whose
-    files hold one packet per sample.
+    of samples per segment or one packet per sample; SpikeGadgets, whose
+    files hold one packet per sample; and Intan, in its three layouts. A
+    stream whose values NEO computes, such as Intan's digital channels, which
+    it unpacks from the bits of one word, has no array in the result.
     """
     if getattr(reader, "header", None) is None:
         reader.parse_header()
@@ -145,6 +148,8 @@ def virtual_arrays_neo(
             for seg in range(reader.segment_count(block)):
                 for stream_index, stream in enumerate(reader.header["signal_streams"]):
                     array = stream_array(reader, block, seg, str(stream["id"]), url_for, chunk_bytes)
+                    if array is None:
+                        continue  # a stream whose values NEO computes, which no file holds
                     array.attributes = _stream_attributes(reader, block, seg, stream_index, columns=None)
                     del array.attributes["columns"]
                     name = str(stream["id"]).replace("/", "_")
@@ -192,7 +197,7 @@ def _blackrock_stream(
 ) -> VirtualArray:
     """One nsX file's samples for a segment. NEO maps them time by channel; the stream id is the nsX number."""
     data = reader.nsx_datas[int(stream_id)][seg]
-    path, _, _ = memmap_location(data)
+    path = f"{reader._filenames['nsx']}.ns{int(stream_id)}"
     return VirtualArray.from_memmap(data, url=url_for(path), chunk_bytes=chunk_bytes)
 
 
@@ -205,7 +210,7 @@ def _spikegadgets_stream(
     bytes of a packet that are its samples, two for each channel.
     """
     packets = reader._raw_memmap
-    path, start, _ = memmap_location(packets)
+    path, start = str(reader.filename), memmap_location(packets)[1]
     places = np.nonzero(reader._mask_streams[stream_id])[0]
     if len(places) % 2 or np.any(places[1::2] != places[::2] + 1):
         raise NotImplementedError(f"The bytes of stream {stream_id!r} are not pairs that each hold one sample")
@@ -221,9 +226,79 @@ def _spikegadgets_stream(
     )
 
 
-# For NEO readers without the buffer description API: how to find a stream's samples in the files
-_STREAM_ARRAYS: dict[str, Callable[..., VirtualArray]] = {
+def _intan_stream(
+    reader: Any, block: int, seg: int, stream_id: str, url_for: Callable[[str], str], chunk_bytes: int
+) -> VirtualArray | None:
+    """One stream of an Intan recording, in any of its three layouts.
+
+    Intan writes one file per signal type (samples by channels), one file per
+    channel, or a single file of fixed blocks that follows the header. In a
+    block each channel's samples are together, so a block is channels by
+    samples and becomes one chunk with the transpose codec.
+
+    Returns None for the digital streams and the stimulation current, whose
+    values NEO works out from the stored words.
+    """
+    from neo.rawio.intanrawio import digital_stream_names
+
+    streams = reader.header["signal_streams"]
+    stream_name = str(streams[streams["id"] == stream_id]["name"][0])
+    if stream_name in digital_stream_names or stream_name == "Stim channel":
+        return None
+    raw = reader._raw_data
+    if reader.file_format != "header-attached":
+        # NEO maps these files by their resolved paths, which for a link is not the path the
+        # recording has. The functions it lists the files with give the paths as they are.
+        from neo.rawio import intanrawio
+
+        per = "signal" if reader.file_format == "one-file-per-signal" else "channel"
+        kind = Path(reader.filename).suffix.lstrip(".")
+        paths = getattr(intanrawio, f"create_one_file_per_{per}_dict_{kind}")(dirname=Path(reader.filename).parent)
+        if per == "signal":
+            return VirtualArray.from_memmap(
+                raw[stream_name], url=url_for(str(paths[stream_name])), chunk_bytes=chunk_bytes
+            )
+        if len(paths[stream_name]) != len(raw[stream_name]):
+            raise NotImplementedError(f"Could not match the files of stream {stream_name!r} to its channels")
+        channels = [
+            VirtualArray.from_memmap(data, url=url_for(str(path)), chunk_bytes=chunk_bytes)
+            for path, data in zip(paths[stream_name], raw[stream_name])
+        ]
+        return stack(channels, axis=1)
+
+    # header-attached: raw maps the blocks, with a field for each channel
+    channels = reader.header["signal_channels"]
+    channel_ids = [str(c) for c in channels[channels["stream_id"] == stream_id]["id"]]
+    path, start = str(reader.filename), memmap_location(raw)[1]
+    fields = [raw.dtype.fields[c] for c in channel_ids]
+    field_type, first = fields[0][0], fields[0][1]
+    dtype, per_block = field_type.base, int(np.prod(field_type.shape, dtype=int))
+    expected = [(field_type, first + i * field_type.itemsize) for i in range(len(fields))]
+    if [(f[0], f[1]) for f in fields] != expected:
+        raise NotImplementedError(f"The channels of stream {stream_name!r} are not next to one another in a block")
+    n_channels, n_blocks, record_size = len(fields), len(raw), raw.dtype.itemsize
+    kwargs = {"dtype": dtype, "record_size": record_size, "file_size": os.path.getsize(path)}
+    if not field_type.shape:
+        # One sample of each channel in a block, as for the supply voltage: the blocks are the rows
+        return VirtualArray.records(
+            url_for(path), shape=(n_blocks, n_channels), skip=first, offset=start, chunk_bytes=chunk_bytes, **kwargs
+        )
+    stored = VirtualArray.blocks(
+        url_for(path),
+        shape=(n_channels, n_blocks * per_block),
+        chunk_shape=(n_channels, per_block),
+        offset=start + first,
+        axis=1,
+        **kwargs,
+    )
+    return stored.transpose(1, 0)
+
+
+# For NEO readers without the buffer description API: how to find a stream's samples in the files.
+# A function returns None for a stream that cannot be referenced.
+_STREAM_ARRAYS: dict[str, Callable[..., VirtualArray | None]] = {
     "BlackrockRawIO": _blackrock_stream,
+    "IntanRawIO": _intan_stream,
     "SpikeGadgetsRawIO": _spikegadgets_stream,
 }
 

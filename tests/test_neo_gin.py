@@ -111,12 +111,32 @@ MAPPED_FILES = {
         "blackrock/blackrock_3_0_ptp/20231027-125608-001",
         "blackrock/segment/PauseCorrect/pause_correct",
     ],
+    "IntanRawIO": [
+        "intan/intan_rhs_test_1.rhs",
+        "intan/intan_rhd_test_1.rhd",
+        "intan/rhs_fpc_multistim_240514_082243/rhs_fpc_multistim_240514_082243.rhs",
+        "intan/intan_fpc_test_231117_052630/info.rhd",
+        "intan/intan_fps_test_231117_052500/info.rhd",
+        "intan/intan_fps_multiple_digital_channels/info.rhd",
+        "intan/intan_fpc_rhs_test_240329_091637/info.rhs",
+        "intan/intan_fps_rhs_test_240329_091536/info.rhs",
+        "intan/rhd_fpc_multistim_240514_082044/info.rhd",
+        "intan/rhs_stim_data_single_file_format/intanTestFile.rhs",
+        "intan/test_fcs_dc_250327_154333/info.rhs",
+        "intan/test_fpc_stim_250327_151617/info.rhs",
+    ],
     "SpikeGadgetsRawIO": [
         "spikegadgets/20210225_em8_minirec2_ac.rec",
         "spikegadgets/W122_06_09_2019_1_fromSD.rec",
         "spikegadgets/SpikeGadgets_test_data_2xNpix1.0_20240318_173658.rec",
         "spikegadgets/SL18_D19_S01_F01_BOX_SLP_20230503_112642_stubbed.rec",
     ],
+}
+
+# Streams whose values NEO computes from what is stored, so that no array can reference them: Intan's
+# digital channels are the bits of one word, and its stimulation current is decoded from a magnitude and a sign.
+COMPUTED_STREAMS = {
+    "IntanRawIO": {"USB board digital input channel", "USB board digital output channel", "Stim channel"},
 }
 
 # Maxwell stores its signals in HDF5 with a proprietary compression filter,
@@ -221,13 +241,20 @@ def test_stream_arrays_match_neo(name, path):
     builder.add_group("")
     for i, array in enumerate(arrays.values()):
         array.add_to(builder, f"a{i}", dimension_names=["time", "channel"])
-    root = open_rfs(builder.build())
+    rfs = builder.build()
+    root = open_rfs(rfs)
+    # The references name the recording's own files, not what a link to them resolves to
+    data_root = os.path.join(_download(path.split("/")[0]), path.split("/")[0])
+    assert all(source.startswith(data_root) and "/.git/" not in source for source in rfs["sources"])
     paths = {key: f"a{i}" for i, key in enumerate(arrays)}
     compared = 0
     for block in range(reader.block_count()):
         for seg in range(reader.segment_count(block)):
             for stream_index, stream in enumerate(reader.header["signal_streams"]):
                 key = _stream_key(reader, block, seg, stream)
+                if key not in arrays:
+                    assert str(stream["name"]) in COMPUTED_STREAMS[name]
+                    continue
                 expected = reader.get_analogsignal_chunk(block_index=block, seg_index=seg, stream_index=stream_index)
                 assert arrays[key].shape == expected.shape
                 np.testing.assert_array_equal(root[paths[key]][...], expected)
