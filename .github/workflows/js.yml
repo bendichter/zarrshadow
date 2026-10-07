@@ -1,0 +1,39 @@
+name: JavaScript
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  js:
+    name: JavaScript store on files written by Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: js/package-lock.json
+      # The tests read reference files that the Python package writes
+      # (js/test/make_fixtures.py), so both are installed.
+      - run: pip install -e ".[dev]"
+      - run: npm ci
+        working-directory: js
+      - run: npm run typecheck
+        working-directory: js
+      - run: npm run build
+        working-directory: js
+      - run: npm test
+        working-directory: js
+        env:
+          PYTHON: python

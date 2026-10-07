@@ -106,7 +106,7 @@ A column permutation needs no selection: the `electrodes` region of an `Electric
    - SpikeGadgets: per-sample packets, the direct use of selections. The same rule covers Blackrock PTP files.
    - Intan: the split-file modes are plain binaries; the header-attached mode is the first format with one chunk per record per channel, which EDF, Neuralynx, and Open Ephys legacy reuse.
    - A raw-binary generator taking offset, dtype, and channel count covers WhiteMatter, CellExplorer, and 16-bit WAV in a few lines each.
-5. Readers and hosting: selections in the JavaScript and MATLAB readers, and where source files live.
+5. Readers and hosting. Done: a JavaScript store for zarrita.js in `js/`, which reads everything the Python store reads, selections included, and is tested against files the Python package writes. It read two NWB files from DANDI in Node and in Chrome with the same values as Python. Remaining: the hdmf-zarr conventions (links, object references, compound types) for JavaScript, which belong in a package of their own; selections in the MATLAB reader; and where source files live.
 6. Propose the bridge as a NeuroConv backend.
 
 ## Source Formats
