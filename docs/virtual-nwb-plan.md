@@ -107,8 +107,11 @@ A column permutation needs no selection: the `electrodes` region of an `Electric
 
    NEO maps Intan's files by their resolved paths, so for a recording reached through links, as in a datalad dataset, a memory map names the link's target. The references use the recording's own paths, which the tests check for all three readers.
 
-   Remaining, in this order:
-   - EDF, Neuralynx, and Open Ephys legacy, which store samples in records and can reuse `VirtualArray.blocks`.
+   Also done: Neuralynx, Open Ephys legacy, and EDF, with `VirtualArray.blocks`. Neuralynx and Open Ephys keep a file for each channel, in records of 512 and 1024 samples, so a stream is a stack of per-channel arrays with one chunk per record. NEO reads EDF through pyedflib, which has no memory map to look at, so the layout is read from the EDF header: signals of one rate that are next to one another in a data record become one transposed chunk per record, and others one chunk per record each. Checked against NEO on ten Neuralynx, three Open Ephys, and eight EDF recordings on GIN, and against NeuroConv for Open Ephys and EDF. Refused: an Open Ephys recording with gaps (NEO fills them with zeros at positions that follow the timestamps), discontinuous EDF+, and BDF.
+
+   Neuralynx through NeuroConv is refused in the usual case. With inverted input NEO reports a negative gain, and SpikeInterface negates the samples and keeps the gain positive, so NeuroConv writes values the file does not hold. A virtual file could reference the stored values and negate `conversion`, which gives the same voltages in a file that differs from NeuroConv's. That is a decision about the bridge, not about the format.
+
+   Remaining:
    - A raw-binary generator taking offset, dtype, and channel count covers WhiteMatter, CellExplorer, and 16-bit WAV in a few lines each.
 5. Readers and hosting. Done: a JavaScript store for zarrita.js in `js/`, which reads everything the Python store reads, selections included, and is tested against files the Python package writes. It read two NWB files from DANDI in Node and in Chrome with the same values as Python. Remaining: the hdmf-zarr conventions (links, object references, compound types) for JavaScript, which belong in a package of their own; selections in the MATLAB reader; and where source files live.
 6. Propose the bridge as a NeuroConv backend.

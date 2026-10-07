@@ -38,6 +38,7 @@ virtualizarr = [
 ]
 dev = [
     "neo>=0.14",
+    "pyedflib",
     "pytest",
     "pynwb",
     "hdmf-zarr>=0.14.0",

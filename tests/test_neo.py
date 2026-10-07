@@ -1,5 +1,7 @@
 """Tests for the NEO raw reader generator."""
 
+import os
+
 import numpy as np
 import pytest
 
@@ -11,7 +13,7 @@ from neo.rawio.baserawio import (  # noqa: E402
     _signal_stream_dtype,
 )
 
-from zarrshadow import generate_rfs_neo, open_rfs, write_rfs  # noqa: E402
+from zarrshadow import RfsBuilder, generate_rfs_neo, open_rfs, write_rfs  # noqa: E402
 
 
 def _columns(spec):
@@ -164,3 +166,114 @@ def test_unsupported_layout(tmp_path):
     reader.desc[(0, "main")]["order"] = "F"
     with pytest.raises(NotImplementedError, match="C order"):
         generate_rfs_neo(reader)
+
+
+def _write_edf(path, signals, n_records):
+    """A minimal EDF file. signals maps each label to its samples, with the same number in every record."""
+
+    def field(value, width):
+        return str(value).ljust(width).encode("ascii")
+
+    per_record = {label: len(values) // n_records for label, values in signals.items()}
+    n = len(signals)
+    header = field("0", 8) + field("", 80) + field("", 80) + field("01.01.26", 8) + field("00.00.00", 8)
+    header += field(256 * (n + 1), 8) + field("", 44) + field(n_records, 8) + field(1, 8) + field(n, 4)
+    for values, width in [
+        (list(signals), 16),
+        ([""] * n, 80),
+        (["uV"] * n, 8),
+        ([-1000] * n, 8),
+        ([1000] * n, 8),
+        ([-32768] * n, 8),
+        ([32767] * n, 8),
+        ([""] * n, 80),
+        (list(per_record.values()), 8),
+        ([""] * n, 32),
+    ]:
+        header += b"".join(field(value, width) for value in values)
+    records = b"".join(
+        np.asarray(values[r * per_record[label] : (r + 1) * per_record[label]], dtype="<i2").tobytes()
+        for r in range(n_records)
+        for label, values in signals.items()
+    )
+    with open(path, "wb") as f:
+        f.write(header + records)
+
+
+class _EdfReader:
+    """What _edf_stream uses of NEO's EDF reader: the file, and which signals each stream holds."""
+
+    def __init__(self, filename, streams, sizes):
+        self.filename, self.stream_idx_to_chidx, self._sizes = filename, streams, sizes
+        self.header = {"signal_streams": np.array([(str(i),) for i in streams], dtype=[("id", "U8")])}
+
+    def get_signal_size(self, block_index, seg_index, stream_index):
+        return self._sizes[stream_index]
+
+
+def test_edf_layout(tmp_path):
+    """Signals of one rate that are apart in a record, and annotation channels, which the library skips."""
+    from zarrshadow.neo_rawio import _edf_signals, _edf_stream
+
+    rng = np.random.default_rng(14)
+    n_records = 6
+    signals = {
+        "fast 1": rng.integers(-3000, 3000, 40 * n_records),
+        "slow 1": rng.integers(-3000, 3000, 5 * n_records),
+        "EDF Annotations": np.zeros(10 * n_records, dtype=int),
+        "fast 2": rng.integers(-3000, 3000, 40 * n_records),
+        "fast 3": rng.integers(-3000, 3000, 40 * n_records),
+        "slow 2": rng.integers(-3000, 3000, 5 * n_records),
+    }
+    path = str(tmp_path / "recording.edf")
+    _write_edf(path, signals, n_records)
+
+    header_size, record_size, count, layout = _edf_signals(path)
+    assert (header_size, record_size, count) == (256 * 7, 2 * (40 + 5 + 10 + 40 + 40 + 5), n_records)
+    assert layout[3] == ("fast 2", 40, 2 * 55)
+
+    # NEO numbers the signals without the annotations: fast 1, slow 1, fast 2, fast 3, slow 2
+    reader = _EdfReader(path, {0: np.array([0, 2, 3]), 1: np.array([1, 4]), 2: np.array([2, 3])}, [240, 30, 240])
+
+    def read(stream):
+        array = _edf_stream(reader, 0, 0, str(stream), lambda p: p, 2**20)
+        builder = RfsBuilder()
+        builder.add_group("")
+        array.add_to(builder, "data")
+        return array, open_rfs(builder.build())["data"][...]
+
+    # Apart in the record: a chunk for each record of each signal
+    array, values = read(0)
+    assert array.chunk_shape == (40, 1) and [c["name"] for c in array.codecs] == ["bytes"]
+    np.testing.assert_array_equal(values, np.stack([signals["fast 1"], signals["fast 2"], signals["fast 3"]], axis=1))
+    array, values = read(1)
+    np.testing.assert_array_equal(values, np.stack([signals["slow 1"], signals["slow 2"]], axis=1))
+    # Next to one another: one chunk for each record, channels by samples, transposed
+    array, values = read(2)
+    assert array.chunk_shape == (40, 2) and [c["name"] for c in array.codecs] == ["transpose", "bytes"]
+    np.testing.assert_array_equal(values, np.stack([signals["fast 2"], signals["fast 3"]], axis=1))
+
+    with open(path, "r+b") as f:
+        f.seek(192)
+        f.write(b"EDF+D")
+    with pytest.raises(NotImplementedError, match="discontinuous"):
+        _edf_signals(path)
+
+
+def test_own_path_of_a_linked_file(tmp_path):
+    """A memory map of a link can name the link's target. The recording's own path is found again."""
+    from zarrshadow.neo_rawio import _own_path
+
+    store, recording = tmp_path / "store", tmp_path / "recording"
+    store.mkdir()
+    recording.mkdir()
+    (store / "object-1").write_bytes(b"\0" * 8)
+    (recording / "channel.dat").symlink_to(store / "object-1")
+    (recording / "plain.dat").write_bytes(b"\1" * 8)
+    resolved = os.path.realpath(recording / "channel.dat")
+    assert resolved.endswith("object-1")
+    assert _own_path(resolved, str(recording)) == str(recording / "channel.dat")
+    assert _own_path(str(recording / "plain.dat"), str(recording)) == os.path.realpath(recording / "plain.dat")
+    # A file that is not in the folder, or no folder to look in
+    assert _own_path(str(store / "other"), str(recording)) == str(store / "other")
+    assert _own_path(resolved, None) == resolved

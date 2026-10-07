@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import numpy as np
@@ -124,12 +124,16 @@ def virtual_arrays_neo(
     parameters are those of generate_rfs_neo. Only raw binary buffers are
     supported.
 
-    Three readers without the buffer description API are supported, through
-    the memory maps NEO reads them with: Blackrock, whose files hold one block
-    of samples per segment or one packet per sample; SpikeGadgets, whose
-    files hold one packet per sample; and Intan, in its three layouts. A
-    stream whose values NEO computes, such as Intan's digital channels, which
-    it unpacks from the bits of one word, has no array in the result.
+    Some readers without the buffer description API are supported, most of
+    them through the memory maps NEO reads them with: Blackrock, whose files
+    hold one block of samples per segment or one packet per sample;
+    SpikeGadgets, whose files hold one packet per sample; Intan, in its three
+    layouts; and Neuralynx, Open Ephys in its legacy format, and EDF, which
+    store records of a fixed number of samples. A stream whose values NEO
+    computes, such as Intan's digital channels, which it unpacks from the
+    bits of one word, has no array in the result. A recording whose values no
+    file holds, such as an Open Ephys one with gaps that NEO fills with zeros,
+    raises NotImplementedError.
     """
     if getattr(reader, "header", None) is None:
         reader.parse_header()
@@ -294,11 +298,165 @@ def _intan_stream(
     return stored.transpose(1, 0)
 
 
+def _own_path(resolved: str, directory: Any, known: dict[str, dict[str, str]] = {}) -> str:
+    """The path a recording's file has in its folder, given the path a memory map reports for it.
+
+    numpy resolves links when it is handed a Path, so for a recording reached
+    through links, as in a datalad dataset, a memory map names the link's
+    target. This looks the target up among the files of the recording's
+    folder. Files with the same content can share a target; either name then
+    leads to the same bytes.
+    """
+    if not directory or not os.path.isdir(directory):
+        return resolved
+    directory = os.path.abspath(str(directory))
+    if directory not in known:
+        known[directory] = {}
+        for folder, _, names in os.walk(directory):
+            for name in sorted(names, reverse=True):
+                path = os.path.join(folder, name)
+                known[directory][os.path.realpath(path)] = path
+    return known[directory].get(os.path.realpath(resolved), resolved)
+
+
+def _channels_in_records(
+    reader: Any,
+    records: Sequence[np.ndarray],
+    n_samples: int,
+    url_for: Callable[[str], str],
+) -> VirtualArray:
+    """Channels that are each in a file of their own, as records with a header and a fixed number of samples.
+
+    records holds, for each channel, the memory map of its records, which
+    have a field named samples. Each record becomes one chunk of one channel.
+    """
+    channels = []
+    for data in records:
+        resolved, start, _ = memmap_location(data)
+        samples, at = data.dtype.fields["samples"][:2]
+        channels.append(
+            VirtualArray.blocks(
+                url_for(_own_path(resolved, getattr(reader, "dirname", None))),
+                shape=(n_samples,),
+                chunk_shape=(int(np.prod(samples.shape)),),
+                dtype=samples.base,
+                record_size=data.dtype.itemsize,
+                offset=start + at,
+                file_size=os.path.getsize(resolved),
+            )
+        )
+    return stack(channels, axis=1)
+
+
+def _openephys_stream(
+    reader: Any, block: int, seg: int, stream_id: str, url_for: Callable[[str], str], chunk_bytes: int
+) -> VirtualArray:
+    """One stream of an Open Ephys recording in the legacy format: a .continuous file for each channel.
+
+    A file holds records of 1024 big-endian samples, each with a header and a
+    trailer. Where records are missing, NEO fills the gap with zeros, at
+    positions that follow the timestamps and so need not fall on a record.
+    Such a recording cannot be referenced.
+    """
+    if reader._gap_mode:
+        raise NotImplementedError(
+            "This Open Ephys recording has gaps between its records, which NEO fills with values no file holds"
+        )
+    (indexes,) = np.nonzero(reader.header["signal_channels"]["stream_id"] == stream_id)
+    records = [reader._sigs_memmap[seg][int(index)] for index in indexes]
+    return _channels_in_records(reader, records, int(reader._sig_length[seg]), url_for)
+
+
+def _neuralynx_stream(
+    reader: Any, block: int, seg: int, stream_id: str, url_for: Callable[[str], str], chunk_bytes: int
+) -> VirtualArray:
+    """One stream of a Neuralynx recording: an .ncs file for each channel, in records of 512 samples."""
+    channels = reader.header["signal_channels"]
+    channels = channels[channels["stream_id"] == stream_id]
+    stream_index = [str(s) for s in reader.header["signal_streams"]["id"]].index(stream_id)
+    n_samples = int(reader.get_signal_size(block_index=block, seg_index=seg, stream_index=stream_index))
+    records = [reader._sigs_memmaps[seg][(name, uid)] for name, uid in zip(channels["name"], channels["id"])]
+    return _channels_in_records(reader, records, n_samples, url_for)
+
+
+def _edf_signals(path: str) -> tuple[int, int, int, list[tuple[str, int, int]]]:
+    """Where an EDF file keeps its signals.
+
+    Returns the size of the header, the size of a data record, the number of
+    records, and for each signal its label, its number of samples in a
+    record, and where those samples start within the record. A record holds
+    the signals one after another, each as 16-bit little-endian integers.
+    """
+    with open(path, "rb") as f:
+        fixed = f.read(256)
+        if fixed[:1] != b"0":
+            raise NotImplementedError(f"{path} is not an EDF file with 16-bit samples (a BDF file has 24-bit ones)")
+        if fixed[192:197] == b"EDF+D":
+            raise NotImplementedError(f"{path} is a discontinuous EDF+ file, whose records are not consecutive in time")
+        header_size, n_records, n_signals = int(fixed[184:192]), int(fixed[236:244]), int(fixed[252:256])
+        per_signal = f.read(256 * n_signals)
+    labels = [per_signal[16 * i : 16 * (i + 1)].decode("latin-1").strip() for i in range(n_signals)]
+    counts_at = (16 + 80 + 8 + 8 + 8 + 8 + 8 + 80) * n_signals
+    counts = [int(per_signal[counts_at + 8 * i : counts_at + 8 * (i + 1)]) for i in range(n_signals)]
+    record_size = 2 * sum(counts)
+    if n_records < 0:  # not filled in by the recorder
+        n_records = (os.path.getsize(path) - header_size) // record_size
+    starts = [2 * sum(counts[:i]) for i in range(n_signals)]
+    return header_size, record_size, n_records, list(zip(labels, counts, starts))
+
+
+def _edf_stream(
+    reader: Any, block: int, seg: int, stream_id: str, url_for: Callable[[str], str], chunk_bytes: int
+) -> VirtualArray:
+    """One stream of an EDF file: the signals that share a sampling rate.
+
+    NEO reads EDF through a library, so the layout is read from the file's
+    header here. A data record holds, for each signal in turn, its samples for
+    the record's duration. Signals that are next to one another in a record
+    become one chunk per record, channels by samples, which is transposed.
+    Others become one chunk per record each.
+    """
+    path = str(reader.filename)
+    header_size, record_size, n_records, signals = _edf_signals(path)
+    # The library numbers the signals without the annotation channels
+    signals = [signal for signal in signals if signal[0] != "EDF Annotations"]
+    stream_index = [str(s) for s in reader.header["signal_streams"]["id"]].index(stream_id)
+    chosen = [signals[int(i)] for i in reader.stream_idx_to_chidx[stream_index]]
+    per_record = chosen[0][1]
+    if any(count != per_record for _, count, _ in chosen):
+        raise NotImplementedError(f"The signals of stream {stream_id!r} do not have the same number of samples in a record")
+    n_samples = int(reader.get_signal_size(block_index=block, seg_index=seg, stream_index=stream_index))
+    if n_samples > n_records * per_record:
+        raise NotImplementedError(f"{path} holds fewer records than its header says")
+    kwargs = {"dtype": "<i2", "record_size": record_size, "file_size": os.path.getsize(path)}
+    starts = [start for _, _, start in chosen]
+    if starts == [starts[0] + 2 * per_record * i for i in range(len(chosen))]:
+        stored = VirtualArray.blocks(
+            url_for(path),
+            shape=(len(chosen), n_samples),
+            chunk_shape=(len(chosen), per_record),
+            offset=header_size + starts[0],
+            axis=1,
+            **kwargs,
+        )
+        return stored.transpose(1, 0)
+    channels = [
+        VirtualArray.blocks(
+            url_for(path), shape=(n_samples,), chunk_shape=(per_record,), offset=header_size + start, **kwargs
+        )
+        for start in starts
+    ]
+    return stack(channels, axis=1)
+
+
 # For NEO readers without the buffer description API: how to find a stream's samples in the files.
 # A function returns None for a stream that cannot be referenced.
 _STREAM_ARRAYS: dict[str, Callable[..., VirtualArray | None]] = {
     "BlackrockRawIO": _blackrock_stream,
+    "EDFRawIO": _edf_stream,
     "IntanRawIO": _intan_stream,
+    "NeuralynxRawIO": _neuralynx_stream,
+    "OpenEphysRawIO": _openephys_stream,
     "SpikeGadgetsRawIO": _spikegadgets_stream,
 }
 
