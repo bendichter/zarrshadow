@@ -340,15 +340,39 @@ class TestBasicRoundtrip:
         result = arr[:]
         np.testing.assert_array_equal(result, expected)
 
-    def test_compound_structured_data_type(self):
-        """Compound datasets use zarr v3 structured data_type (no _COMPOUND_DTYPE)."""
+    def test_compound_struct_data_type(self):
+        """Compound datasets use the zarr v3 struct data_type (no _COMPOUND_DTYPE)."""
         meta = json.loads(self.rfs["refs"]["acquisition/compound_small/zarr.json"])
         assert "_COMPOUND_DTYPE" not in meta["attributes"]
-        assert meta["data_type"]["name"] == "structured"
+        assert meta["data_type"]["name"] == "struct"
         assert meta["data_type"]["configuration"]["fields"] == [
-            ["x", "int32"],
-            ["y", "float64"],
+            {"name": "x", "data_type": "int32"},
+            {"name": "y", "data_type": "float64"},
         ]
+
+    def test_compound_under_the_earlier_name(self):
+        """References written before struct was registered, with the name structured, still read."""
+        import copy
+
+        rfs = copy.deepcopy(self.rfs)
+        renamed = 0
+        for key, value in rfs["refs"].items():
+            if not key.endswith("zarr.json"):
+                continue
+            meta = json.loads(value)
+            if isinstance(meta.get("data_type"), dict) and meta["data_type"].get("name") == "struct":
+                fields = meta["data_type"]["configuration"]["fields"]
+                meta["data_type"] = {
+                    "name": "structured",
+                    "configuration": {"fields": [[f["name"], f["data_type"]] for f in fields]},
+                }
+                rfs["refs"][key] = json.dumps(meta)
+                renamed += 1
+        assert renamed >= 3
+        for name in ("compound_small", "compound_contiguous", "compound_with_refs"):
+            np.testing.assert_array_equal(
+                open_rfs(rfs)[f"acquisition/{name}"][:], open_rfs(self.rfs)[f"acquisition/{name}"][:]
+            )
 
     def test_compound_mixed_inline(self):
         """Compound with int, float, and fixed-length string round-trips (inlined)."""
@@ -444,7 +468,7 @@ class TestBasicRoundtrip:
         """Compound with refs has _REFERENCE_FIELDS attribute."""
         meta = json.loads(self.rfs["refs"]["acquisition/compound_with_refs/zarr.json"])
         assert meta["attributes"]["_REFERENCE_FIELDS"] == ["target"]
-        assert meta["data_type"]["name"] == "structured"
+        assert meta["data_type"]["name"] == "struct"
 
     def test_write_and_read_json(self):
         """RFS can be written to JSON and read back."""

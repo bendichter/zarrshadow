@@ -213,7 +213,7 @@ def _process_dataset(
     chunks = [max(c, 1) for c in chunks]  # Zarr doesn't allow zero-size chunks
 
     if ds.dtype.kind == "V" and ds.dtype.fields is not None:
-        # Compound: zarr v3's structured data_type carries the fields
+        # Compound: zarr v3's struct data_type carries the fields
         data_type: str | dict = _compound_dtype_to_zarr_v3(ds.dtype)
         fill_value = _encode_compound_fill_value(ds.dtype)
     else:
@@ -511,7 +511,13 @@ def _numpy_dtype_to_zarr_v3(dtype: np.dtype) -> str:
 
 
 def _compound_dtype_to_zarr_v3(dtype: np.dtype) -> dict:
-    """Convert a numpy structured dtype to a zarr v3 structured data_type dict."""
+    """Convert a numpy structured dtype to a zarr v3 struct data_type dict.
+
+    struct is the registered data type for records of named fields
+    (https://github.com/zarr-developers/zarr-extensions/tree/main/data-types/struct).
+    Its earlier name, structured, with fields as [name, type] pairs, may be
+    read but is not to be written.
+    """
     fields = []
     for field_name in dtype.names:
         field_dtype = dtype[field_name]
@@ -528,10 +534,10 @@ def _compound_dtype_to_zarr_v3(dtype: np.dtype) -> dict:
             }
         else:
             zarr_type = _numpy_dtype_to_zarr_v3(field_dtype)
-        fields.append([field_name, zarr_type])
+        fields.append({"name": field_name, "data_type": zarr_type})
 
     return {
-        "name": "structured",
+        "name": "struct",
         "configuration": {"fields": fields},
     }
 
@@ -645,7 +651,7 @@ def _add_dtype_attrs(refs: dict) -> None:
     """Set the _DTYPE attribute on every non-compound array, as hdmf-zarr does.
 
     Values follow hdmf-zarr: the numpy type name for numeric arrays and "str"
-    for strings. Compound arrays carry their fields in the structured
+    for strings. Compound arrays carry their fields in the struct
     data_type and get no _DTYPE. Arrays that already have one (object
     references) are left alone.
     """
