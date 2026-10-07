@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 
-import { arrayPath, evaluate, Generator, ReferenceStore, render, Selection } from "../src/index.js";
+import { arrayPath, evaluate, Generator, itemSize, ReferenceStore, render, Selection } from "../src/index.js";
 
 describe("gen expressions", () => {
   test("integer arithmetic with Python's floor division and modulo", () => {
@@ -102,6 +102,23 @@ test("arrayPath", () => {
   for (const key of ["a/b/zarr.json", "zarr.json", "a/c", "a/c/", "a/c/x", "abc/0"]) {
     expect(arrayPath(key), key).toBeUndefined();
   }
+});
+
+test("itemSize", () => {
+  expect(itemSize("int16")).toBe(2);
+  expect(itemSize("float64")).toBe(8);
+  expect(itemSize("string")).toBeUndefined();
+  const text = { name: "fixed_length_utf32", configuration: { length_bytes: 12 } };
+  // struct, and the same type under its earlier name, with fields as pairs
+  const struct = {
+    name: "struct",
+    configuration: { fields: [{ name: "x", data_type: "int32" }, { name: "y", data_type: "float64" }, { name: "label", data_type: text }] },
+  };
+  const structured = { name: "structured", configuration: { fields: [["x", "int32"], ["y", "float64"], ["label", text]] } };
+  expect(itemSize(struct)).toBe(24);
+  expect(itemSize(structured)).toBe(24);
+  expect(itemSize({ name: "struct", configuration: { fields: [{ name: "inner", data_type: struct }, { name: "z", data_type: "uint8" }] } })).toBe(25);
+  expect(itemSize({ name: "struct", configuration: { fields: [{ name: "s", data_type: "string" }] } })).toBeUndefined();
 });
 
 describe("ReferenceStore", () => {

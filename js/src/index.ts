@@ -5,6 +5,7 @@ export { evaluate, type FileRef, type GenEntry, Generator, render } from "./gen.
 export { Selection } from "./selection.js";
 export {
   arrayPath,
+  itemSize,
   type Ref,
   type ReferenceFileSystem,
   ReferenceStore,

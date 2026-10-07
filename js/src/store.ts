@@ -97,14 +97,21 @@ function bounds(range: RangeQuery, total: number): [number, number] {
   return [clamp(range.offset), clamp(range.offset + range.length)];
 }
 
-function itemSize(dataType: unknown): number | undefined {
+/**
+ * The size in bytes of one value of a data type, if it is one whose short
+ * chunks are padded. A struct lists its fields as objects; its earlier name,
+ * structured, lists them as [name, type] pairs.
+ */
+export function itemSize(dataType: unknown): number | undefined {
   if (typeof dataType === "string") return ITEM_SIZES[dataType];
-  const structured = dataType as { name?: string; configuration?: { fields?: [string, unknown][] } };
-  if (structured?.name !== "structured" || !structured.configuration?.fields) return undefined;
+  const type = dataType as { name?: string; configuration?: { fields?: unknown[]; length_bytes?: number } };
+  if (type?.name === "null_terminated_bytes" || type?.name === "fixed_length_utf32") {
+    return type.configuration?.length_bytes;
+  }
+  if ((type?.name !== "struct" && type?.name !== "structured") || !type.configuration?.fields) return undefined;
   let total = 0;
-  for (const [, field] of structured.configuration.fields) {
-    const sized = field as { configuration?: { length_bytes?: number } };
-    const size = typeof field === "string" ? ITEM_SIZES[field] : sized.configuration?.length_bytes;
+  for (const field of type.configuration.fields) {
+    const size = itemSize(Array.isArray(field) ? field[1] : (field as { data_type?: unknown }).data_type);
     if (size === undefined) return undefined;
     total += size;
   }
