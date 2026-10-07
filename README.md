@@ -481,18 +481,36 @@ cache = LocalCache(max_size_bytes=500_000_000)  # 500 MB cap
 
 ## Request merging
 
-When reading a multi-chunk slice, zarrshadow automatically merges nearby HTTP Range requests into fewer, larger fetches. For example, reading 10 contiguous chunks from a remote file may result in a single HTTP request instead of 10.
+zarr asks for the chunks of a selection at the same time. `RfsStore` fetches small chunks of a remote file that are close together in one request, so a recording stored in records of a few kilobytes does not cost a request for each record.
 
-Two parameters control the merging behavior:
+Three parameters control it:
 
-- `merge_gap`: maximum gap in bytes between two ranges to merge (default 256 KB)
-- `max_merge_size`: maximum size of a single merged request (default 50 MB)
+- `merge_gap`: chunks are merged when the gap between them is at most this many bytes (default 32 KiB)
+- `max_merge_size`: the most bytes one merged request asks for (default 1 MiB); 0 turns merging off
+- `merge_below`: only chunks of at most this many bytes are merged (default 64 KiB)
 
 ```python
-root = open_rfs("example.zarrshadow.json", merge_gap=1_000_000, max_merge_size=100_000_000)
+root = open_rfs("example.zarrshadow.json", merge_gap=100_000, max_merge_size=4 * 2**20)
 ```
 
-Set `merge_gap=0` to disable merging and fetch every chunk individually.
+zarr reads at most 10 chunks at a time by default, which is also the most that can share a request. For files with small chunks, raise the limit:
+
+```python
+zarr.config.set({"async.concurrency": 100})
+```
+
+Larger chunks are left alone because merging them is slower. These are timings of two reads from a file on DANDI (medians of three, October 2026). The small chunks are 2 kB each, laid out like the records of an Open Ephys file. The large ones are the compressed chunks of an LFP recording.
+
+| Read | `async.concurrency` | Merging | Requests | Time |
+|---|---|---|---|---|
+| 300 chunks of 2 kB | 10 | off | 300 | 1.93 s |
+| | 10 | on | 30 | 1.93 s |
+| | 100 | off | 300 | 1.41 s |
+| | 100 | on | 3 | 0.37 s |
+| 82 chunks of 100 kB | 10 | off or on | 82 | 0.6 to 0.7 s |
+| | 100 | off or on | 82 | 1.6 to 1.8 s |
+
+With every chunk of the LFP read merged into requests of up to 1 MiB, an earlier version took 1.7 s where separate requests took 1.4 s, which is why `merge_below` exists.
 
 ## Architecture
 
