@@ -286,7 +286,17 @@ packets = np.memmap(path, dtype=[("header", "u1", 13), ("samples", "<i2", 64)], 
 signal = VirtualArray.from_memmap(packets["samples"])
 ```
 
-`virtual_arrays_neo(reader)` returns one `VirtualArray` for each signal stream of a NEO reader, holding only that stream's channels, with the stream's sampling rate and channel information in `attributes`. `generate_rfs_neo` describes each buffer as the file stores it. `virtual_arrays_neo` also covers Blackrock and SpikeGadgets, whose NEO readers do not describe their buffers but read them through memory maps.
+Other formats write a header and then a fixed number of samples, over and over. `VirtualArray.blocks` describes those: each record of the file holds one chunk of the array. Where a record holds each channel's samples together, the block is channels by samples, and transposing the result gives samples by channels.
+
+```python
+# Records of 24372 bytes, each holding 60 samples of 192 channels, one channel after another
+stored = VirtualArray.blocks(
+    path, shape=[192, n_samples], chunk_shape=[192, 60], dtype="uint16", record_size=24372, offset=first_block, axis=1
+)
+signal = stored.transpose(1, 0)
+```
+
+`virtual_arrays_neo(reader)` returns one `VirtualArray` for each signal stream of a NEO reader, holding only that stream's channels, with the stream's sampling rate and channel information in `attributes`. `generate_rfs_neo` describes each buffer as the file stores it. `virtual_arrays_neo` also covers Blackrock, SpikeGadgets, and Intan, whose NEO readers do not describe their buffers but read them through memory maps. Intan's digital channels and stimulation current are left out, because NEO computes their values from the stored words. An Intan file that holds blocks after its header gets one chunk for each block of 60 or 128 samples, so reading it makes many small requests.
 
 ## Virtual NWB Files
 
@@ -340,7 +350,7 @@ write_virtual_nwb(nwbfile, "session.nwb.zarrshadow")
 
 For electrophysiology it covers recordings that SpikeInterface reads through a NEO reader that `virtual_arrays_neo` supports. For imaging it covers roiextractors' TIFF extractors (plain TIFF stacks, ScanImage, Thor, Micro-Manager, and Bruker with one file per frame), which keep a table of the page that holds each frame, and its HDF5 extractor. Each TIFF page becomes one chunk, and the frames are transposed into the (frame, width, height) order NeuroConv writes. Anything else raises `NotVirtualizable`: compressed TIFF pages, frames cropped out of a page, Bruker volumes, and readers that do not say where their data is. With `strict=False` those are left for NeuroConv to copy.
 
-Continuous integration compares the result with NeuroConv's own conversion on GIN data, for SpikeGLX (AP band and NIDQ), Open Ephys binary, Neuroscope, MCS raw, Blackrock, SpikeGadgets, a TIFF stack, ScanImage (single and two channels, planes, and volumes), an HDF5 movie, Bruker, Thor, and Micro-Manager. Every dataset is equal except the file's creation time.
+Continuous integration compares the result with NeuroConv's own conversion on GIN data, for SpikeGLX (AP band and NIDQ), Open Ephys binary, Neuroscope, MCS raw, Blackrock, SpikeGadgets, Intan, a TIFF stack, ScanImage (single and two channels, planes, and volumes), an HDF5 movie, Bruker, Thor, and Micro-Manager. Every dataset is equal except the file's creation time.
 
 This is experimental. As of October 2026, SpikeInterface requires `zarr<3` and zarrshadow needs Zarr v3, so NeuroConv and zarrshadow install together only with that requirement overridden (`uv pip install --override`), and NeuroConv 0.10 reads `zarr.codec_registry` at import, which Zarr v3 removed. `tests/test_neuroconv_bridge.py` shows the environment and the one-line workaround.
 

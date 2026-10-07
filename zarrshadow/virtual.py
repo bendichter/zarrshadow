@@ -162,6 +162,55 @@ class VirtualArray:
         )
 
     @staticmethod
+    def blocks(
+        url: str,
+        *,
+        shape: Sequence[int],
+        chunk_shape: Sequence[int],
+        dtype: Any,
+        record_size: int,
+        offset: int = 0,
+        axis: int = 0,
+        file_size: int | None = None,
+        attributes: dict | None = None,
+    ) -> VirtualArray:
+        """An uncompressed array stored a block at a time, with other bytes between the blocks.
+
+        The file holds records of record_size bytes, and each record holds
+        one chunk of the array: chunk i along axis is at offset + i *
+        record_size, in C order. A chunk spans the array along every other
+        axis. Formats that write a header and then a fixed number of samples,
+        over and over, are like this.
+
+        Where a record holds each channel's samples together, the block is
+        channels by samples. Describe it that way and transpose the result:
+
+            blocks(url, shape=(n_channels, n_samples), chunk_shape=(n_channels, 60),
+                   dtype="uint16", record_size=24372, offset=16466, axis=1).transpose(1, 0)
+
+        Unlike records, whose rows can be sliced, this array can only be
+        indexed by whole chunks.
+
+        Parameters
+        ----------
+        url : str
+            The file's URL or local path.
+        shape, chunk_shape : sequence of int
+            The array's shape and the shape of the block one record holds.
+        dtype : numpy dtype
+            The values' type, with their byte order.
+        record_size : int
+            The distance in the file from one block to the next, in bytes.
+        offset : int
+            Where the first block starts in the file.
+        axis : int
+            The axis the blocks follow one another along.
+        file_size : int or None
+            The file's size, if known, to check that the blocks fit in it.
+        """
+        return _Blocks(url, shape, chunk_shape, np.dtype(dtype), record_size, offset, axis, file_size, attributes)
+
+    @staticmethod
     def from_memmap(
         array: np.ndarray,
         *,
@@ -690,6 +739,57 @@ class _Listed(VirtualArray):
 
     def _add_chunks(self, builder: RfsBuilder, path: str, place: _Place) -> None:
         _add_listed_chunks(builder, path, place, self._chunks, self.shape, self.chunk_shape)
+
+
+class _Blocks(VirtualArray):
+    """An uncompressed array whose chunks are evenly spaced in one file along one axis."""
+
+    def __init__(
+        self,
+        url: str,
+        shape: Sequence[int],
+        chunk_shape: Sequence[int],
+        dtype: np.dtype,
+        record_size: int,
+        offset: int,
+        axis: int,
+        file_size: int | None,
+        attributes: dict | None,
+    ) -> None:
+        self.shape = tuple(int(n) for n in shape)
+        self.chunk_shape = tuple(int(n) for n in chunk_shape)
+        if len(self.shape) != len(self.chunk_shape) or any(c < 1 for c in self.chunk_shape):
+            raise ValueError(f"chunk_shape {self.chunk_shape} does not fit an array of shape {self.shape}")
+        if not 0 <= axis < len(self.shape):
+            raise ValueError(f"axis {axis} is not one of the array's {len(self.shape)} axes")
+        if any(c < n for a, (c, n) in enumerate(zip(self.chunk_shape, self.shape)) if a != axis):
+            raise ValueError("A block must span the array along every axis but the one the blocks run along")
+        self._url, self._offset, self._axis = url, int(offset), axis
+        self._record_size = int(record_size)
+        self._chunk_bytes = int(np.prod(self.chunk_shape)) * dtype.itemsize
+        self._count = -(-self.shape[axis] // self.chunk_shape[axis])
+        if self._record_size < self._chunk_bytes:
+            raise ValueError(f"A block of {self._chunk_bytes} bytes does not fit in a record of {record_size}")
+        end = self._offset + (self._count - 1) * self._record_size + self._chunk_bytes
+        if file_size is not None and self._count and end > file_size:
+            raise ValueError(f"{self._count} blocks end at byte {end:,}, past the end of {url} ({file_size:,} bytes)")
+        self.data_type = zarr_data_type(dtype)
+        self.codecs = bytes_codecs(dtype)
+        self.attributes = dict(attributes or {})
+
+    def _add_chunks(self, builder: RfsBuilder, path: str, place: _Place) -> None:
+        coords: list[int | None] = [0] * self.ndim
+        coords[self._axis] = None
+        builder.add_strided_chunks(
+            path,
+            ndim=self.ndim,
+            url=self._url,
+            start=self._offset,
+            stride=self._record_size,
+            length=self._chunk_bytes,
+            count=self._count,
+            coords=place(coords),
+        )
 
 
 class _Transposed(VirtualArray):

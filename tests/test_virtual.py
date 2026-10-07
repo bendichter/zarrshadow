@@ -450,6 +450,66 @@ def test_from_memmap(packets, tmp_path):
         VirtualArray.from_memmap(view[:, ::2])
 
 
+def test_blocks(tmp_path):
+    """Records that each hold a block of samples, with every channel's samples together."""
+    n_channels, per_block, n_blocks = 4, 30, 25
+    x = np.random.default_rng(13).integers(0, 60_000, (n_blocks * per_block, n_channels)).astype("<u2")
+    record = np.dtype([("time", "<i4", per_block), ("samples", "<u2", (n_channels, per_block)), ("other", "u1", 7)])
+    records = np.zeros(n_blocks, dtype=record)
+    records["samples"] = x.reshape(n_blocks, per_block, n_channels).transpose(0, 2, 1)
+    records["time"], records["other"] = 5, 9
+    path = tmp_path / "blocks.bin"
+    path.write_bytes(b"HEAD" * 10 + records.tobytes())
+    start = 40 + record.fields["samples"][1]
+
+    stored = VirtualArray.blocks(
+        str(path),
+        shape=(n_channels, n_blocks * per_block),
+        chunk_shape=(n_channels, per_block),
+        dtype="<u2",
+        record_size=record.itemsize,
+        offset=start,
+        axis=1,
+        file_size=path.stat().st_size,
+    )
+    np.testing.assert_array_equal(_read(stored), x.T)
+    # The blocks are channels by samples; transposed, a chunk is one block of samples by channels
+    signal = stored.transpose(1, 0)
+    assert signal.shape == (750, 4) and signal.chunk_shape == (30, 4)
+    assert [codec["name"] for codec in signal.codecs] == ["transpose", "bytes"]
+    np.testing.assert_array_equal(_read(signal), x)
+    rfs = _rfs_without_sources(signal)
+    # One entry describes every block, and no bytes outside the samples are read
+    assert rfs["gen"] == [
+        {
+            "key": "data/c/{{i}}/0",
+            "url": str(path),
+            "offset": "{{%d + i * %d}}" % (start, record.itemsize),
+            "length": str(n_channels * per_block * 2),
+            "dimensions": {"i": {"stop": n_blocks}},
+        }
+    ]
+    assert "selections" not in rfs
+    # Whole blocks can be taken
+    np.testing.assert_array_equal(_read(signal[60:150]), x[60:150])
+
+    # Along the first axis, with one value in a block for each channel
+    rows = VirtualArray.blocks(
+        str(path), shape=(n_blocks, per_block), chunk_shape=(1, per_block), dtype="<i4", record_size=record.itemsize, offset=40
+    )
+    np.testing.assert_array_equal(_read(rows), np.full((n_blocks, per_block), 5))
+
+    kwargs = {"dtype": "<u2", "record_size": record.itemsize, "offset": start, "axis": 1}
+    with pytest.raises(ValueError, match="must span the array along every axis"):
+        VirtualArray.blocks(str(path), shape=(4, 750), chunk_shape=(2, 30), **kwargs)
+    with pytest.raises(ValueError, match="does not fit in a record"):
+        VirtualArray.blocks(str(path), shape=(4, 750), chunk_shape=(4, 30), **{**kwargs, "record_size": 100})
+    with pytest.raises(ValueError, match="past the end of"):
+        VirtualArray.blocks(
+            str(path), shape=(4, 780), chunk_shape=(4, 30), file_size=path.stat().st_size, **kwargs
+        )
+
+
 def _rfs_without_sources(virtual):
     builder = RfsBuilder()
     builder.add_group("")
