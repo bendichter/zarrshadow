@@ -524,11 +524,13 @@ class RfsStore(Store):
             return None
 
         if isinstance(data_type, dict):
-            if data_type.get("name") == "structured":
-                fields = data_type["configuration"]["fields"]
-                dtype = np.dtype([
-                    (f[0], _zarr_field_type_to_numpy(f[1])) for f in fields
-                ])
+            if data_type.get("name") in ("struct", "structured"):
+                # struct lists its fields as objects; structured, its earlier name, as pairs
+                fields = [
+                    (f["name"], f["data_type"]) if isinstance(f, dict) else (f[0], f[1])
+                    for f in data_type["configuration"]["fields"]
+                ]
+                dtype = np.dtype([(name, _zarr_field_type_to_numpy(field)) for name, field in fields])
             else:
                 return None
         elif isinstance(data_type, str):
