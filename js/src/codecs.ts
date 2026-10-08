@@ -23,6 +23,6 @@ class Fletcher32Codec {
  */
 export function registerCodecs(): void {
   // zarrita types its registry for its own codecs
-  const codecs = registry as Map<string, () => any>;
+  const codecs = registry as unknown as Map<string, () => unknown>;
   if (!codecs.has("numcodecs.fletcher32")) codecs.set("numcodecs.fletcher32", () => Fletcher32Codec);
 }

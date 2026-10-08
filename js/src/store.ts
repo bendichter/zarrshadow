@@ -313,7 +313,7 @@ export class ReferenceStore implements AsyncReadable {
   #expandTemplates(location: string): string {
     if (!location.includes("{{") || !this.rfs.templates) return location;
     for (const [name, value] of Object.entries(this.rfs.templates)) {
-      location = location.replaceAll(`{{${name}}}`, value);
+      location = location.split(`{{${name}}}`).join(value);
     }
     return location;
   }
