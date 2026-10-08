@@ -217,6 +217,54 @@ describe("over HTTP", () => {
     ]);
   });
 
+  test("chunks that are close together in a file are fetched in one request", async () => {
+    const store = await ReferenceStore.fromUrl(`${base}/binary.zarrshadow`);
+    const whole = cases.find((c) => c.references === "binary.zarrshadow" && c.path === "whole") as Case;
+    requests.length = 0;
+    await expectValues(store, whole);
+    // 11 chunks of raw.bin, one after another from byte 100 to the end of the file
+    expect(requests).toEqual([{ url: "/raw.bin", range: "bytes=100-12207", ifMatch: undefined }]);
+
+    // Three files of one chunk each cannot be merged
+    const stacked = cases.find((c) => c.references === "binary.zarrshadow" && c.path === "stacked") as Case;
+    requests.length = 0;
+    await expectValues(store, stacked);
+    expect(requests.map((r) => r.url).sort()).toEqual(["/plane0.bin", "/plane1.bin", "/plane2.bin"]);
+  });
+
+  test("the gap and the size that requests are merged within", async () => {
+    const rfs = (await ReferenceStore.fromUrl(`${base}/binary.zarrshadow`)).rfs;
+    // whole/c/i/0 is 1200 bytes at 100 + 1200 * i
+    const keys = ["/whole/c/0/0", "/whole/c/1/0", "/whole/c/4/0", "/whole/c/5/0"] as const;
+    const read = async (options: object) => {
+      const store = new ReferenceStore(rfs, options);
+      requests.length = 0;
+      const chunks = await Promise.all(keys.map((key) => store.get(key)));
+      return { ranges: requests.map((r) => r.range).sort(), chunks };
+    };
+    const apart = await read({ maxMergeSize: 0 });
+    expect(apart.ranges).toEqual(["bytes=100-1299", "bytes=1300-2499", "bytes=4900-6099", "bytes=6100-7299"]);
+    // Chunks 1 and 4 are 2400 bytes apart
+    expect((await read({ mergeGap: 0 })).ranges).toEqual(["bytes=100-2499", "bytes=4900-7299"]);
+    expect((await read({ mergeGap: 2399 })).ranges).toEqual(["bytes=100-2499", "bytes=4900-7299"]);
+    expect((await read({ mergeGap: 2400 })).ranges).toEqual(["bytes=100-7299"]);
+    // By default, reads within 32 KiB of one another share a request of up to 1 MiB
+    expect((await read({})).ranges).toEqual(["bytes=100-7299"]);
+    expect((await read({ mergeGap: 2400, maxMergeSize: 3000 })).ranges).toEqual(["bytes=100-2499", "bytes=4900-7299"]);
+    // Whichever way they are fetched, each caller gets its own chunk
+    for (const options of [{ mergeGap: 0 }, { mergeGap: 2400 }, {}]) {
+      const { chunks } = await read(options);
+      chunks.forEach((chunk, i) => expect([...(chunk ?? [])]).toEqual([...(apart.chunks[i] ?? [])]));
+    }
+  });
+
+  test("a merged request that fails is reported to every caller", async () => {
+    const rfs = (await ReferenceStore.fromUrl(`${base}/binary.zarrshadow`)).rfs;
+    const store = new ReferenceStore(rfs, { fetch: async () => new Response(null, { status: 404 }) });
+    const results = await Promise.allSettled([store.get("/whole/c/0/0"), store.get("/whole/c/1/0")]);
+    expect(results.map((r) => r.status)).toEqual(["rejected", "rejected"]);
+  });
+
   test("a file whose ETag or size changed is refused", async () => {
     const rfs = (await ReferenceStore.fromUrl(`${base}/binary.zarrshadow`)).rfs;
     const withSources = (source: { size?: number; etag?: string }) =>
