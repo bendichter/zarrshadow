@@ -104,6 +104,12 @@ FILES = {
 # Readers without the buffer description API, whose signals zarrshadow finds through the memory maps NEO
 # reads them with. Only virtual_arrays_neo supports these.
 MAPPED_FILES = {
+    "BiocamRawIO": [
+        "biocam/biocam_hw3.0_fw1.6.brw",
+        "biocam/biocam_hw3.0_fw1.7.0.12_raw.brw",
+        "biocam/raw_shape_variants/version_100.brw",
+        "biocam/raw_shape_variants/version_101.brw",
+    ],
     "BlackrockRawIO": [
         "blackrock/FileSpec2.3001",
         "blackrock/blackrock_2_1/l101210-001",
@@ -135,6 +141,7 @@ MAPPED_FILES = {
         "intan/test_fcs_dc_250327_154333/info.rhs",
         "intan/test_fpc_stim_250327_151617/info.rhs",
     ],
+    "MEArecRawIO": ["mearec/mearec_test_10s.h5"],
     "NeuralynxRawIO": [
         "neuralynx/BML/original_data",
         "neuralynx/BML_unfilledsplit/original_data",
@@ -172,6 +179,8 @@ MAPPED_REFUSED = {
     ("OpenEphysRawIO", "openephys/OpenEphys_SampleData_2_(multiple_starts)"): "gaps between its records",
     # BDF, with 24-bit samples
     ("EDFRawIO", "edf/events/event_markers.bdf"): "24-bit",
+    # Only events are stored, and NEO fills the rest in
+    ("BiocamRawIO", "biocam/BioCAM_BrainWave5_HW_3.0_FW_1.7.brw"): "stored as events",
 }
 
 # Maxwell stores its signals in HDF5 with a proprietary compression filter,
@@ -208,7 +217,13 @@ def _download(folder):
     return path[: -len(folder)].rstrip("/")
 
 
+# Libraries that NEO needs to open the files of some readers
+READER_NEEDS = {"EDFRawIO": "pyedflib", "MEArecRawIO": "MEArec"}
+
+
 def _reader(name, path):
+    if name in READER_NEEDS:
+        pytest.importorskip(READER_NEEDS[name])
     cls = getattr(neo_rawio, name)
     local = os.path.join(_download(path.split("/")[0]), path)
     reader = cls(dirname=local) if cls.rawmode == "one-dir" else cls(filename=local)

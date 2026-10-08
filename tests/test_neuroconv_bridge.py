@@ -362,6 +362,20 @@ CASES = {
         ("ElectricalSeries/data", (256, 5)),
         1,
     ),
+    "MEArec": (
+        EPHYS,
+        "MEArecRecordingInterface",
+        {"file_path": "mearec/mearec_test_10s.h5"},
+        ("ElectricalSeries/data", (320000, 32)),
+        1,
+    ),
+    "Biocam": (
+        EPHYS,
+        "BiocamRecordingInterface",
+        {"file_path": "biocam/biocam_hw3.0_fw1.7.0.12_raw.brw"},
+        ("ElectricalSeries/data", (5000, 100)),
+        1,
+    ),
     "WhiteMatter": (
         EPHYS,
         "WhiteMatterRecordingInterface",

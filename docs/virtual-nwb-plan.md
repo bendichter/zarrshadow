@@ -119,7 +119,7 @@ A column permutation needs no selection: the `electrodes` region of an `Electric
 
 Classes: A, an existing zarrshadow generator covers it. B, one contiguous raw block. C, fixed-size records, one chunk per record. D, needs a selection. E, not feasible. F, nothing to gain. "+T" needs the transpose codec, and "+S" needs a sign or offset carried in `conversion` and `offset`. The evidence column says whether the layout was checked against NEO's read on a GIN file or read in the reader's source only.
 
-As of October 2026 the table's rows are implemented down to EDF, except Axon ABF as one series per sweep per channel, MEArec, and Biocam, which have not been tried through the bridge. The imaging rows for TIFF and HDF5 are implemented as phase 3 describes. TDT, Axona, Scanbox, the segmentation outputs, and Minian are not.
+As of October 2026 the table's rows are implemented down to EDF, except Axon ABF as one series per sweep per channel. NeuroConv's `AbfInterface` reads the sweeps into memory before it builds the file, so there is no iterator to replace, and the Axon test recording has a negative gain, which SpikeInterface answers by negating the samples. MEArec and Biocam are HDF5: `virtual_arrays_neo` takes the dataset NEO reads from and references it as the HDF5 generator does. A Biocam file that holds its samples as one long row is read as time by channel when that row is stored in one piece. The imaging rows for TIFF and HDF5 are implemented as phase 3 describes. TDT, Axona, Scanbox, the segmentation outputs, and Minian are not.
 
 | Format | Layout | Class | Evidence |
 |---|---|---|---|
