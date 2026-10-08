@@ -78,8 +78,9 @@ class RfsStore(Store):
         rfs: dict,
         *,
         local_cache: Any = None,
-        merge_gap: int = 256 * 1024,
-        max_merge_size: int = 50 * 1024 * 1024,
+        merge_gap: int = 32 * 1024,
+        max_merge_size: int = 2**20,
+        merge_below: int = 64 * 1024,
         validate_sources: bool = True,
     ) -> None:
         """
@@ -91,12 +92,15 @@ class RfsStore(Store):
         local_cache : LocalCache or None
             Optional local cache for persisting remote chunk data on disk.
         merge_gap : int
-            Maximum gap in bytes between two ranges before they are fetched
-            separately. Ranges within this distance are merged into a single
-            HTTP request. Default 256 KB.
+            Chunks of a remote file that are asked for at the same time are
+            fetched in one request when the gap between them is at most this
+            many bytes. Default 32 KiB.
         max_merge_size : int
-            Maximum size in bytes for a single merged HTTP request. Merged
-            ranges that would exceed this are split. Default 50 MB.
+            The most bytes one merged request may ask for. 0 turns merging
+            off. Default 1 MiB.
+        merge_below : int
+            Only chunks of at most this many bytes are merged. Larger ones are
+            fetched faster on their own, in parallel. Default 64 KiB.
         validate_sources : bool
             Check reads against the size and ETag recorded under "sources" and
             raise SourceChangedError if a file has changed. Default True.
@@ -108,6 +112,9 @@ class RfsStore(Store):
         self._local_cache = local_cache
         self._merge_gap = merge_gap
         self._max_merge_size = max_merge_size
+        self._merge_below = merge_below
+        # Small reads of remote files that are waiting to be sent together, for each event loop
+        self._pending: dict[Any, dict[str, list[tuple[int, int, str, asyncio.Future]]]] = {}
         self._executor = ThreadPoolExecutor(max_workers=32)
         self._sources = SourceChecker(rfs.get("sources", {}), enabled=validate_sources)
         _register_imagecodecs_if_needed(rfs["refs"])
@@ -149,10 +156,89 @@ class RfsStore(Store):
         if prototype is None:
             prototype = default_buffer_prototype()
         loop = asyncio.get_running_loop()
-        data = await loop.run_in_executor(self._executor, self._get_bytes, key, byte_range)
+        if byte_range is None and self._max_merge_size > 0:
+            data = await self._get_merged(key, loop)
+        else:
+            data = await loop.run_in_executor(self._executor, self._get_bytes, key, byte_range)
         if data is None:
             return None
         return prototype.buffer.from_bytes(data)
+
+    async def _get_merged(self, key: str, loop: asyncio.AbstractEventLoop) -> bytes | None:
+        """Read a whole value, sharing a request with other small chunks of the same remote file.
+
+        zarr asks for the chunks of a selection at the same time, each with its
+        own get. A small chunk of a remote file waits a moment for the others,
+        and those that are close together in the file are fetched in one
+        request. Everything else is read on its own.
+        """
+        if self._indexes and key.rpartition("/c/")[0] in self._indexes:
+            # A chunk index may have to be read, which blocks
+            ref = await loop.run_in_executor(self._executor, self._resolve, key)
+        else:
+            ref = self._resolve(key)
+        mergeable = isinstance(ref, list) and len(ref) == 3 and 0 < ref[2] <= self._merge_below
+        url = self._expand_templates(ref[0]) if mergeable else ""
+        if not url.startswith(("http://", "https://")):
+            return await loop.run_in_executor(self._executor, self._get_bytes, key, None)
+        if self._local_cache is not None:
+            cached = self._local_cache.get_remote_chunk(url=url, offset=ref[1], size=ref[2])
+            if cached is not None:
+                return self._finish(key, cached)
+        future: asyncio.Future = loop.create_future()
+        pending = self._pending.setdefault(loop, {})
+        if not pending:
+            loop.call_later(0.001, self._send_pending, loop)
+        pending.setdefault(url, []).append((ref[1], ref[2], key, future))
+        return await future
+
+    def _send_pending(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Send the reads that are waiting, one request for each run that is close together in a file."""
+        for url, reads in self._pending.pop(loop, {}).items():
+            reads.sort(key=lambda read: read[0])
+            runs: list[list[Any]] = []  # [start, end, reads]
+            for read in reads:
+                end = read[0] + read[1]
+                if (
+                    runs
+                    and read[0] <= runs[-1][1] + self._merge_gap
+                    and max(runs[-1][1], end) - runs[-1][0] <= self._max_merge_size
+                ):
+                    runs[-1][1] = max(runs[-1][1], end)
+                    runs[-1][2].append(read)
+                else:
+                    runs.append([read[0], end, [read]])
+            for start, end, run in runs:
+                task = loop.run_in_executor(self._executor, self._read_run, url, start, end, run)
+                task.add_done_callback(lambda done, run=run: self._deliver(done, run))
+
+    def _read_run(self, url: str, start: int, end: int, run: list) -> list[bytes]:
+        """Fetch [start, end) of a remote file and cut out the chunk of each read in the run."""
+        raw = _read_bytes_from_url(url, start, end - start, session=self._session, checker=self._sources)
+        chunks = []
+        for offset, length, key, _ in run:
+            data = raw[offset - start : offset - start + length]
+            if self._local_cache is not None:
+                from .local_cache import ChunkTooLargeError
+
+                try:
+                    self._local_cache.put_remote_chunk(url=url, offset=offset, size=length, data=data)
+                except ChunkTooLargeError:
+                    pass
+            chunks.append(self._finish(key, data))
+        return chunks
+
+    @staticmethod
+    def _deliver(done: asyncio.Future, run: list) -> None:
+        """Give each read of a run its chunk, or the error the request ended with."""
+        error = done.exception() if not done.cancelled() else asyncio.CancelledError()
+        for i, (_, _, _, future) in enumerate(run):
+            if future.done():
+                continue
+            if error is not None:
+                future.set_exception(error)
+            else:
+                future.set_result(done.result()[i])
 
     async def get_partial_values(
         self,

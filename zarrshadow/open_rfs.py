@@ -21,8 +21,9 @@ def open_rfs(
     rfs: dict | str,
     *,
     local_cache: Any = None,
-    merge_gap: int = 256 * 1024,
-    max_merge_size: int = 50 * 1024 * 1024,
+    merge_gap: int = 32 * 1024,
+    max_merge_size: int = 2**20,
+    merge_below: int = 64 * 1024,
     validate_sources: bool = True,
 ) -> zarr.Group:
     """Open a reference file system as a zarr v3 Group.
@@ -36,11 +37,14 @@ def open_rfs(
     local_cache : LocalCache or None
         Optional local cache for persisting remote chunk data on disk.
     merge_gap : int
-        Maximum gap in bytes between two HTTP range requests before they
-        are fetched separately. Nearby ranges are merged into a single
-        request. Default 256 KB.
+        Chunks of a remote file that are asked for at the same time are
+        fetched in one request when the gap between them is at most this
+        many bytes. Default 32 KiB.
     max_merge_size : int
-        Maximum size in bytes for a single merged HTTP request. Default 50 MB.
+        The most bytes one merged request may ask for. 0 turns merging off.
+        Default 1 MiB.
+    merge_below : int
+        Only chunks of at most this many bytes are merged. Default 64 KiB.
     validate_sources : bool
         Raise SourceChangedError if a file the references point into has
         changed since they were generated. Default True.
@@ -60,6 +64,7 @@ def open_rfs(
         local_cache=local_cache,
         merge_gap=merge_gap,
         max_merge_size=max_merge_size,
+        merge_below=merge_below,
         validate_sources=validate_sources,
     )
     return zarr.open_group(store, mode="r", zarr_format=3)
