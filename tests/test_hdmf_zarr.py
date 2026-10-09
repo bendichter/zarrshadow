@@ -1,5 +1,6 @@
 """Read a zarrshadow RFS of a pynwb-written file with hdmf-zarr's NWBZarrIO."""
 
+import json
 import warnings
 from datetime import datetime, timezone
 
@@ -80,6 +81,44 @@ def nwb_pair(request, nwb_path, tmp_path_factory):
         zio = hdmf_zarr_nwb.NWBZarrIO(RfsStore(rfs), mode="r")
         yield h5io.read(), zio.read()
         zio.close()
+
+
+def test_cached_spec_in_array_of_one(nwb_path, tmp_path):
+    """HDMF before 2.0 wrote each cached specification as an array of one string.
+
+    hdmf-zarr reads a cached specification as a scalar, so the RFS holds it as one.
+    """
+    import shutil
+
+    import h5py
+
+    old = str(tmp_path / "old.nwb")
+    shutil.copy(nwb_path, old)
+    with h5py.File(old, "r+") as f:
+        specs = []
+        f["specifications"].visititems(
+            lambda name, obj: specs.append(name) if isinstance(obj, h5py.Dataset) else None
+        )
+        assert specs
+        for name in specs:
+            text = f["specifications"][name][()]
+            del f["specifications"][name]
+            f["specifications"].create_dataset(name, data=[text], dtype=h5py.string_dtype())
+            assert f["specifications"][name].shape == (1,)
+
+    rfs = generate_rfs(old)
+    for name in specs:
+        assert json.loads(rfs["refs"][f"specifications/{name}/zarr.json"])["shape"] == []
+    # Only the cached specifications change shape
+    keywords = json.loads(rfs["refs"]["general/keywords/zarr.json"])
+    assert keywords["shape"] == [2]
+    with NWBHDF5IO(old, "r") as h5io, hdmf_zarr_nwb.NWBZarrIO(RfsStore(rfs), mode="r") as zio:
+        from_hdf5, from_rfs = h5io.read(), zio.read()
+        assert from_rfs.identifier == from_hdf5.identifier
+        np.testing.assert_array_equal(
+            from_rfs.acquisition["ElectricalSeries"].data[:100],
+            from_hdf5.acquisition["ElectricalSeries"].data[:100],
+        )
 
 
 def test_no_dtype_inference_warnings(nwb_path):

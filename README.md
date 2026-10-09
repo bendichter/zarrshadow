@@ -455,6 +455,7 @@ The generated JSON follows the [unified Zarr v3 convention](https://github.com/h
 | Soft links | `_LINKS` list on parent group: `[{"name", "source", "path"}]` |
 | References in datasets | `_DTYPE: "object_reference"` with target paths as strings; compound reference fields listed in `_REFERENCE_FIELDS` |
 | Spec location | Root `.specloc` attribute holds the plain path `"specifications"` |
+| Cached specifications | Scalar strings. HDMF before 2.0 wrote each as an array of one string, which is stored here as a scalar so that hdmf-zarr reads it |
 | References in attrs | `{"_REFERENCE": {"source": ".", "path": "/target"}}` |
 | NaN/Inf in attrs | Written as the float tokens `NaN`, `Infinity`, `-Infinity`, as zarr-python does |
 | Strings | `data_type: "string"` with `vlen-utf8` codec |
