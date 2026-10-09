@@ -7,6 +7,7 @@ import { dirname, join } from "node:path";
 
 import FileSystemStore from "@zarrita/storage/fs";
 
+import { parseJson } from "./json.js";
 import { type ReferenceFileSystem, ReferenceStore, type ReferenceStoreOptions } from "./store.js";
 
 /** Read length bytes at offset from a local file, or the whole file. */
@@ -33,7 +34,7 @@ export async function fileSize(path: string): Promise<number> {
  */
 export async function openLocal(location: string, options: ReferenceStoreOptions = {}): Promise<ReferenceStore> {
   const jsonPath = location.endsWith(".json") ? location : join(location, "refs.json");
-  const rfs = JSON.parse(new TextDecoder().decode(await readWholeFile(jsonPath))) as ReferenceFileSystem;
+  const rfs = parseJson(new TextDecoder().decode(await readWholeFile(jsonPath))) as ReferenceFileSystem;
   return new ReferenceStore(rfs, {
     indexStore: new FileSystemStore(dirname(jsonPath)),
     readFile,

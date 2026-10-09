@@ -36,6 +36,8 @@ The size limit comes from a measurement: one second of an LFP recording on DANDI
 | 4 MiB | 2 | 1.51 s | 1.30 s |
 | 50 MiB | 1 | 2.29 s | 2.22 s |
 
+Python writes a number that is not finite as a bare `NaN`, `Infinity`, or `-Infinity`, which `JSON.parse` refuses, and NWB files have such attributes (`resolution` of a TimeSeries, for one). The store gives zarrita metadata in which these are the strings `"NaN"`, `"Infinity"`, and `"-Infinity"`, as Zarr v3 writes a fill value. `parseJson` reads the original form into numbers.
+
 zarrita decodes the codecs that references to HDF5 files use (`numcodecs.zlib`, `numcodecs.shuffle`, `numcodecs.blosc`, `numcodecs.zstd`). The store adds `numcodecs.fletcher32`, which drops the checksum without verifying it.
 
 ## What It Does Not Do

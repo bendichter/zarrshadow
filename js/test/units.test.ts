@@ -1,6 +1,16 @@
 import { describe, expect, test } from "vitest";
 
-import { arrayPath, evaluate, Generator, itemSize, ReferenceStore, render, Selection } from "../src/index.js";
+import {
+  arrayPath,
+  evaluate,
+  Generator,
+  itemSize,
+  parseJson,
+  ReferenceStore,
+  render,
+  Selection,
+  toStrictJson,
+} from "../src/index.js";
 
 describe("gen expressions", () => {
   test("integer arithmetic with Python's floor division and modulo", () => {
@@ -119,6 +129,45 @@ test("itemSize", () => {
   expect(itemSize(structured)).toBe(24);
   expect(itemSize({ name: "struct", configuration: { fields: [{ name: "inner", data_type: struct }, { name: "z", data_type: "uint8" }] } })).toBe(25);
   expect(itemSize({ name: "struct", configuration: { fields: [{ name: "s", data_type: "string" }] } })).toBeUndefined();
+});
+
+describe("JSON that Python wrote", () => {
+  const text =
+    '{"resolution": NaN, "limits": [-Infinity, Infinity], "rate": 30000.0,' +
+    ' "note": "NaN and -Infinity stay in a \\"string\\"", "name": "NaN"}';
+
+  test("is read with its numbers that are not finite", () => {
+    expect(parseJson(text)).toEqual({
+      resolution: Number.NaN,
+      limits: [-Infinity, Infinity],
+      rate: 30000,
+      note: 'NaN and -Infinity stay in a "string"',
+      name: "NaN",
+    });
+    expect(parseJson('{"a": 1}')).toEqual({ a: 1 });
+  });
+
+  test("is made readable by any JSON parser", () => {
+    expect(JSON.parse(toStrictJson(text))).toEqual({
+      resolution: "NaN",
+      limits: ["-Infinity", "Infinity"],
+      rate: 30000,
+      note: 'NaN and -Infinity stay in a "string"',
+      name: "NaN",
+    });
+    expect(toStrictJson('{"a": 1}')).toBe('{"a": 1}');
+  });
+
+  test("the store gives zarrita metadata it can parse", async () => {
+    const meta = '{"zarr_format":3,"node_type":"group","attributes":{"resolution":NaN}}';
+    const store = new ReferenceStore({ version: 2, refs: { "zarr.json": meta, "a/zarr.json": meta, "a/c/0": "NaN" } });
+    for (const key of ["/zarr.json", "/a/zarr.json"] as const) {
+      const bytes = await store.get(key);
+      expect(JSON.parse(new TextDecoder().decode(bytes)).attributes).toEqual({ resolution: "NaN" });
+    }
+    // a chunk is not metadata, and is left as it is
+    expect(new TextDecoder().decode(await store.get("/a/c/0"))).toBe("NaN");
+  });
 });
 
 describe("ReferenceStore", () => {

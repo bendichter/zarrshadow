@@ -49,6 +49,9 @@ def hdf5_file(folder):
         partly = group.create_dataset("partly_written", shape=(60, 4), dtype="<i8", chunks=(20, 4), fillvalue=0)
         partly[:20] = data["partly_written"][:20]
         f.create_dataset("scalar", data=data["scalar"])
+        # Python writes these attributes as bare NaN and Infinity, which JSON.parse refuses
+        group["contiguous"].attrs["resolution"] = np.nan
+        group["contiguous"].attrs["limits"] = np.array([-np.inf, np.inf])
         f.create_dataset("strings", data=data["strings"], dtype=h5py.string_dtype())
         f.create_dataset("long_strings", data=data["long_strings"], dtype=h5py.string_dtype())
     paths = {
