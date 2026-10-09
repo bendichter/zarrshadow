@@ -334,9 +334,14 @@ export class ReferenceStore implements AsyncReadable {
     let size: number | undefined;
     const bytes = await this.#read(path === "" ? "zarr.json" : `${path}/zarr.json`, undefined, {});
     if (bytes) {
-      const meta = parseJson(new TextDecoder().decode(bytes)) as Record<string, any>;
-      const chunkShape: number[] | undefined = meta.chunk_grid?.configuration?.chunk_shape;
-      const uncompressed = (meta.codecs ?? []).every((codec: { name?: string }) => codec.name === "bytes");
+      const meta = parseJson(new TextDecoder().decode(bytes)) as {
+        node_type?: string;
+        data_type?: unknown;
+        chunk_grid?: { configuration?: { chunk_shape?: number[] } };
+        codecs?: { name?: string }[];
+      };
+      const chunkShape = meta.chunk_grid?.configuration?.chunk_shape;
+      const uncompressed = (meta.codecs ?? []).every((codec) => codec.name === "bytes");
       const item = itemSize(meta.data_type);
       if (meta.node_type === "array" && uncompressed && chunkShape && item !== undefined) {
         size = chunkShape.reduce((a, b) => a * b, 1) * item;
