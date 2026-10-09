@@ -91,6 +91,7 @@ def generate_rfs(
 
     def process(opened: h5py.File, raw_source: str) -> None:
         opts["offset_shift"] = _detect_offset_shift(opened, _raw_reader(raw_source))
+        opts["spec_location"] = _spec_location(opened)
         _process_group(opened, "", builder, hdf5_url_or_path, opened, **opts)
 
     if h5f is not None:
@@ -198,12 +199,16 @@ def _process_dataset(
     chunk_index_threshold: int | None,
     contiguous_chunk_bytes: int | None,
     offset_shift: int,
+    spec_location: str | None = None,
 ) -> None:
     """Add a dataset's metadata and chunk locations, or its data inline."""
     attrs = _collect_attrs(ds, h5f=h5f, label=path)
 
     if _should_inline(ds):
-        _process_inline_dataset(ds, path, builder, attrs, h5f)
+        # hdmf-zarr reads a cached specification as a scalar string. Files
+        # written by HDMF before 2.0 hold it in an array of one.
+        cached_spec = spec_location is not None and path.startswith(spec_location + "/")
+        _process_inline_dataset(ds, path, builder, attrs, h5f, scalar_if_single=cached_spec)
         return
 
     if ds.chunks:
@@ -239,17 +244,23 @@ def _process_inline_dataset(
     builder: RfsBuilder,
     attrs: dict,
     h5f: h5py.File,
+    *,
+    scalar_if_single: bool = False,
 ) -> None:
-    """Store a small dataset, string data, or references in the RFS itself."""
+    """Store a small dataset, string data, or references in the RFS itself.
+
+    With scalar_if_single, a string dataset of shape (1,) is stored as a scalar.
+    """
     data = ds[()]
-    origin = [0] * ds.ndim
 
     def add_strings(strings: list[str], shape: list[int]) -> None:
+        if scalar_if_single and shape == [1]:
+            shape = []
         builder.add_array(
             path, shape=shape, data_type="string", chunk_shape=shape,
             codecs=STRING_CODECS, fill_value="", attributes=attrs,
         )
-        builder.add_inline_chunk(path, origin, _encode_vlen_utf8(strings))
+        builder.add_inline_chunk(path, [0] * len(shape), _encode_vlen_utf8(strings))
 
     if ds.ndim == 0:
         if isinstance(data, h5py.Reference):
@@ -449,6 +460,17 @@ def _detect_offset_shift(h5f: h5py.File, read_bytes: Callable[[int, int], bytes]
 # ---------------------------------------------------------------------------
 # Attributes, links, and types
 # ---------------------------------------------------------------------------
+
+
+def _spec_location(h5f: h5py.File) -> str | None:
+    """The path of the group that holds an NWB file's cached specifications."""
+    specloc = h5f.attrs.get(".specloc")
+    if not isinstance(specloc, h5py.Reference):
+        return None
+    try:
+        return h5f[specloc].name.strip("/")
+    except (KeyError, ValueError):
+        return None
 
 
 def _collect_attrs(
