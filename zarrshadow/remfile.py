@@ -3,12 +3,15 @@
 Optimized for use with h5py: reads small chunks for metadata, then
 adaptively increases chunk size for sequential access patterns.
 
-Ported from lindi's LindiRemfile.
+Ported from lindi's LindiRemfile, with one addition: the nodes of a chunk
+index are read ahead, in parallel (see _prefetch_chunk_btree).
 """
 
 from __future__ import annotations
 
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
@@ -19,6 +22,46 @@ _DEFAULT_MAX_CACHE_SIZE = 1024 * 1024 * 1024  # 1 GB
 _DEFAULT_CHUNK_INCREMENT_FACTOR = 1.7
 _DEFAULT_MAX_CHUNK_SIZE = 100 * 1024 * 1024  # 100 MB
 _NUM_REQUEST_RETRIES = 8
+_PREFETCH_WORKERS = 32
+
+# A version 1 B-tree node: signature, node type, level, entries used, and two
+# sibling addresses. Type 1 nodes index the chunks of a dataset.
+_BTREE_SIGNATURE = b"TREE"
+_OFFSET_SIZE = 8
+_BTREE_HEADER = 8 + 2 * _OFFSET_SIZE
+
+
+def parse_chunk_btree_node(node: bytes, file_length: int) -> tuple[int, list[int]] | None:
+    """The level and child addresses of a version 1 B-tree node that indexes chunks.
+
+    Returns None for anything else. A key holds the chunk's size, its filter
+    mask, and an offset for each dimension of the dataset plus one for the
+    element, which is 0 in every key but the last. The number of dimensions is
+    not in the node, so each is tried until the keys and children make sense.
+    A wrong guess only means reading ahead what is not needed.
+    """
+    if len(node) < _BTREE_HEADER or node[:4] != _BTREE_SIGNATURE or node[4] != 1:
+        return None
+    level = node[5]
+    entries = int.from_bytes(node[6:8], "little")
+    if entries == 0:
+        return None
+    for dims in range(2, 34):  # HDF5 datasets have at most 32 dimensions
+        key = 8 + 8 * dims
+        if _BTREE_HEADER + (entries + 1) * key + entries * _OFFSET_SIZE > len(node):
+            return None
+        children = []
+        for i in range(entries):
+            at = _BTREE_HEADER + i * (key + _OFFSET_SIZE)
+            if int.from_bytes(node[at + key - 8 : at + key], "little") != 0:
+                break
+            child = int.from_bytes(node[at + key : at + key + _OFFSET_SIZE], "little")
+            if not 0 < child < file_length:
+                break
+            children.append(child)
+        else:
+            return level, children
+    return None
 
 
 class ZarrShadowRemfile:
@@ -58,11 +101,59 @@ class ZarrShadowRemfile:
         response.close()
 
         self.session = requests.Session()
+        # Nodes of chunk indexes, read ahead, by address
+        self._nodes: dict[int, bytes] = {}
+        self._indexes_read_ahead: set[int] = set()
+        self._local = threading.local()
 
     def read(self, size: int | None = None) -> bytes:
         if size is None:
             raise ValueError("size argument is required")
+        start = self._position
+        node = self._nodes.get(start)
+        if node is not None and size <= len(node):
+            self._position += size
+            return node[:size]
+        data = self._read(size)
+        if data[:4] == _BTREE_SIGNATURE and start not in self._indexes_read_ahead:
+            self._prefetch_chunk_btree(start, data)
+        return data
 
+    def _prefetch_chunk_btree(self, address: int, node: bytes) -> None:
+        """Read every node under this one, a level at a time, in parallel.
+
+        h5py walks the B-tree of a chunked dataset one node at a time, and the
+        nodes of a dataset written in pieces lie throughout the file, so each
+        costs a request. For a dataset with hundreds of thousands of chunks
+        that is thousands of requests in a row. All nodes have the size of
+        this one, which is how much h5py reads of each.
+        """
+        self._indexes_read_ahead.add(address)
+        size = len(node)
+        level = [node]
+        with ThreadPoolExecutor(_PREFETCH_WORKERS) as pool:
+            while level:
+                wanted = []
+                for parent in level:
+                    parsed = parse_chunk_btree_node(parent, self.length)
+                    if parsed is None or parsed[0] == 0:
+                        continue  # the children of a leaf are chunks of data
+                    wanted += [a for a in parsed[1] if a not in self._nodes]
+                fetched = list(pool.map(lambda a: self._fetch_node(a, size), wanted))
+                level = []
+                for child, data in zip(wanted, fetched):
+                    self._nodes[child] = data
+                    self._indexes_read_ahead.add(child)
+                    level.append(data)
+
+    def _fetch_node(self, address: int, size: int) -> bytes:
+        session = getattr(self._local, "session", None)
+        if session is None:
+            session = self._local.session = requests.Session()
+        end = min(address + size, self.length) - 1
+        return _fetch_bytes(session, resolve_url(self._url), address, end)
+
+    def _read(self, size: int) -> bytes:
         chunk_start_index = self._position // self._min_chunk_size
         chunk_end_index = (self._position + size - 1) // self._min_chunk_size
         loaded_chunks = {}
