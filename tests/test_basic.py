@@ -524,3 +524,27 @@ def test_large_inline_chunks_are_compressed(tmp_path):
     read = root["table"][:]
     np.testing.assert_array_equal(read["start"], np.arange(800))
     assert set(read["series"]) == {"/target"}
+
+
+def test_empty_inline_datasets(tmp_path):
+    """An empty dataset has no chunk, and its chunk shape may not have a zero."""
+    path = str(tmp_path / "empty.h5")
+    with h5py.File(path, "w") as f:
+        f.create_dataset("numbers", shape=(0,), dtype="<f8")
+        f.create_dataset("table", shape=(0, 3), dtype="<i4")
+        f.create_dataset("strings", shape=(0,), dtype=h5py.string_dtype())
+        f.create_dataset("references", shape=(0,), dtype=h5py.ref_dtype)
+
+    rfs = generate_rfs(path)
+    cases = [("numbers", [0], [1]), ("table", [0, 3], [1, 3]), ("strings", [0], [1]), ("references", [0], [1])]
+    for name, shape, chunk_shape in cases:
+        meta = json.loads(rfs["refs"][f"{name}/zarr.json"])
+        assert meta["shape"] == shape
+        assert meta["chunk_grid"]["configuration"]["chunk_shape"] == chunk_shape
+        assert not [key for key in rfs["refs"] if key.startswith(f"{name}/c")]
+
+    root = open_rfs(rfs)
+    assert root["numbers"][:].shape == (0,)
+    assert root["table"][:].shape == (0, 3)
+    assert root["strings"][:].shape == (0,)
+    assert root["references"][:].shape == (0,)
