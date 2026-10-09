@@ -2,6 +2,7 @@ export { ChunkIndex } from "./chunk-index.js";
 export { registerCodecs } from "./codecs.js";
 export { dandiUrlResolver } from "./dandi.js";
 export { evaluate, type FileRef, type GenEntry, Generator, render } from "./gen.js";
+export { parseJson, toStrictJson } from "./json.js";
 export { Selection } from "./selection.js";
 export {
   arrayPath,

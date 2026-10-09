@@ -5,6 +5,7 @@ import { ChunkIndex } from "./chunk-index.js";
 import { registerCodecs } from "./codecs.js";
 import { dandiUrlResolver } from "./dandi.js";
 import { type FileRef, type GenEntry, Generator } from "./gen.js";
+import { parseJson, toStrictJson } from "./json.js";
 import { Selection } from "./selection.js";
 
 /** A reference: inline text or base64, inline JSON, or a place in a file. */
@@ -204,7 +205,7 @@ export class ReferenceStore implements AsyncReadable {
     const fetch_ = options.fetch ?? ((input: string, init?: RequestInit) => fetch(input, init));
     const response = await fetch_(jsonUrl);
     if (!response.ok) throw new Error(`Could not read ${jsonUrl}: HTTP ${response.status}`);
-    const rfs = (await response.json()) as ReferenceFileSystem;
+    const rfs = parseJson(await response.text()) as ReferenceFileSystem;
     const folder = jsonUrl.slice(0, jsonUrl.lastIndexOf("/"));
     const indexStore = new zarr.FetchStore(
       folder,
@@ -264,7 +265,10 @@ export class ReferenceStore implements AsyncReadable {
       let data: Uint8Array;
       if (typeof ref !== "string") data = new TextEncoder().encode(JSON.stringify(ref));
       else if (ref.startsWith("base64:")) data = decodeBase64(ref.slice("base64:".length));
-      else data = new TextEncoder().encode(ref);
+      else if (key === "zarr.json" || key.endsWith("/zarr.json")) {
+        // zarrita reads metadata with JSON.parse, which refuses the NaN that Python writes in attributes
+        data = new TextEncoder().encode(toStrictJson(ref));
+      } else data = new TextEncoder().encode(ref);
       return range ? data.subarray(...bounds(range, data.length)) : data;
     }
     const location = this.#expandTemplates(ref[0]);
@@ -330,9 +334,14 @@ export class ReferenceStore implements AsyncReadable {
     let size: number | undefined;
     const bytes = await this.#read(path === "" ? "zarr.json" : `${path}/zarr.json`, undefined, {});
     if (bytes) {
-      const meta = JSON.parse(new TextDecoder().decode(bytes));
-      const chunkShape: number[] | undefined = meta.chunk_grid?.configuration?.chunk_shape;
-      const uncompressed = (meta.codecs ?? []).every((codec: { name?: string }) => codec.name === "bytes");
+      const meta = parseJson(new TextDecoder().decode(bytes)) as {
+        node_type?: string;
+        data_type?: unknown;
+        chunk_grid?: { configuration?: { chunk_shape?: number[] } };
+        codecs?: { name?: string }[];
+      };
+      const chunkShape = meta.chunk_grid?.configuration?.chunk_shape;
+      const uncompressed = (meta.codecs ?? []).every((codec) => codec.name === "bytes");
       const item = itemSize(meta.data_type);
       if (meta.node_type === "array" && uncompressed && chunkShape && item !== undefined) {
         size = chunkShape.reduce((a, b) => a * b, 1) * item;
