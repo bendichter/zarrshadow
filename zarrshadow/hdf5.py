@@ -19,6 +19,7 @@ import json
 from typing import Any, Callable
 
 import h5py
+import numcodecs
 import numpy as np
 from tqdm import tqdm
 
@@ -33,6 +34,19 @@ from .h5_chunk_utils import (
 from .h5_filters_to_codecs import h5_filters_to_codec_pipeline
 
 STRING_CODECS = [{"name": "vlen-utf8", "configuration": {}}]
+
+# An inline chunk of at least this many bytes is compressed. Text and tables of
+# references compress well, and everything inline is read when the RFS is opened.
+INLINE_COMPRESS_BYTES = 4096
+_ZSTD_LEVEL = 5
+ZSTD_CODEC = {"name": "zstd", "configuration": {"level": _ZSTD_LEVEL, "checksum": False}}
+
+
+def _inline_chunk(codecs: list[dict], data: bytes) -> tuple[list[dict], bytes]:
+    """The codecs and stored bytes for an inline chunk, compressed if it is large."""
+    if len(data) < INLINE_COMPRESS_BYTES:
+        return codecs, data
+    return [*codecs, ZSTD_CODEC], numcodecs.Zstd(level=_ZSTD_LEVEL).encode(data)
 
 
 def generate_rfs(
@@ -256,11 +270,12 @@ def _process_inline_dataset(
     def add_strings(strings: list[str], shape: list[int]) -> None:
         if scalar_if_single and shape == [1]:
             shape = []
+        codecs, stored = _inline_chunk(STRING_CODECS, _encode_vlen_utf8(strings))
         builder.add_array(
             path, shape=shape, data_type="string", chunk_shape=shape,
-            codecs=STRING_CODECS, fill_value="", attributes=attrs,
+            codecs=codecs, fill_value="", attributes=attrs,
         )
-        builder.add_inline_chunk(path, [0] * len(shape), _encode_vlen_utf8(strings))
+        builder.add_inline_chunk(path, [0] * len(shape), stored)
 
     if ds.ndim == 0:
         if isinstance(data, h5py.Reference):
@@ -310,13 +325,14 @@ def _process_inline_dataset(
         fill_value = _encode_fill_value(ds.fillvalue, dtype)
 
     shape = list(data.shape)
-    builder.add_array(
-        path, shape=shape, data_type=data_type, chunk_shape=shape,
-        codecs=DEFAULT_CODECS, fill_value=fill_value, attributes=attrs,
-    )
     if dtype.byteorder == ">":
         data = data.astype(dtype.newbyteorder("<"))
-    builder.add_inline_chunk(path, [0] * len(shape), data.tobytes())
+    codecs, stored = _inline_chunk(DEFAULT_CODECS, data.tobytes())
+    builder.add_array(
+        path, shape=shape, data_type=data_type, chunk_shape=shape,
+        codecs=codecs, fill_value=fill_value, attributes=attrs,
+    )
+    builder.add_inline_chunk(path, [0] * len(shape), stored)
 
 
 def _add_chunk_refs(
