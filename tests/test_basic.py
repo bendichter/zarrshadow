@@ -484,3 +484,67 @@ class TestBasicRoundtrip:
         with h5py.File(self.h5_path, "r") as f:
             expected = f["acquisition/timeseries"][:]
         np.testing.assert_array_equal(arr[:], expected)
+
+
+def test_large_inline_chunks_are_compressed(tmp_path):
+    """Inline text and tables of references can be large, and all of it is read on opening."""
+    from zarrshadow.hdf5 import INLINE_COMPRESS_BYTES
+
+    path = str(tmp_path / "inline.h5")
+    notes = "sweep 12: βeta, 30000 Hz, " * 2000
+    labels = np.array([f"channel {i} of the probe" for i in range(500)], dtype=object)
+    with h5py.File(path, "w") as f:
+        f.create_dataset("notes", data=notes, dtype=h5py.string_dtype())
+        f.create_dataset("labels", data=labels, dtype=h5py.string_dtype())
+        f.create_dataset("short", data="a short note", dtype=h5py.string_dtype())
+        target = f.create_dataset("target", data=np.arange(4))
+        table = np.zeros(800, dtype=[("start", "<i4"), ("count", "<i4"), ("series", h5py.ref_dtype)])
+        table["start"] = np.arange(800)
+        table["count"] = 7
+        table["series"] = target.ref
+        f.create_dataset("table", data=table)
+
+    rfs = generate_rfs(path)
+    refs = rfs["refs"]
+
+    def codecs(name):
+        return [codec["name"] for codec in json.loads(refs[f"{name}/zarr.json"])["codecs"]]
+
+    assert codecs("notes") == ["vlen-utf8", "zstd"]
+    assert codecs("labels") == ["vlen-utf8", "zstd"]
+    assert codecs("table") == ["bytes", "zstd"]
+    assert codecs("short") == ["vlen-utf8"]
+    assert len(notes.encode()) > 10 * INLINE_COMPRESS_BYTES
+    assert len(refs["notes/c"]) < len(notes.encode()) / 20
+
+    root = open_rfs(rfs)
+    assert root["notes"][()] == notes
+    assert list(root["labels"][:]) == list(labels)
+    assert root["short"][()] == "a short note"
+    read = root["table"][:]
+    np.testing.assert_array_equal(read["start"], np.arange(800))
+    assert set(read["series"]) == {"/target"}
+
+
+def test_empty_inline_datasets(tmp_path):
+    """An empty dataset has no chunk, and its chunk shape may not have a zero."""
+    path = str(tmp_path / "empty.h5")
+    with h5py.File(path, "w") as f:
+        f.create_dataset("numbers", shape=(0,), dtype="<f8")
+        f.create_dataset("table", shape=(0, 3), dtype="<i4")
+        f.create_dataset("strings", shape=(0,), dtype=h5py.string_dtype())
+        f.create_dataset("references", shape=(0,), dtype=h5py.ref_dtype)
+
+    rfs = generate_rfs(path)
+    cases = [("numbers", [0], [1]), ("table", [0, 3], [1, 3]), ("strings", [0], [1]), ("references", [0], [1])]
+    for name, shape, chunk_shape in cases:
+        meta = json.loads(rfs["refs"][f"{name}/zarr.json"])
+        assert meta["shape"] == shape
+        assert meta["chunk_grid"]["configuration"]["chunk_shape"] == chunk_shape
+        assert not [key for key in rfs["refs"] if key.startswith(f"{name}/c")]
+
+    root = open_rfs(rfs)
+    assert root["numbers"][:].shape == (0,)
+    assert root["table"][:].shape == (0, 3)
+    assert root["strings"][:].shape == (0,)
+    assert root["references"][:].shape == (0,)

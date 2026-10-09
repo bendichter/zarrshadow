@@ -144,7 +144,7 @@ Opening the directory reads only `refs.json`. Each index is itself an ordinary Z
 }
 ```
 
-`refs` holds the Zarr metadata, small datasets, and a `[url, offset, size]` entry for each chunk of an array with at most 1,000 chunks. For each larger array, `indexes` gives the file its chunks are in and the path of its index array, relative to `refs.json`. There is nothing in between: a reader looks up the array in `indexes`, opens that Zarr array, and reads the index chunk it needs. `gen`, `selections`, and `sources` are described below.
+`refs` holds the Zarr metadata, small datasets, and a `[url, offset, size]` entry for each chunk of an array with at most 1,000 chunks. Strings and tables of object references are also held in `refs`, because HDF5 keeps them in heaps that a byte range cannot address, and a chunk of 4 KiB or more held there is compressed with zstd. For each larger array, `indexes` gives the file its chunks are in and the path of its index array, relative to `refs.json`. There is nothing in between: a reader looks up the array in `indexes`, opens that Zarr array, and reads the index chunk it needs. `gen`, `selections`, and `sources` are described below.
 
 A directory that uses `indexes`, `gen`, or `selections` is marked `"version": 2`, so readers that only know version 1 of the kerchunk format refuse it instead of returning fill values for the chunks they cannot find. Writing to a path ending in `.json` produces a version 1 file with every chunk listed in `refs`, which any kerchunk reader can open. A file with `selections` stays version 2, because version 1 cannot express them.
 

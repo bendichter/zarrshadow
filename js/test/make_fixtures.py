@@ -31,6 +31,8 @@ def hdf5_file(folder):
         "partly_written": np.zeros((60, 4), dtype="<i8"),
         "scalar": np.array(42, dtype="<i4"),
         "strings": np.array(["alpha", "βeta", "", "a longer string"], dtype=object),
+        # Long enough that zarrshadow compresses the inline chunk
+        "long_strings": np.array([f"sweep {i}: βeta, 30000 Hz" * 20 for i in range(40)], dtype=object),
     }
     data["partly_written"][:20] = np.arange(80).reshape(20, 4)
     path = os.path.join(folder, "source.h5")
@@ -48,8 +50,9 @@ def hdf5_file(folder):
         partly[:20] = data["partly_written"][:20]
         f.create_dataset("scalar", data=data["scalar"])
         f.create_dataset("strings", data=data["strings"], dtype=h5py.string_dtype())
+        f.create_dataset("long_strings", data=data["long_strings"], dtype=h5py.string_dtype())
     paths = {
-        name: name if name in ("scalar", "strings") else f"acquisition/{name}" for name in data
+        name: name if name in ("scalar", "strings", "long_strings") else f"acquisition/{name}" for name in data
     }
     return path, {paths[name]: values for name, values in data.items()}
 
