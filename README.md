@@ -53,7 +53,7 @@ rfs = generate_rfs(url)
 write_rfs(rfs, "example.zarrshadow.json")
 ```
 
-Just pass the URL — zarrshadow handles remote file access internally.
+Pass the URL, and zarrshadow reads the file's headers over HTTP. h5py walks the index of a chunked dataset one node at a time, and in a file written in pieces those nodes lie throughout the file, so each would cost a request. zarrshadow reads the nodes of such an index ahead, a level at a time and in parallel, when h5py reaches its root. For a 137 GB file on DANDI whose recording has 196,608 chunks, generating references went from more than 15 minutes to 28 seconds.
 
 ### Load the JSON and read data as Zarr v3
 
