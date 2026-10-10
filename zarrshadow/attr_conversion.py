@@ -3,9 +3,9 @@
 Handles numpy type conversion and h5py references.
 For v1, references are converted to the unified convention format.
 
-Float NaN and Inf are passed through as floats. ``json.dumps`` writes them as the
-bare tokens ``NaN``, ``Infinity``, and ``-Infinity``, matching zarr-python, which
-keeps a float distinct from a string holding the same text.
+Float NaN and Inf are passed through as floats. RfsBuilder.build writes them as
+strings, following the Non-Finite Attributes convention, which keeps a float
+distinct from a string holding the same text; see zarrshadow.non_finite.
 
 Ported from lindi with adaptations for the unified zarr v3 convention.
 """

@@ -37,6 +37,7 @@ from zarr.codecs import BloscCodec
 
 from .chunk_index import MISSING, ChunkIndex, index_block_shape
 from .gen import Generator
+from .non_finite import encode_metadata
 from .sources import describe_source
 
 DEFAULT_CODECS = [{"name": "bytes", "configuration": {"endian": "little"}}]
@@ -364,7 +365,12 @@ class RfsBuilder:
         With record_sources, the size and ETag of every referenced file are
         recorded under "sources" so readers can detect a file that has changed.
         URLs used many times are replaced by templates.
+        Attributes that are NaN or infinite are written as strings; see
+        zarrshadow.non_finite.
         """
+        for key, value in self.refs.items():
+            if isinstance(value, str) and (key == "zarr.json" or key.endswith("/zarr.json")):
+                self.refs[key] = encode_metadata(value)
         extended = self.indexes or self.gen or self.selections
         rfs: dict[str, Any] = {"refs": self.refs, "version": 2 if extended else 1}
         if self.indexes:

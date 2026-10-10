@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import zarr
 
-from zarrshadow import generate_rfs, open_rfs
+from zarrshadow import decode_attributes, generate_rfs, open_rfs
 
 
 def _create_test_hdf5(path: str) -> None:
@@ -268,13 +268,21 @@ class TestBasicRoundtrip:
         assert acq.attrs["unit"] == "volts"
 
     def test_nan_inf_attrs(self):
-        """NaN and Inf stay floats in attributes, and a string keeping the same text stays a string."""
-        root_meta = json.loads(self.rfs["refs"]["acquisition/zarr.json"])
-        attrs = root_meta["attributes"]
+        """NaN and Inf are stored as valid JSON, and a string with the same text stays a string."""
+
+        def refuse(token):
+            raise ValueError(f"{token} is not valid JSON")
+
+        stored = json.loads(self.rfs["refs"]["acquisition/zarr.json"], parse_constant=refuse)["attributes"]
+        assert stored["nan_value"] == "NaN" and stored["inf_value"] == "Infinity"
+        assert stored["nan_text"] == "_str_NaN"
+
+        attrs = decode_attributes(open_rfs(self.rfs)["acquisition"].attrs)
         assert isinstance(attrs["nan_value"], float) and math.isnan(attrs["nan_value"])
         assert attrs["inf_value"] == float("inf")
         assert attrs["nan_text"] == "NaN"
         assert isinstance(attrs["nan_text"], str)
+        assert "zarr_conventions" not in attrs
 
     def test_soft_link_in_links(self):
         """Soft links appear in parent group's _LINKS attribute."""
