@@ -92,6 +92,25 @@ def test_arrays_with_many_chunks_get_an_index(recording, tmp_path):
     assert "indexes" not in listed and listed["refs"]["signal/c/7/0"] == ["{{u0}}", 12 + 35 * 34, 170]
 
 
+def test_paths_are_mapped_and_chunk_keys_are_joined_by_slashes(recording):
+    """A manifest may name its chunks "c.0.0" and its files by any URL; the references use "c/0/0"."""
+    path, x = recording
+    metadata = create_v3_array_metadata(
+        shape=(1000, 17),
+        data_type=x.dtype,
+        chunk_shape=(1000, 17),
+        codecs=BYTES,
+        chunk_key_encoding={"name": "default", "separator": "."},
+    )
+    manifest = ChunkManifest(entries={"0.0": {"path": "s3://bucket/raw.bin", "offset": 12, "length": 34_000}})
+    group = ManifestGroup(arrays={"signal": ManifestArray(metadata=metadata, chunkmanifest=manifest)})
+
+    rfs = manifest_store_to_rfs(group, url_for={"s3://bucket/raw.bin": path}.get)
+    assert rfs["refs"]["signal/c/0/0"] == [path, 12, 34_000]
+    assert json.loads(rfs["refs"]["signal/zarr.json"])["chunk_key_encoding"]["configuration"]["separator"] == "/"
+    np.testing.assert_array_equal(open_rfs(rfs)["signal"][...], x[:1000])
+
+
 def test_virtual_array_of_a_contiguous_block(recording):
     """An uncompressed array in one piece can be sliced, which VirtualiZarr's own arrays cannot do by column."""
     path, x = recording
