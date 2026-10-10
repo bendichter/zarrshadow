@@ -3,6 +3,7 @@ from .hdf5 import generate_rfs
 from .local_cache import LocalCache
 from .materialize import materialize
 from .neo_rawio import generate_rfs_neo, virtual_arrays_neo
+from .non_finite import decode_attributes
 from .open_rfs import load_rfs, open_rfs
 from .remfile import ZarrShadowRemfile
 from .rfs_store import RfsStore
@@ -23,6 +24,7 @@ __all__ = [
     "write_rfs",
     "open_rfs",
     "load_rfs",
+    "decode_attributes",
     "LocalCache",
     "ZarrShadowRemfile",
     "RfsStore",

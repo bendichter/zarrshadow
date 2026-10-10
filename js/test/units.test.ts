@@ -2,9 +2,14 @@ import { describe, expect, test } from "vitest";
 
 import {
   arrayPath,
+  decodeAttributes,
+  decodeNonFinite,
+  encodeMetadata,
+  encodeNonFinite,
   evaluate,
   Generator,
   itemSize,
+  NON_FINITE_ATTRIBUTES_UUID,
   parseJson,
   ReferenceStore,
   render,
@@ -159,14 +164,87 @@ describe("JSON that Python wrote", () => {
   });
 
   test("the store gives zarrita metadata it can parse", async () => {
-    const meta = '{"zarr_format":3,"node_type":"group","attributes":{"resolution":NaN}}';
-    const store = new ReferenceStore({ version: 2, refs: { "zarr.json": meta, "a/zarr.json": meta, "a/c/0": "NaN" } });
+    const meta = '{"zarr_format":3,"node_type":"group","attributes":{"resolution":NaN,"name":"NaN","rate":30000.0}}';
+    const plain = '{"zarr_format":3,"node_type":"group","attributes":{"name":"NaN"}}';
+    const store = new ReferenceStore({
+      version: 2,
+      refs: { "zarr.json": meta, "a/zarr.json": meta, "b/zarr.json": plain, "a/c/0": "NaN" },
+    });
     for (const key of ["/zarr.json", "/a/zarr.json"] as const) {
-      const bytes = await store.get(key);
-      expect(JSON.parse(new TextDecoder().decode(bytes)).attributes).toEqual({ resolution: "NaN" });
+      const attributes = JSON.parse(new TextDecoder().decode(await store.get(key))).attributes;
+      // stored as the Python package now writes them, with the text escaped and the convention registered
+      expect(attributes.resolution).toBe("NaN");
+      expect(attributes.name).toBe("_str_NaN");
+      expect(attributes.zarr_conventions.map((entry: { uuid: string }) => entry.uuid)).toEqual([NON_FINITE_ATTRIBUTES_UUID]);
+      expect(decodeAttributes(attributes)).toEqual({ resolution: Number.NaN, name: "NaN", rate: 30000 });
     }
+    // a node with no such number is left as it is
+    expect(new TextDecoder().decode(await store.get("/b/zarr.json"))).toBe(plain);
     // a chunk is not metadata, and is left as it is
     expect(new TextDecoder().decode(await store.get("/a/c/0"))).toBe("NaN");
+  });
+});
+
+describe("attributes that are not finite numbers", () => {
+  // [decoded, encoded], as in the convention's test vectors
+  const vectors: [unknown, unknown][] = [
+    [Number.NaN, "NaN"],
+    [Infinity, "Infinity"],
+    [-Infinity, "-Infinity"],
+    ["NaN", "_str_NaN"],
+    ["Infinity", "_str_Infinity"],
+    ["-Infinity", "_str_-Infinity"],
+    ["_str_NaN", "_str__str_NaN"],
+    ["_str__str_NaN", "_str__str__str_NaN"],
+    ["_str_hello", "_str_hello"],
+    ["_str_", "_str_"],
+    ["nan", "nan"],
+    ["inf", "inf"],
+    ["+Infinity", "+Infinity"],
+    ["NaN ", "NaN "],
+    ["NaNNaN", "NaNNaN"],
+    ["_STR_NaN", "_STR_NaN"],
+    ["0x7fc00000", "0x7fc00000"],
+    ["", ""],
+    [1.5, 1.5],
+    [0, 0],
+    [null, null],
+    [true, true],
+  ];
+
+  test("are encoded and decoded as the convention says", () => {
+    for (const [decoded, encoded] of vectors) {
+      expect(encodeNonFinite(decoded)).toEqual(encoded);
+      expect(decodeNonFinite(encoded)).toEqual(decoded);
+    }
+    const value = { a: [1, Infinity, "NaN"], b: { c: "_str_NaN", d: [-Infinity] } };
+    const stored = { a: [1, "Infinity", "_str_NaN"], b: { c: "_str__str_NaN", d: ["-Infinity"] } };
+    expect(encodeNonFinite(value)).toEqual(stored);
+    expect(decodeNonFinite(stored)).toEqual(value);
+  });
+
+  test("are decoded only for a node that registers the convention", () => {
+    const other = { uuid: "00000000-0000-0000-0000-000000000000" };
+    const registration = { uuid: NON_FINITE_ATTRIBUTES_UUID };
+    expect(decodeAttributes({ resolution: "NaN" })).toEqual({ resolution: "NaN" });
+    expect(decodeAttributes({ resolution: "NaN", zarr_conventions: [other] })).toEqual({
+      resolution: "NaN",
+      zarr_conventions: [other],
+    });
+    expect(
+      decodeAttributes({ resolution: "NaN", name: "_str_NaN", zarr_conventions: [other, registration] }),
+    ).toEqual({ resolution: Number.NaN, name: "NaN", zarr_conventions: [other] });
+  });
+
+  test("in consolidated metadata are encoded too", () => {
+    const node = '{"zarr_format":3,"node_type":"array","fill_value":"NaN","attributes":{"resolution":NaN}}';
+    const text = `{"zarr_format":3,"node_type":"group","attributes":{},"consolidated_metadata":{"metadata":{"data":${node}}}}`;
+    const meta = JSON.parse(encodeMetadata(text));
+    const attributes = meta.consolidated_metadata.metadata.data.attributes;
+    expect(attributes.resolution).toBe("NaN");
+    expect(decodeAttributes(attributes)).toEqual({ resolution: Number.NaN });
+    expect(meta.attributes).toEqual({});
+    expect(encodeMetadata('{"a": 1}')).toBe('{"a": 1}');
   });
 });
 

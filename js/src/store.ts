@@ -5,7 +5,7 @@ import { ChunkIndex } from "./chunk-index.js";
 import { registerCodecs } from "./codecs.js";
 import { dandiUrlResolver } from "./dandi.js";
 import { type FileRef, type GenEntry, Generator } from "./gen.js";
-import { parseJson, toStrictJson } from "./json.js";
+import { encodeMetadata, parseJson } from "./json.js";
 import { Selection } from "./selection.js";
 
 /** A reference: inline text or base64, inline JSON, or a place in a file. */
@@ -266,8 +266,8 @@ export class ReferenceStore implements AsyncReadable {
       if (typeof ref !== "string") data = new TextEncoder().encode(JSON.stringify(ref));
       else if (ref.startsWith("base64:")) data = decodeBase64(ref.slice("base64:".length));
       else if (key === "zarr.json" || key.endsWith("/zarr.json")) {
-        // zarrita reads metadata with JSON.parse, which refuses the NaN that Python writes in attributes
-        data = new TextEncoder().encode(toStrictJson(ref));
+        // zarrita reads metadata with JSON.parse, which refuses the NaN that older files hold in attributes
+        data = new TextEncoder().encode(encodeMetadata(ref));
       } else data = new TextEncoder().encode(ref);
       return range ? data.subarray(...bounds(range, data.length)) : data;
     }

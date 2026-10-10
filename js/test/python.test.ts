@@ -8,7 +8,7 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import * as zarr from "zarrita";
 import type { RangeQuery } from "zarrita";
 
-import { ReferenceStore, SourceChangedError } from "../src/index.js";
+import { decodeAttributes, ReferenceStore, SourceChangedError } from "../src/index.js";
 import { openLocal } from "../src/node.js";
 
 interface Case {
@@ -80,6 +80,17 @@ describe("arrays match what Python reads", () => {
     expect(binary.refs["whole/c/10/0"]).toEqual([expect.any(String), 12100, 108]);
     expect((await (await open("binary.zarrshadow")).get("/whole/c/10/0"))?.length).toBe(1200);
   });
+});
+
+test("attributes that are not finite numbers are read back", async () => {
+  // Python stores them following the Non-Finite Attributes convention, which zarrita reads as strings
+  const store = await open("hdf5.zarrshadow");
+  const array = await zarr.open.v3(zarr.root(store).resolve("acquisition/contiguous"), { kind: "array" });
+  expect(array.attrs.resolution).toBe("NaN");
+  const attributes = decodeAttributes(array.attrs);
+  expect(attributes.resolution).toBeNaN();
+  expect(attributes.limits).toEqual([-Infinity, Infinity]);
+  expect(attributes).not.toHaveProperty("zarr_conventions");
 });
 
 describe("part of a chunk", () => {

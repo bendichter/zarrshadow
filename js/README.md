@@ -36,7 +36,15 @@ The size limit comes from a measurement: one second of an LFP recording on DANDI
 | 4 MiB | 2 | 1.51 s | 1.30 s |
 | 50 MiB | 1 | 2.29 s | 2.22 s |
 
-Python writes a number that is not finite as a bare `NaN`, `Infinity`, or `-Infinity`, which `JSON.parse` refuses, and NWB files have such attributes (`resolution` of a TimeSeries, for one). The store gives zarrita metadata in which these are the strings `"NaN"`, `"Infinity"`, and `"-Infinity"`, as Zarr v3 writes a fill value. `parseJson` reads the original form into numbers.
+JSON has no representation for `NaN`, `Infinity`, or `-Infinity`, and NWB files have such attributes (`resolution` of a TimeSeries, for one). Reference files store them following the [Non-Finite Attributes Zarr convention](https://github.com/catalystneuro/zarr-non-finite-attributes): the number is written as the string `"NaN"`, `"Infinity"`, or `"-Infinity"`, a string with the same characters is written with the prefix `_str_`, and the group or array registers the convention in its `zarr_conventions` attribute. zarrita returns the attributes as they are stored, and `decodeAttributes` turns them back into numbers and strings:
+
+```ts
+import { decodeAttributes } from "zarrshadow";
+
+const attributes = decodeAttributes(array.attrs); // { resolution: NaN, ... }
+```
+
+Reference files written before this hold the bare words `NaN` and `Infinity`, which `JSON.parse` refuses. The store gives zarrita their metadata in the form above, so both read the same way. `parseJson` reads the bare words into numbers.
 
 zarrita decodes the codecs that references to HDF5 files use (`numcodecs.zlib`, `numcodecs.shuffle`, `numcodecs.blosc`, `numcodecs.zstd`). The store adds `numcodecs.fletcher32`, which drops the checksum without verifying it.
 
