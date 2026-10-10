@@ -375,6 +375,45 @@ write_rfs(manifest_store_to_rfs(store), "air.zarrshadow")
 
 VirtualiZarr's HDF5 parser does not read NWB files, which hold variable-length strings and object references. Use `generate_rfs` for those.
 
+## Icechunk Repositories
+
+[Icechunk](https://icechunk.io) is a transactional store for Zarr v3 that keeps its history as snapshots. Besides the chunks it stores itself, it holds virtual chunks, which are byte ranges of other files, as the references here are. `zarrshadow.icechunk` converts in both directions. Install with `pip install zarrshadow[icechunk]`.
+
+```python
+import icechunk
+import zarr
+from zarrshadow.icechunk import icechunk_to_rfs, rfs_to_icechunk
+
+config = icechunk.RepositoryConfig.default()
+config.set_virtual_chunk_container(
+    icechunk.VirtualChunkContainer("https://api.dandiarchive.org/", icechunk.http_store())
+)
+repo = icechunk.Repository.create(
+    icechunk.local_filesystem_storage("example.icechunk"),
+    config=config,
+    authorize_virtual_chunk_access={"https://api.dandiarchive.org/": icechunk.credentials.HttpAccess},
+)
+session = repo.writable_session("main")
+rfs_to_icechunk("example.zarrshadow", session)
+session.commit("Add the file")
+
+root = zarr.open_group(repo.readonly_session("main").store, mode="r")
+rfs = icechunk_to_rfs(repo.readonly_session("main"))
+```
+
+`rfs_to_icechunk` writes the groups, arrays, and attributes as they are. Each `[url, offset, size]` reference, each entry of a chunk index, and each chunk of a `gen` entry becomes a virtual chunk, and what `refs` holds inline is written into the repository. The ETag recorded under `sources` goes with each virtual chunk, so Icechunk refuses to read a file that has changed, as `RfsStore` does. The size recorded for a local file has no counterpart and is not checked. A repository reads virtual chunks only from the places its virtual chunk containers name, so it needs a container for each place the references point into. A local path is written as a `file://` URL, and `url_for` maps a location to another one, such as a DANDI download URL to the `s3://dandiarchive/blobs/...` object behind it.
+
+Icechunk has no counterpart for some of what a reference file system holds:
+
+- An array with a selection is refused, because its bytes are interleaved with others in the file. With `copy_selections=True` its data is read and written into the repository.
+- A last chunk that is shorter than a full chunk, which `RfsStore` pads, is read and written into the repository. That is at most one chunk for each run of contiguous data.
+- Icechunk refuses metadata that holds `NaN` or `Infinity` as bare words, which is how zarr-python writes such attributes. They are written as the strings `"NaN"`, `"Infinity"`, and `"-Infinity"` and read back as strings. PyNWB does not accept a string where it expects a number, so an NWB file with such an attribute, for example a `TimeSeries` with `resolution=NaN`, does not read through `NWBZarrIO` after this.
+- Consolidated metadata, which hdmf-zarr writes in the root group, is left out. A repository already reads all of its metadata from one snapshot, and a second copy would go stale when the repository changes.
+
+Apart from the attributes above, a virtual NWB file written into a repository reads with `NWBZarrIO(session.store, mode="r")`.
+
+`icechunk_to_rfs` reads the repository with VirtualiZarr's `IcechunkParser`. A virtual chunk becomes a reference to the same byte range, and an array with more than 1,000 chunks in one file gets a chunk index. The chunks the repository stores itself are copied into the references, which suits repositories where those are small, such as strings and coordinates. Pass `native_chunks_prefix`, the location of the repository's `chunks` directory, to reference them where they are instead. `RfsStore` reads local paths and http(s) URLs, so virtual chunks at other locations, such as `s3://`, need `url_for` to map them. A `gen` entry does not come back as one: its chunks return listed in `refs` or in a chunk index.
+
 ## Materializing
 
 `materialize` reads the bytes a reference file system points at and writes them into an ordinary Zarr store, which then no longer depends on the source files.
@@ -525,6 +564,7 @@ zarrshadow/
 ├── nwb.py                   # Virtual NWB files, written through hdmf-zarr
 ├── neuroconv_bridge.py      # NeuroConv's in-memory NWB files → virtual NWB files
 ├── virtualizarr.py          # VirtualiZarr manifests → reference file system and VirtualArray
+├── icechunk.py              # Reference file system ↔ Icechunk repository
 ├── materialize.py           # Reference file system → ordinary Zarr store
 ├── open_rfs.py              # Open RFS as zarr.Group
 ├── rfs_store.py             # Zarr v3 Store backed by reference file system

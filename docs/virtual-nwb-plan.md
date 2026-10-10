@@ -164,7 +164,7 @@ VirtualiZarr's `ManifestArray` and `ManifestStore` cover much of what `VirtualAr
 - VirtualiZarr's HDF5 parser raises on object references and cannot read variable-length strings, so it does not open an NWB file (https://github.com/zarr-developers/VirtualiZarr/issues/1104).
 - A `ManifestArray` cannot select columns, can slice rows inside a chunk only when the array is a single chunk, and has no transpose. Ephys with a sync channel and imaging depend on those.
 - Its kerchunk writer emits Zarr v2 metadata from an xarray Dataset. https://github.com/zarr-developers/VirtualiZarr/pull/1118 adds Zarr v3 metadata as an option.
-- It has no chunk index format. Its answer for large reference sets is kerchunk Parquet, which holds Zarr v2 metadata only, or Icechunk.
+- It has no chunk index format. Its answer for large reference sets is kerchunk Parquet, which holds Zarr v2 metadata only, or Icechunk. `zarrshadow.icechunk` converts between this format and an Icechunk repository, reading the repository with VirtualiZarr's `IcechunkParser`. It writes through Icechunk's own API, because VirtualiZarr's Icechunk writer takes an xarray `Dataset` or `DataTree`.
 
 VirtualiZarr adds concatenation, which `VirtualArray` lacks, and parsers for NetCDF, GRIB, FITS, Zarr, and DMR++. Kerchunk itself went into maintenance mode in September 2026 and points new projects to VirtualiZarr, so proposals about the format belong there.
 

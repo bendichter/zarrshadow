@@ -36,6 +36,10 @@ nwb = [
 virtualizarr = [
     "virtualizarr>=2.7",
 ]
+icechunk = [
+    "icechunk>=2.1",
+    "virtualizarr>=2.7.1",
+]
 dev = [
     "neo>=0.14",
     "pyedflib",
@@ -44,7 +48,8 @@ dev = [
     "hdmf-zarr>=0.14.0",
     "tifffile>=2026.4.11",
     "imagecodecs",
-    "virtualizarr[hdf]>=2.7",
+    "virtualizarr[hdf]>=2.7.1",
+    "icechunk>=2.1",
 ]
 
 [tool.pytest.ini_options]

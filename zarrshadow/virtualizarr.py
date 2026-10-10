@@ -22,6 +22,7 @@ Requires virtualizarr (pip install zarrshadow[virtualizarr]).
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -39,6 +40,7 @@ def manifest_store_to_rfs(
     *,
     index_threshold: int | None = 1000,
     record_sources: bool = True,
+    url_for: Callable[[str], str] | None = None,
 ) -> dict:
     """Write a VirtualiZarr ManifestStore as a reference file system.
 
@@ -51,6 +53,10 @@ def manifest_store_to_rfs(
         index in place of one ref per chunk.
     record_sources : bool
         Record the size and, for remote URLs, the ETag of each referenced file.
+    url_for : callable or None
+        Maps each path in the manifests to the URL or path the references
+        should use. RfsStore reads local paths and http(s) URLs, so paths of
+        other kinds, such as s3://, need mapping. By default a path is kept.
 
     Returns
     -------
@@ -58,18 +64,32 @@ def manifest_store_to_rfs(
         A reference file system dict; see zarrshadow.builder.
     """
     builder = RfsBuilder()
+    _add_manifest_store(builder, store, index_threshold=index_threshold, url_for=url_for)
+    return builder.build(record_sources=record_sources)
+
+
+def _add_manifest_store(
+    builder: RfsBuilder,
+    store: Any,
+    *,
+    index_threshold: int | None,
+    url_for: Callable[[str], str] | None = None,
+) -> None:
+    """The groups, arrays, and chunk locations of a ManifestStore or ManifestGroup."""
+
+    def location(path: str) -> str:
+        return _location(path if url_for is None else url_for(path))
 
     def walk(group: Any, path: str) -> None:
         builder.refs[f"{path}/zarr.json" if path else "zarr.json"] = _metadata_json(group.metadata)
         for name, array in group.arrays.items():
             array_path = f"{path}/{name}" if path else name
-            builder.refs[f"{array_path}/zarr.json"] = _metadata_json(array.metadata)
-            _add_manifest(builder, array_path, array, index_threshold, lambda coords: coords)
+            builder.refs[f"{array_path}/zarr.json"] = _array_metadata_json(array.metadata)
+            _add_manifest(builder, array_path, array, index_threshold, lambda coords: coords, location)
         for name, subgroup in group.groups.items():
             walk(subgroup, f"{path}/{name}" if path else name)
 
     walk(getattr(store, "_group", store), "")
-    return builder.build(record_sources=record_sources)
 
 
 def virtual_array(array: Any) -> VirtualArray:
@@ -102,9 +122,15 @@ class _FromManifest(VirtualArray):
 
 
 def _add_manifest(
-    builder: RfsBuilder, path: str, array: Any, index_threshold: int | None, place: _Place
+    builder: RfsBuilder,
+    path: str,
+    array: Any,
+    index_threshold: int | None,
+    place: _Place,
+    location: Callable[[str], str] | None = None,
 ) -> None:
     """The chunk locations in a ManifestArray's manifest, as refs or as a chunk index."""
+    location = location or _location
     manifest = array.manifest
     paths, offsets, lengths = manifest._paths, manifest._offsets, manifest._lengths
     inlined = getattr(manifest, "_inlined", {})
@@ -119,12 +145,12 @@ def _add_manifest(
     if identity and not inlined and len(urls) == 1 and index_threshold is not None and n_referenced > index_threshold:
         index = np.full((*paths.shape, 2), MISSING, dtype=np.uint64)
         index[referenced, 0], index[referenced, 1] = offsets[referenced], lengths[referenced]
-        builder.add_index(path, _location(str(urls[0])), index)
+        builder.add_index(path, location(str(urls[0])), index)
         return
     for coords in np.argwhere(referenced):
         coords = tuple(int(c) for c in coords)
         builder.refs[chunk_key(path, place(list(coords)))] = [
-            _location(str(paths[coords])),
+            location(str(paths[coords])),
             int(offsets[coords]),
             int(lengths[coords]),
         ]
@@ -179,6 +205,17 @@ def _metadata_json(metadata: Any) -> str:
     from zarr.core.buffer import default_buffer_prototype
 
     return metadata.to_buffer_dict(default_buffer_prototype())["zarr.json"].to_bytes().decode()
+
+
+def _array_metadata_json(metadata: Any) -> str:
+    """An array's zarr.json, naming the chunk keys that the references use, which are joined by "/"."""
+    text = _metadata_json(metadata)
+    meta = json.loads(text)
+    encoding = {"name": "default", "configuration": {"separator": "/"}}
+    if meta.get("chunk_key_encoding") == encoding:
+        return text
+    meta["chunk_key_encoding"] = encoding
+    return json.dumps(meta, separators=(",", ":"))
 
 
 def _location(path: str) -> str:
