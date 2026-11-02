@@ -200,10 +200,24 @@ def virtual_arrays_neo(
 def _blackrock_stream(
     reader: Any, block: int, seg: int, stream_id: str, url_for: Callable[[str], str], chunk_bytes: int
 ) -> VirtualArray:
-    """One nsX file's samples for a segment. NEO maps them time by channel; the stream id is the nsX number."""
-    data = reader.nsx_datas[int(stream_id)][seg]
-    path = f"{reader._filenames['nsx']}.ns{int(stream_id)}"
-    return VirtualArray.from_memmap(data, url=url_for(path), chunk_bytes=chunk_bytes)
+    """One nsX file's samples for a segment, time by channel; the stream id is the nsX number.
+
+    NEO before 0.14.6 keeps a memory map of each segment. Later versions keep
+    where each segment is, with a packet size when every sample is in a
+    packet of its own (FileSpec 3.0 PTP).
+    """
+    nsx = int(stream_id)
+    path = f"{reader._filenames['nsx']}.ns{nsx}"
+    if hasattr(reader, "nsx_datas"):
+        return VirtualArray.from_memmap(reader.nsx_datas[nsx][seg], url=url_for(path), chunk_bytes=chunk_bytes)
+    where = reader._nsx_data_header[nsx][seg]["memmap_kwargs"]
+    shape = (int(where["num_samples"]), int(where.get("num_channels", reader._nsx_basic_header[nsx]["channel_count"])))
+    common = dict(dtype=where["dtype"], offset=int(where["offset"]), file_size=os.path.getsize(path), chunk_bytes=chunk_bytes)
+    if where.get("packet_size") is None:
+        return VirtualArray.contiguous(url_for(path), shape=shape, **common)
+    return VirtualArray.records(
+        url_for(path), shape=shape, record_size=int(where["packet_size"]), skip=int(where.get("item_offset", 0)), **common
+    )
 
 
 def _spikegadgets_stream(
