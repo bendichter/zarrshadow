@@ -38,6 +38,7 @@ from .builder import (
 )
 from .chunk_index import ChunkIndex
 from .gen import Generator
+from .keep_bytes import keep_bytes_codec
 
 # Maps a chunk's coordinates in an array to its coordinates in the array being
 # written, which differ when the array is part of a stack. Coordinates may be
@@ -402,8 +403,8 @@ class VirtualArray:
     ) -> None:
         """Write the array into a builder at path.
 
-        With metadata False only the chunk locations and selection are
-        written, for an array whose zarr.json is already in the builder.
+        With metadata False only the chunk locations are written, for an
+        array whose zarr.json is already in the builder.
         """
         if metadata:
             builder.add_array(
@@ -416,9 +417,6 @@ class VirtualArray:
                 attributes=attributes,
                 dimension_names=dimension_names,
             )
-        selection = self._selection()
-        if selection is not None:
-            builder.add_selection(path, **selection)
         self._add_chunks(builder, path, lambda coords: coords)
 
     def placeholder(self) -> Any:
@@ -428,9 +426,6 @@ class VirtualArray:
         return placeholder(self)
 
     # -- For subclasses --
-
-    def _selection(self) -> dict | None:
-        return None
 
     def _add_chunks(self, builder: RfsBuilder, path: str, place: _Place) -> None:
         raise NotImplementedError
@@ -476,6 +471,14 @@ class _Contiguous(VirtualArray):
         self.shape = shape
         self.data_type = zarr_data_type(dtype)
         self.codecs = bytes_codecs(dtype)
+        if element_offsets is not None:
+            keep: list[list[int]] = []
+            for start in element_offsets.ravel().tolist():
+                if keep and keep[-1][1] == start:
+                    keep[-1][1] = start + dtype.itemsize
+                else:
+                    keep.append([start, start + dtype.itemsize])
+            self.codecs = [*self.codecs, keep_bytes_codec(self._record_bytes, keep)]
         self.chunk_shape = tuple(max(c, 1) for c in contiguous_chunk_shape(shape, dtype.itemsize, chunk_bytes))
         self.attributes = dict(attributes or {})
 
@@ -518,18 +521,6 @@ class _Contiguous(VirtualArray):
             record_bytes=self._record_bytes,
             element_offsets=offsets,
         )
-
-    def _selection(self) -> dict | None:
-        if self._element_offsets is None:
-            return None
-        itemsize = self._dtype.itemsize
-        keep: list[list[int]] = []
-        for start in self._element_offsets.ravel().tolist():
-            if keep and keep[-1][1] == start:
-                keep[-1][1] = start + itemsize
-            else:
-                keep.append([start, start + itemsize])
-        return {"record_size": self._record_bytes, "keep": keep}
 
     def _add_chunks(self, builder: RfsBuilder, path: str, place: _Place) -> None:
         if self.shape[0] == 0:
@@ -592,10 +583,6 @@ class _Referenced(VirtualArray):
             if entry["key"].startswith(prefix + "/")
         ]
         self._index = rfs.get("indexes", {}).get(path)
-        self._chosen = rfs.get("selections", {}).get(path)
-
-    def _selection(self) -> dict | None:
-        return self._chosen
 
     def _add_chunks(self, builder: RfsBuilder, path: str, place: _Place) -> None:
         for coords, value in self._refs.items():
@@ -619,9 +606,6 @@ class _Stacked(VirtualArray):
         self.chunk_shape = (*first.chunk_shape[:axis], 1, *first.chunk_shape[axis:])
         self.data_type, self.codecs, self.fill_value = first.data_type, first.codecs, first.fill_value
         self.attributes = {}
-
-    def _selection(self) -> dict | None:
-        return self._arrays[0]._selection()
 
     def _add_chunks(self, builder: RfsBuilder, path: str, place: _Place) -> None:
         axis = self._axis
@@ -665,9 +649,6 @@ class _Taken(VirtualArray):
         self.data_type, self.codecs, self.fill_value = array.data_type, array.codecs, array.fill_value
         self.attributes = dict(array.attributes)
         self.dimension_names = array.dimension_names
-
-    def _selection(self) -> dict | None:
-        return self._array._selection()
 
     def _add_chunks(self, builder: RfsBuilder, path: str, place: _Place) -> None:
         _add_listed_chunks(builder, path, place, self._picked_chunks(), self.shape, self.chunk_shape)
@@ -810,9 +791,6 @@ class _Transposed(VirtualArray):
             stored = [axes.index(a) for a in range(len(axes))]
             self.codecs = [{"name": "transpose", "configuration": {"order": stored}}, *array.codecs]
 
-    def _selection(self) -> dict | None:
-        return self._array._selection()
-
     def _add_chunks(self, builder: RfsBuilder, path: str, place: _Place) -> None:
         axes = self._axes
         self._array._add_chunks(builder, path, lambda coords: place([coords[a] for a in axes]))
@@ -821,8 +799,8 @@ class _Transposed(VirtualArray):
 def stack(arrays: Sequence[VirtualArray], axis: int = 0) -> VirtualArray:
     """Join arrays along a new axis, like numpy.stack.
 
-    The arrays must have the same shape, data type, chunking, codecs, and
-    selection. Each keeps its chunks, which get one more coordinate, so files
+    The arrays must have the same shape, data type, chunking, and codecs,
+    including any keep_bytes codec. Each keeps its chunks, which get one more coordinate, so files
     that each hold one channel, frame, or plane become one array.
     """
     arrays = list(arrays)
@@ -839,6 +817,4 @@ def stack(arrays: Sequence[VirtualArray], axis: int = 0) -> VirtualArray:
                     f"Cannot stack: array {i} has {name} {getattr(array, name)!r}, "
                     f"and array 0 has {getattr(first, name)!r}"
                 )
-        if array._selection() != first._selection():
-            raise ValueError(f"Cannot stack: array {i} and array 0 select different bytes of each record")
     return _Stacked(arrays, axis)

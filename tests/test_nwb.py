@@ -64,7 +64,7 @@ def test_virtual_nwb(sources, tmp_path):
 
     # The signals are references into the five source files, and nothing of them is stored
     assert len(rfs["sources"]) == 5
-    assert rfs["selections"] == {
+    assert _selections(rfs) == {
         "acquisition/ElectricalSeries/data": {"record_size": 34, "keep": [[0, 32]]},
         "acquisition/sync/data": {"record_size": 34, "keep": [[32, 34]]},
     }
@@ -171,3 +171,14 @@ def test_tiff_movie_as_two_photon_series(tmp_path, options):
         np.testing.assert_array_equal(data[...], x.transpose(0, 2, 1))
         np.testing.assert_array_equal(data[7, 10:20, 5], x[7, 5, 10:20])
         assert pynwb.validate(io=io) == []
+
+
+def _selections(rfs):
+    """The keep_bytes codec configuration of each array that has one."""
+    out = {}
+    for key, meta in rfs["refs"].items():
+        if key.endswith("zarr.json"):
+            for codec in json.loads(meta).get("codecs", []):
+                if codec.get("name") == "shadowzarr.keep_bytes":
+                    out[key[: -len("/zarr.json")] if "/" in key else ""] = codec["configuration"]
+    return out

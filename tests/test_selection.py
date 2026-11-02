@@ -1,4 +1,4 @@
-"""Selections: arrays whose chunks are stored with other bytes in every record."""
+"""Selections: arrays whose chunks are stored with other bytes in every record, read with the keep_bytes codec."""
 
 import asyncio
 import functools
@@ -14,7 +14,8 @@ from zarr.abc.store import OffsetByteRequest, RangeByteRequest, SuffixByteReques
 import shadowzarr.rfs_store
 from shadowzarr import RfsBuilder, RfsStore, open_rfs, write_rfs
 from shadowzarr.builder import columns_selection
-from shadowzarr.rfs_store import Selection, _array_path
+from shadowzarr.keep_bytes import KeepBytesCodec
+from shadowzarr.rfs_store import _array_path
 
 N_COLUMNS, HEADER, ROWS, CHUNK_ROWS = 17, 12, 10_000, 1000
 
@@ -52,11 +53,17 @@ def test_columns_selection():
         columns_selection(4, 2, [])
 
 
+def _codecs(rfs, path="data"):
+    return json.loads(rfs["refs"][f"{path}/zarr.json"])["codecs"]
+
+
 def test_leading_columns(recording):
     path, x = recording
     rfs = _builder(path, x, slice(0, 16)).build()
-    assert rfs["version"] == 2
-    assert rfs["selections"] == {"data": {"record_size": 34, "keep": [[0, 32]]}}
+    assert _codecs(rfs) == [
+        {"name": "bytes", "configuration": {"endian": "little"}},
+        {"name": "shadowzarr.keep_bytes", "configuration": {"record_size": 34, "keep": [[0, 32]]}},
+    ]
     data = open_rfs(rfs)["data"]
     assert data.shape == (ROWS, 16)
     np.testing.assert_array_equal(data[...], x[:, :16])
@@ -102,20 +109,41 @@ def test_written_forms(recording, tmp_path):
     write_rfs(rfs, str(tmp_path / "raw.shadowzarr"))
     np.testing.assert_array_equal(open_rfs(str(tmp_path / "raw.shadowzarr"))["data"][...], x[:, :16])
 
-    # A single file cannot be version 1, which has no way to express a selection
+    # A single file is plain version 1 kerchunk, with the selection in the array's codecs
     write_rfs(rfs, str(tmp_path / "raw.json"))
     written = json.loads((tmp_path / "raw.json").read_text())
-    assert written["version"] == 2 and "gen" not in written
-    assert written["selections"] == rfs["selections"]
+    assert written["version"] == 1 and "gen" not in written
     np.testing.assert_array_equal(open_rfs(str(tmp_path / "raw.json"))["data"][...], x[:, :16])
+
+
+def test_read_without_shadowzarr_store(recording, tmp_path):
+    """fsspec's reference file system and zarr-python read the references, with the codec registered."""
+    import fsspec
+    import zarr
+    from fsspec.implementations.asyn_wrapper import AsyncFileSystemWrapper
+
+    path, x = recording
+    write_rfs(_builder(path, x, [5, 2, 3, 16]).build(record_sources=False), str(tmp_path / "raw.json"))
+    fs = fsspec.filesystem("reference", fo=str(tmp_path / "raw.json"))
+    store = zarr.storage.FsspecStore(AsyncFileSystemWrapper(fs, asynchronous=True), read_only=True)
+    np.testing.assert_array_equal(zarr.open_array(store, path="data", mode="r")[...], x[:, [5, 2, 3, 16]])
 
 
 def test_invalid_selections(recording):
     path, x = recording
     builder = RfsBuilder()
+    with pytest.raises(KeyError, match="before its selection"):
+        builder.add_selection("data", 8, [[0, 2]])
+    builder.add_array("data", shape=[10, 1], data_type="int16", chunk_shape=[10, 1])
     for record_size, keep in [(0, [[0, 1]]), (8, []), (8, [[4, 4]]), (8, [[6, 10]]), (8, [[-1, 2]])]:
         with pytest.raises(ValueError):
             builder.add_selection("data", record_size, keep)
+    # A second selection replaces the first
+    builder.add_selection("data", 8, [[0, 2]])
+    builder.add_selection("data", 4, [[2, 4]])
+    assert _codecs(builder.build())[1:] == [
+        {"name": "shadowzarr.keep_bytes", "configuration": {"record_size": 4, "keep": [[2, 4]]}}
+    ]
 
     # A reference that is not a whole number of records
     builder = _builder(path, x, slice(0, 16))
@@ -125,15 +153,17 @@ def test_invalid_selections(recording):
         open_rfs(builder.build())["data"][:10]
 
 
-def test_selection_source_range():
-    selection = Selection(record_size=10, keep=[[2, 6], [8, 10]])  # 6 of every 10 bytes
+def test_codec():
+    codec = KeepBytesCodec(record_size=10, keep=[[2, 6], [8, 10]])  # 6 of every 10 bytes
     data = bytes(range(40))
-    assert selection.apply(data) == bytes([2, 3, 4, 5, 8, 9, 12, 13, 14, 15, 18, 19, 22, 23, 24, 25, 28, 29,
-                                           32, 33, 34, 35, 38, 39])
-    assert selection.selected_size(40) == 24
-    assert selection.source_range(0, 6) == (0, 10, 0)
-    assert selection.source_range(7, 13) == (10, 20, 1)
-    assert selection.source_range(12, 18) == (20, 10, 0)
+    assert codec.apply(data) == bytes([2, 3, 4, 5, 8, 9, 12, 13, 14, 15, 18, 19, 22, 23, 24, 25, 28, 29,
+                                       32, 33, 34, 35, 38, 39])
+    assert codec.kept == 6 and codec.encoded_size(24) == 40
+    assert KeepBytesCodec.from_dict(codec.to_dict()) == codec
+    with pytest.raises(ValueError, match="not a whole number of 10 byte records"):
+        codec.apply(data[:35])
+    with pytest.raises(ValueError, match="Invalid keep_bytes"):
+        KeepBytesCodec(record_size=10, keep=[[8, 12]])
 
 
 def test_array_path():
@@ -163,23 +193,17 @@ def reads(monkeypatch):
     return log
 
 
-def test_part_of_a_chunk_reads_only_its_records(recording, reads):
+def test_part_of_a_chunk_is_a_range_of_its_records(recording, reads):
+    """A byte range of a chunk is a range of the records in the file, which the codec decodes."""
     path, x = recording
     store = RfsStore(_builder(path, x, slice(0, 16)).build())
-    chunk = x[2000:3000, :16].tobytes()  # chunk 2: 1,000 rows of 32 selected bytes
+    records = x[2000:3000].tobytes()  # chunk 2: 1,000 rows of 34 bytes
 
     reads.clear()
-    assert _get(store, "data/c/2/0", RangeByteRequest(100 * 32, 110 * 32)) == chunk[3200:3520]
+    assert _get(store, "data/c/2/0", RangeByteRequest(100 * 34, 110 * 34)) == records[3400:3740]
     assert reads == [(HEADER + 2100 * 34, 10 * 34)]
-
-    reads.clear()  # a range that starts and ends inside a row reads the whole rows it touches
-    assert _get(store, "data/c/2/0", RangeByteRequest(3210, 3250)) == chunk[3210:3250]
-    assert reads == [(HEADER + 2100 * 34, 2 * 34)]
-
-    assert _get(store, "data/c/2/0", OffsetByteRequest(31_000)) == chunk[31_000:]
-    assert _get(store, "data/c/2/0", SuffixByteRequest(64)) == chunk[-64:]
-    assert _get(store, "data/c/2/0", RangeByteRequest(5, 5)) == b""
-    assert _get(store, "data/c/2/0") == chunk
+    assert _get(store, "data/c/2/0", SuffixByteRequest(68)) == records[-68:]
+    assert _get(store, "data/c/2/0") == records
 
 
 def test_part_of_a_chunk_without_a_selection(recording, reads):
@@ -200,17 +224,17 @@ def test_part_of_a_chunk_without_a_selection(recording, reads):
 
 
 def test_part_of_a_padded_chunk(recording, reads):
-    """The padding of a short last chunk is not read from the file."""
+    """The padding of a short last chunk, whole records of zeros, is not read from the file."""
     path, x = recording
     store = RfsStore(_builder(path, x, slice(0, 16), chunk_rows=3000).build())
-    chunk = x[9000:, :16].tobytes() + b"\0" * (2000 * 32)
+    records = x[9000:].tobytes() + b"\0" * (2000 * 34)
     reads.clear()
-    assert _get(store, "data/c/3/0", RangeByteRequest(990 * 32, 1010 * 32)) == chunk[990 * 32 : 1010 * 32]
+    assert _get(store, "data/c/3/0", RangeByteRequest(990 * 34, 1010 * 34)) == records[990 * 34 : 1010 * 34]
     assert reads == [(HEADER + 9990 * 34, 10 * 34)]
     reads.clear()
-    assert _get(store, "data/c/3/0", RangeByteRequest(2000 * 32, 2001 * 32)) == b"\0" * 32
+    assert _get(store, "data/c/3/0", RangeByteRequest(2000 * 34, 2001 * 34)) == b"\0" * 34
     assert reads == []
-    assert _get(store, "data/c/3/0") == chunk
+    assert _get(store, "data/c/3/0") == records
 
 
 class _RangeHandler(http.server.SimpleHTTPRequestHandler):

@@ -142,7 +142,7 @@ def main(folder):
     record("hdf5.json", os.path.join(folder, "hdf5.json"), expected)
 
     rfs, expected = binary_arrays(folder)
-    assert rfs["version"] == 2 and rfs["selections"] and rfs["gen"]
+    assert rfs["version"] == 2 and rfs["gen"] and '"shadowzarr.keep_bytes"' in rfs["refs"]["packets/zarr.json"]
     write_rfs(rfs, os.path.join(folder, "binary.shadowzarr"))
     record("binary.shadowzarr", os.path.join(folder, "binary.shadowzarr"), expected)
 

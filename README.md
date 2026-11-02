@@ -22,7 +22,7 @@ shadowzarr sits between the libraries that understand source formats and the lib
 
 ![shadowzarr reads the headers of source files and writes kerchunk references, which zarr-python reads through shadowzarr's store while fetching byte ranges from the source files; materialize turns the references into an ordinary Zarr store; in MATLAB, matzarr indexes MAT files for zarr-matlab](docs/images/ecosystem.svg)
 
-On the writing side, shadowzarr reads only headers, through h5py, tifffile, and NEO, and writes references in the [kerchunk](https://fsspec.github.io/kerchunk/spec.html) JSON format with Zarr v3 keys. For an NWB file, hdmf-zarr and PyNWB write the file's structure, and NeuroConv can supply the file to write, which is experimental. On the reading side, `RfsStore` is a zarr-python store, so anything built on zarr-python reads the references, including hdmf-zarr's `NWBZarrIO`. A version 1 file is plain kerchunk, which fsspec reads too. A version 2 file, which uses `gen`, `indexes`, or `selections`, needs shadowzarr's store.
+On the writing side, shadowzarr reads only headers, through h5py, tifffile, and NEO, and writes references in the [kerchunk](https://fsspec.github.io/kerchunk/spec.html) JSON format with Zarr v3 keys. For an NWB file, hdmf-zarr and PyNWB write the file's structure, and NeuroConv can supply the file to write, which is experimental. On the reading side, `RfsStore` is a zarr-python store, so anything built on zarr-python reads the references, including hdmf-zarr's `NWBZarrIO`. A version 1 file is plain kerchunk, which fsspec reads too. A version 2 file, which uses `gen` or `indexes`, needs shadowzarr's store. An array whose bytes are interleaved with others in the file uses the `shadowzarr.keep_bytes` codec, which zarr-python finds once shadowzarr is installed.
 
 MATLAB has a parallel path for MAT files. [matzarr](https://github.com/catalystneuro/matzarr) indexes a `.mat` file into Zarr v3 metadata and a `manifest.json`, which the `ManifestStore` of [zarr-matlab](https://github.com/catalystneuro/zarr-matlab) reads, and a script in matzarr translates that index into kerchunk references. zarr-matlab does not read kerchunk references, so the references shadowzarr writes cannot be read from MATLAB as they are.
 
@@ -144,9 +144,9 @@ Opening the directory reads only `refs.json`. Each index is itself an ordinary Z
 }
 ```
 
-`refs` holds the Zarr metadata, small datasets, and a `[url, offset, size]` entry for each chunk of an array with at most 1,000 chunks. Strings and tables of object references are also held in `refs`, because HDF5 keeps them in heaps that a byte range cannot address, and a chunk of 4 KiB or more held there is compressed with zstd. For each larger array, `indexes` gives the file its chunks are in and the path of its index array, relative to `refs.json`. There is nothing in between: a reader looks up the array in `indexes`, opens that Zarr array, and reads the index chunk it needs. `gen`, `selections`, and `sources` are described below.
+`refs` holds the Zarr metadata, small datasets, and a `[url, offset, size]` entry for each chunk of an array with at most 1,000 chunks. Strings and tables of object references are also held in `refs`, because HDF5 keeps them in heaps that a byte range cannot address, and a chunk of 4 KiB or more held there is compressed with zstd. For each larger array, `indexes` gives the file its chunks are in and the path of its index array, relative to `refs.json`. There is nothing in between: a reader looks up the array in `indexes`, opens that Zarr array, and reads the index chunk it needs. `gen`, the `keep_bytes` codec, and `sources` are described below.
 
-A directory that uses `indexes`, `gen`, or `selections` is marked `"version": 2`, so readers that only know version 1 of the kerchunk format refuse it instead of returning fill values for the chunks they cannot find. Writing to a path ending in `.json` produces a version 1 file with every chunk listed in `refs`, which any kerchunk reader can open. A file with `selections` stays version 2, because version 1 cannot express them.
+A directory that uses `indexes` or `gen` is marked `"version": 2`, so readers that only know version 1 of the kerchunk format refuse it instead of returning fill values for the chunks they cannot find. Writing to a path ending in `.json` produces a version 1 file with every chunk listed in `refs`, which any kerchunk reader can open.
 
 ### Contiguous Datasets
 
@@ -160,13 +160,18 @@ shadowzarr computes a slab's offset when that chunk is requested. The slab heigh
 
 ### Arrays Stored with Other Bytes
 
-Some files store an array together with bytes that do not belong to it. A SpikeGLX recording holds 384 neural channels and one sync channel, interleaved sample by sample, so no byte range contains the neural channels alone. Other formats put a header in front of every sample. For these, `selections` says which bytes of the file belong to the array:
+Some files store an array together with bytes that do not belong to it. A SpikeGLX recording holds 384 neural channels and one sync channel, interleaved sample by sample, so no byte range contains the neural channels alone. Other formats put a header in front of every sample. For these, the array's codecs say which bytes of the file belong to it, with the `shadowzarr.keep_bytes` codec right after the `bytes` codec:
 
 ```json
-"selections": {"imec0.ap": {"record_size": 770, "keep": [[0, 768]]}}
+"codecs": [
+  {"name": "bytes", "configuration": {"endian": "little"}},
+  {"name": "shadowzarr.keep_bytes", "configuration": {"record_size": 770, "keep": [[0, 768]]}}
+]
 ```
 
-Every reference of the array is read as consecutive records of `record_size` bytes, here one sample of all 385 int16 channels. From each record the byte ranges in `keep` are taken and joined in the order listed, and the rest is dropped. The Zarr metadata describes only the selected data, a 384-column array with the plain `bytes` codec, so nothing in the codec chain is specific to shadowzarr. Listing several ranges keeps columns that are not next to each other, and listing them in another order reorders the columns. A selection applies to uncompressed data.
+Every chunk of the array is read as consecutive records of `record_size` bytes, here one sample of all 385 int16 channels. From each record the byte ranges in `keep` are taken and joined in the order listed, and the rest is dropped. The rest of the Zarr metadata describes only the selected data, a 384-column array. Listing several ranges keeps columns that are not next to each other, and listing them in another order reorders the columns. The codec applies to uncompressed data, and since what it drops cannot be restored, it only decodes.
+
+Because the selection is a codec, the references stay plain `[url, offset, size]` byte ranges, so a single `.json` file is version 1 kerchunk and an Icechunk repository holds the chunks as virtual chunks. The codec is registered with zarr-python under the `zarr.codecs` entry point when shadowzarr is installed, so fsspec's reference file system, Icechunk, and anything else built on zarr-python read these arrays without shadowzarr's store. The JavaScript store registers it with zarrita.js. `RfsBuilder.add_selection` adds the codec to an array that is already in the builder:
 
 ```python
 from shadowzarr import RfsBuilder
@@ -182,7 +187,7 @@ builder.add_contiguous_chunks(
 )
 ```
 
-A request for part of a chunk reads only the records that hold it, with or without a selection, so reading a few samples from a large chunk does not fetch the whole chunk.
+A request for part of a chunk reads only those bytes of the file. For an array with the `keep_bytes` codec, the chunk is the records as the file stores them, so the range is of the records; zarr-python reads whole chunks of such an array.
 
 ### Detecting Changed Files
 
@@ -274,7 +279,7 @@ neural.add_to(builder, "neural", dimension_names=["time", "channel"])
 rfs = builder.build()
 ```
 
-A slice along the first axis of a contiguous array moves the byte range. A slice or a list of indices along a later axis becomes a selection. Any other array can be indexed by whole chunks: any slice or list along an axis with one element per chunk, such as the pages of a TIFF stack (`pages[::2]`), and slices that start and stop on chunk boundaries elsewhere. `VirtualArray.from_chunks` makes an uncompressed array from chunks given one by one, each a file, an offset, and a length. `stack` joins arrays of the same shape, data type, and chunking along a new axis: each keeps its chunks, which get one more coordinate. `transpose` puts the axes in another order, as for a TIFF stack stored (page, row, column) that an NWB `TwoPhotonSeries` wants as (frame, x, y): `pages.transpose(0, 2, 1)`. The chunks stay as the file has them, and the array gets the Zarr `transpose` codec when a chunk's bytes depend on the order, which they do not when the chunk extends along one axis only. zarr-python reads whole chunks from an array with that codec, so it suits small chunks such as one frame. `VirtualArray.from_rfs(rfs, path)` takes an array from a reference file system that a generator built, which can be placed in another file or stacked. Only contiguous arrays can be sliced inside their chunks, and before they are stacked or transposed, because slicing inside the chunks of any other array would need its data. Joining arrays end to end along an existing axis is not supported.
+A slice along the first axis of a contiguous array moves the byte range. A slice or a list of indices along a later axis becomes a `keep_bytes` codec. Any other array can be indexed by whole chunks: any slice or list along an axis with one element per chunk, such as the pages of a TIFF stack (`pages[::2]`), and slices that start and stop on chunk boundaries elsewhere. `VirtualArray.from_chunks` makes an uncompressed array from chunks given one by one, each a file, an offset, and a length. `stack` joins arrays of the same shape, data type, and chunking along a new axis: each keeps its chunks, which get one more coordinate. `transpose` puts the axes in another order, as for a TIFF stack stored (page, row, column) that an NWB `TwoPhotonSeries` wants as (frame, x, y): `pages.transpose(0, 2, 1)`. The chunks stay as the file has them, and the array gets the Zarr `transpose` codec when a chunk's bytes depend on the order, which they do not when the chunk extends along one axis only. zarr-python reads whole chunks from an array with that codec, so it suits small chunks such as one frame. `VirtualArray.from_rfs(rfs, path)` takes an array from a reference file system that a generator built, which can be placed in another file or stacked. Only contiguous arrays can be sliced inside their chunks, and before they are stacked or transposed, because slicing inside the chunks of any other array would need its data. Joining arrays end to end along an existing axis is not supported.
 
 Some formats store a packet for every sample, with a header before the values. `VirtualArray.records` describes those: each row of the array is in one record of fixed size, after `skip` bytes. `VirtualArray.from_memmap` takes a `numpy.memmap`, or a view of one, and returns the part of the file it shows, which is a short way to reference what a reader already maps into memory.
 
@@ -403,9 +408,8 @@ rfs = icechunk_to_rfs(repo.readonly_session("main"))
 
 `rfs_to_icechunk` writes the groups, arrays, and attributes as they are. Each `[url, offset, size]` reference, each entry of a chunk index, and each chunk of a `gen` entry becomes a virtual chunk, and what `refs` holds inline is written into the repository. The ETag recorded under `sources` goes with each virtual chunk, so Icechunk refuses to read a file that has changed, as `RfsStore` does. The size recorded for a local file has no counterpart and is not checked. A repository reads virtual chunks only from the places its virtual chunk containers name, so it needs a container for each place the references point into. A local path is written as a `file://` URL, and `url_for` maps a location to another one, such as a DANDI download URL to the `s3://dandiarchive/blobs/...` object behind it.
 
-Icechunk has no counterpart for some of what a reference file system holds:
+Icechunk has no counterpart for some of what a reference file system holds. An array with the `keep_bytes` codec keeps it in its metadata and its chunks are virtual like any others, so reading the repository needs shadowzarr installed.
 
-- An array with a selection is refused, because its bytes are interleaved with others in the file. With `copy_selections=True` its data is read and written into the repository.
 - A last chunk that is shorter than a full chunk, which `RfsStore` pads, is read and written into the repository. That is at most one chunk for each run of contiguous data.
 - Icechunk refuses metadata that holds `NaN` or `Infinity` as bare words, which is how zarr-python writes such attributes. They are written as the strings `"NaN"`, `"Infinity"`, and `"-Infinity"` and read back as strings. PyNWB does not accept a string where it expects a number, so an NWB file with such an attribute, for example a `TimeSeries` with `resolution=NaN`, does not read through `NWBZarrIO` after this.
 - Consolidated metadata, which hdmf-zarr writes in the root group, is left out. A repository already reads all of its metadata from one snapshot, and a second copy would go stale when the repository changes.
@@ -441,7 +445,7 @@ A virtual NWB file materializes into an NWB Zarr file that `NWBZarrIO` opens fro
 
 ## Reading in JavaScript
 
-`js/` holds a [zarrita.js](https://github.com/manzt/zarrita.js) store that reads these reference files in a browser or in Node, including chunk indexes, `gen` entries, and selections. Its tests read files that the Python package writes and compare every array with what Python reads. See [js/README.md](js/README.md). It is not on npm yet.
+`js/` holds a [zarrita.js](https://github.com/manzt/zarrita.js) store that reads these reference files in a browser or in Node, including chunk indexes, `gen` entries, and the `keep_bytes` codec. Its tests read files that the Python package writes and compare every array with what Python reads. See [js/README.md](js/README.md). It is not on npm yet.
 
 ```ts
 import * as zarr from "zarrita";

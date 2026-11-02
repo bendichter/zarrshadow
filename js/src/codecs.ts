@@ -1,5 +1,7 @@
 import { registry } from "zarrita";
 
+import { KEEP_BYTES, KeepBytesCodec } from "./keep-bytes.js";
+
 /**
  * The checksum HDF5's fletcher32 filter appends to a chunk. Decoding drops
  * its four bytes. The checksum is not verified.
@@ -25,4 +27,5 @@ export function registerCodecs(): void {
   // zarrita types its registry for its own codecs
   const codecs = registry as unknown as Map<string, () => unknown>;
   if (!codecs.has("numcodecs.fletcher32")) codecs.set("numcodecs.fletcher32", () => Fletcher32Codec);
+  if (!codecs.has(KEEP_BYTES)) codecs.set(KEEP_BYTES, () => KeepBytesCodec);
 }

@@ -169,24 +169,24 @@ def test_native_chunks_can_be_referenced(recording, repo, tmp_path):
 
 
 def test_selection(recording, repo):
-    """An array that is some of the columns of a file has no virtual form in Icechunk."""
+    """An array that is some of the columns of a file is virtual, through its keep_bytes codec."""
     path, x = recording
     builder = RfsBuilder()
     builder.add_group("")
     raw = VirtualArray.contiguous(path, shape=x.shape, dtype="<i2", offset=12, chunk_bytes=34_000)
     raw[:, :16].add_to(builder, "neural")
     raw.add_to(builder, "all")
-    rfs = builder.build()
 
-    with pytest.raises(NotImplementedError, match="copy_selections=True"):
-        rfs_to_icechunk(rfs, repo.writable_session("main"))
-
-    session = _committed(repo, rfs, copy_selections=True)
+    session = _committed(repo, builder.build())
     root = zarr.open_group(session.store, mode="r")
+    assert root["neural"].metadata.codecs[-1].to_dict()["name"] == "shadowzarr.keep_bytes"
     np.testing.assert_array_equal(root["neural"][...], x[:, :16])
     np.testing.assert_array_equal(root["all"][...], x)
-    assert _chunk_kinds(session, "neural") == {"native": 10}
-    assert _chunk_kinds(session, "all") == {"native": 1, "virtual": 10}
+    # Only the short last chunk, which RfsStore pads, is copied
+    assert _chunk_kinds(session, "neural") == {"native": 1, "virtual": 9}
+
+    # And back
+    np.testing.assert_array_equal(open_rfs(icechunk_to_rfs(session))["neural"][...], x[:, :16])
 
 
 def test_file_outside_the_containers(recording, repo, tmp_path):

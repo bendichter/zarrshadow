@@ -10,8 +10,6 @@ It handles:
 - Chunk padding for contiguous HDF5 datasets
 - Chunk indexes for arrays with many chunks (see chunk_index.py)
 - kerchunk "gen" entries, evaluated when a key is requested (see gen.py)
-- Selections, for arrays stored with other bytes in every record (see
-  RfsBuilder.add_selection)
 - Byte range requests, which fetch only the part of a chunk that is asked for
 
 Ported from lindi's LindiReferenceFileSystemStore, adapted for zarr v3.
@@ -34,6 +32,7 @@ from zarr.core.buffer import Buffer, BufferPrototype, default_buffer_prototype
 
 from .chunk_index import ChunkIndex
 from .gen import Generator
+from .keep_bytes import NAME as KEEP_BYTES, find_keep_bytes
 from .sources import SourceChangedError, SourceChecker
 from .url_resolver import resolve_url
 
@@ -88,7 +87,7 @@ class RfsStore(Store):
         ----------
         rfs : dict
             Reference file system dict with "refs" key, and optional
-            "templates", "gen", "indexes", "selections", and "sources".
+            "templates", "gen", "indexes", and "sources".
         local_cache : LocalCache or None
             Optional local cache for persisting remote chunk data on disk.
         merge_gap : int
@@ -125,7 +124,6 @@ class RfsStore(Store):
             for path, entry in rfs.get("indexes", {}).items()
         }
         self._generators = [Generator(entry, rfs.get("templates", {})) for entry in rfs.get("gen", [])]
-        self._selections = {path: Selection(**entry) for path, entry in rfs.get("selections", {}).items()}
         self._children: dict[str, set[str]] | None = None
         self._array_meta: dict[str, dict | None] = {}
         self._is_open = True
@@ -524,12 +522,9 @@ class RfsStore(Store):
     def _finish(self, key: str, data: bytes) -> bytes:
         """Turn the bytes of a reference into the chunk a reader decodes.
 
-        The array's selection, if it has one, is applied, and a final chunk of
-        a contiguous dataset that is shorter than a full chunk is padded.
+        A final chunk of a contiguous dataset that is shorter than a full chunk
+        is padded.
         """
-        selection = self._selection_for(key)
-        if selection is not None:
-            data = selection.apply(data)
         padded_size = self._get_padded_size(key, len(data))
         if padded_size is not None:
             data = data + b"\0" * (padded_size - len(data))
@@ -537,32 +532,17 @@ class RfsStore(Store):
 
     def _read_part(self, key: str, url_or_path: str, offset: int, length: int, byte_range: ByteRequest) -> bytes:
         """Read part of a chunk, fetching only the bytes of the file that hold it."""
-        selection = self._selection_for(key)
-        stored = length if selection is None else selection.selected_size(length)
-        total = self._get_padded_size(key, stored) or stored
+        total = self._get_padded_size(key, length) or length
         start, stop = _range_bounds(byte_range, total)
         if stop <= start:
             return b""
-        available = min(stop, stored)  # past this, the chunk is padding
+        available = min(stop, length)  # past this, the chunk is padding
         data = b""
         if start < available:
-            if selection is None:
-                data = _read_bytes_from_url_or_path(
-                    url_or_path, offset + start, available - start, session=self._session, checker=self._sources
-                )
-            else:
-                source_start, source_length, skip = selection.source_range(start, available)
-                data = _read_bytes_from_url_or_path(
-                    url_or_path, offset + source_start, source_length, session=self._session, checker=self._sources
-                )
-                data = selection.apply(data)[skip : skip + available - start]
+            data = _read_bytes_from_url_or_path(
+                url_or_path, offset + start, available - start, session=self._session, checker=self._sources
+            )
         return data + b"\0" * (stop - start - len(data))
-
-    def _selection_for(self, key: str) -> Selection | None:
-        if not self._selections:
-            return None
-        path = _array_path(key)
-        return None if path is None else self._selections.get(path)
 
     def _get_padded_size(self, key: str, nbytes: int) -> int | None:
         """The full size of a chunk of nbytes that needs padding (final chunk in contiguous dataset).
@@ -601,7 +581,9 @@ class RfsStore(Store):
         meta = self._array_meta[meta_key]
         if meta is None:
             return None
-        if any(codec.get("name") != "bytes" for codec in meta.get("codecs", [])):
+        codecs = meta.get("codecs", [])
+        keep_bytes = find_keep_bytes(codecs)
+        if any(codec.get("name") != "bytes" for codec in codecs if codec.get("name") != KEEP_BYTES):
             return None
 
         chunk_shape = meta.get("chunk_grid", {}).get("configuration", {}).get("chunk_shape")
@@ -627,6 +609,13 @@ class RfsStore(Store):
             return None
 
         expected_size = int(np.prod(chunk_shape)) * dtype.itemsize
+        if keep_bytes is not None:
+            # The chunk is whole records of the file, from which the codec keeps the array's bytes
+            if nbytes % keep_bytes.record_size:
+                raise ValueError(
+                    f"A reference of {nbytes} bytes is not a whole number of {keep_bytes.record_size} byte records"
+                )
+            expected_size = keep_bytes.encoded_size(expected_size)
         if nbytes < expected_size:
             return expected_size
 
@@ -743,45 +732,3 @@ def _array_path(key: str) -> str | None:
         return head
     return None
 
-
-class Selection:
-    """Which bytes of every record in the file belong to an array.
-
-    A reference is read as consecutive records of record_size bytes. From each one,
-    the [start, stop) ranges in keep are taken and joined in the order listed.
-    See RfsBuilder.add_selection.
-    """
-
-    def __init__(self, record_size: int, keep: list[list[int]]) -> None:
-        self.record_size = int(record_size)
-        self.keep = [(int(a), int(b)) for a, b in keep]
-        if self.record_size <= 0 or not self.keep or any(not 0 <= a < b <= self.record_size for a, b in self.keep):
-            raise ValueError(f"Invalid selection: record_size {record_size}, keep {keep}")
-        self.kept = sum(b - a for a, b in self.keep)
-
-    def selected_size(self, source_size: int) -> int:
-        """The size of what is kept from source_size bytes of the file."""
-        if source_size % self.record_size:
-            raise ValueError(
-                f"A reference of {source_size} bytes is not a whole number of {self.record_size} byte records"
-            )
-        return source_size // self.record_size * self.kept
-
-    def apply(self, data: bytes) -> bytes:
-        """Keep the selected bytes of every record in data."""
-        self.selected_size(len(data))
-        records = np.frombuffer(data, dtype=np.uint8).reshape(-1, self.record_size)
-        if len(self.keep) == 1:
-            start, stop = self.keep[0]
-            return records[:, start:stop].tobytes()
-        return np.concatenate([records[:, a:b] for a, b in self.keep], axis=1).tobytes()
-
-    def source_range(self, start: int, stop: int) -> tuple[int, int, int]:
-        """Where bytes [start, stop) of the selected data are in the file.
-
-        Returns the offset and length of the whole records that hold them, and
-        how many selected bytes to skip at the front of what those records give.
-        """
-        first = start // self.kept
-        last = -(-stop // self.kept)
-        return first * self.record_size, (last - first) * self.record_size, start - first * self.kept

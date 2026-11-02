@@ -6,7 +6,7 @@ import { registerCodecs } from "./codecs.js";
 import { dandiUrlResolver } from "./dandi.js";
 import { type FileRef, type GenEntry, Generator } from "./gen.js";
 import { encodeMetadata, parseJson } from "./json.js";
-import { Selection } from "./selection.js";
+import { findKeepBytes, KEEP_BYTES } from "./keep-bytes.js";
 
 /** A reference: inline text or base64, inline JSON, or a place in a file. */
 export type Ref = string | Record<string, unknown> | FileRef;
@@ -18,7 +18,6 @@ export interface ReferenceFileSystem {
   templates?: Record<string, string>;
   gen?: GenEntry[];
   indexes?: Record<string, { url: string; index: string }>;
-  selections?: Record<string, { record_size: number; keep: number[][] }>;
   sources?: Record<string, { size?: number; etag?: string }>;
 }
 
@@ -147,8 +146,7 @@ export function itemSize(dataType: unknown): number | undefined {
  *
  * Keys are looked up in "refs", then in the chunk index of their array, then
  * in the "gen" entries. A reference into a file is read with a range request,
- * the array's selection is applied if it has one, and a short last chunk of
- * an uncompressed array is padded.
+ * and a short last chunk of an uncompressed array is padded.
  *
  * ```ts
  * import * as zarr from "zarrita";
@@ -167,8 +165,7 @@ export class ReferenceStore implements AsyncReadable {
   #sources: Record<string, { size?: number; etag?: string }>;
   #indexes = new Map<string, ChunkIndex>();
   #generators: Generator[];
-  #selections = new Map<string, Selection>();
-  #chunkSizes = new Map<string, number | undefined>();
+  #chunkSizes = new Map<string, { size: number; recordSize: number } | undefined>();
   #checkedFiles = new Map<string, Promise<void>>();
   #pending = new Map<string, PendingRead[]>();
   #children: Map<string, Set<string>> | undefined;
@@ -191,9 +188,6 @@ export class ReferenceStore implements AsyncReadable {
       this.#indexes.set(path, new ChunkIndex(entry.url, options.indexStore, entry.index));
     }
     this.#generators = (rfs.gen ?? []).map((entry) => new Generator(entry, rfs.templates));
-    for (const [path, entry] of Object.entries(rfs.selections ?? {})) {
-      this.#selections.set(path, new Selection(entry));
-    }
   }
 
   /**
@@ -272,46 +266,29 @@ export class ReferenceStore implements AsyncReadable {
       return range ? data.subarray(...bounds(range, data.length)) : data;
     }
     const location = this.#expandTemplates(ref[0]);
-    const selection = this.#selectionFor(key);
     if (ref.length !== 3) {
-      const whole = await this.#finish(key, await this.#readSource(location, undefined, undefined, opts), selection);
+      const whole = await this.#finish(key, await this.#readSource(location, undefined, undefined, opts));
       return range ? whole.subarray(...bounds(range, whole.length)) : whole;
     }
     const [, offset, length] = ref;
-    if (!range) return this.#finish(key, await this.#readSource(location, offset, length, opts), selection);
+    if (!range) return this.#finish(key, await this.#readSource(location, offset, length, opts));
 
     // Part of a chunk: fetch only the bytes of the file that hold it
-    const stored = selection ? selection.selectedSize(length) : length;
-    const total = Math.max(stored, (await this.#chunkSize(key)) ?? 0);
+    const total = Math.max(length, (await this.#chunkSize(key, length))?.size ?? 0);
     const [start, stop] = bounds(range, total);
     const out = new Uint8Array(stop - start); // what lies past the stored bytes is padding
-    const available = Math.min(stop, stored);
-    if (start < available) {
-      if (!selection) {
-        out.set(await this.#readSource(location, offset + start, available - start, opts));
-      } else {
-        const source = selection.sourceRange(start, available);
-        const records = await this.#readSource(location, offset + source.offset, source.length, opts);
-        out.set(selection.apply(records).subarray(source.skip, source.skip + available - start));
-      }
-    }
+    const available = Math.min(stop, length);
+    if (start < available) out.set(await this.#readSource(location, offset + start, available - start, opts));
     return out;
   }
 
   /** Turn the bytes of a reference into the chunk a reader decodes. */
-  async #finish(key: string, data: Uint8Array, selection: Selection | undefined): Promise<Uint8Array> {
-    if (selection) data = selection.apply(data);
-    const size = await this.#chunkSize(key);
+  async #finish(key: string, data: Uint8Array): Promise<Uint8Array> {
+    const size = (await this.#chunkSize(key, data.length))?.size;
     if (size === undefined || data.length >= size) return data;
     const padded = new Uint8Array(size);
     padded.set(data);
     return padded;
-  }
-
-  #selectionFor(key: string): Selection | undefined {
-    if (this.#selections.size === 0) return undefined;
-    const path = arrayPath(key);
-    return path === undefined ? undefined : this.#selections.get(path);
   }
 
   #expandTemplates(location: string): string {
@@ -325,29 +302,42 @@ export class ReferenceStore implements AsyncReadable {
   /**
    * The full size of a chunk of the array that key belongs to, if a short
    * chunk of it is to be padded. Only uncompressed chunks are padded: the last
-   * chunk of a contiguous dataset stops where the data does.
+   * chunk of a contiguous dataset stops where the data does. For an array with
+   * a keep_bytes codec, the size is of the records in the file, and a
+   * reference of nbytes must be whole records.
    */
-  async #chunkSize(key: string): Promise<number | undefined> {
+  async #chunkSize(key: string, nbytes: number): Promise<{ size: number; recordSize: number } | undefined> {
     const path = arrayPath(key);
     if (path === undefined) return undefined;
-    if (this.#chunkSizes.has(path)) return this.#chunkSizes.get(path);
-    let size: number | undefined;
+    if (!this.#chunkSizes.has(path)) this.#chunkSizes.set(path, await this.#readChunkSize(path));
+    const found = this.#chunkSizes.get(path);
+    if (found && nbytes % found.recordSize !== 0) {
+      throw new Error(`A reference of ${nbytes} bytes is not a whole number of ${found.recordSize} byte records`);
+    }
+    return found;
+  }
+
+  async #readChunkSize(path: string): Promise<{ size: number; recordSize: number } | undefined> {
+    let size: { size: number; recordSize: number } | undefined;
     const bytes = await this.#read(path === "" ? "zarr.json" : `${path}/zarr.json`, undefined, {});
     if (bytes) {
       const meta = parseJson(new TextDecoder().decode(bytes)) as {
         node_type?: string;
         data_type?: unknown;
         chunk_grid?: { configuration?: { chunk_shape?: number[] } };
-        codecs?: { name?: string }[];
+        codecs?: { name?: string; configuration?: unknown }[];
       };
       const chunkShape = meta.chunk_grid?.configuration?.chunk_shape;
-      const uncompressed = (meta.codecs ?? []).every((codec) => codec.name === "bytes");
+      const keepBytes = findKeepBytes(meta.codecs);
+      const uncompressed = (meta.codecs ?? []).every((codec) => codec.name === "bytes" || codec.name === KEEP_BYTES);
       const item = itemSize(meta.data_type);
       if (meta.node_type === "array" && uncompressed && chunkShape && item !== undefined) {
-        size = chunkShape.reduce((a, b) => a * b, 1) * item;
+        const decoded = chunkShape.reduce((a, b) => a * b, 1) * item;
+        size = keepBytes
+          ? { size: keepBytes.encodedSize(decoded), recordSize: keepBytes.recordSize }
+          : { size: decoded, recordSize: 1 };
       }
     }
-    this.#chunkSizes.set(path, size);
     return size;
   }
 
