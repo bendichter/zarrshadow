@@ -64,7 +64,6 @@ def rfs_to_icechunk(
     session: Any,
     *,
     url_for: Callable[[str], str] | None = None,
-    copy_selections: bool = False,
     validate_sources: bool = True,
 ) -> None:
     """Write a reference file system into an Icechunk repository.
@@ -74,15 +73,12 @@ def rfs_to_icechunk(
     file. Chunks stored in the references themselves are written into the
     repository. The session is left uncommitted.
 
-    Icechunk has no counterpart for two things a reference file system can
-    hold, so the chunks they concern are read from the source files and written
-    into the repository:
-
-    - a last chunk that is shorter than a full chunk, which RfsStore pads when
-      it reads it. This is at most one chunk for each run of contiguous data.
-    - an array with a selection, whose bytes are interleaved with others in the
-      file. Every chunk of it would be copied, so this is refused unless
-      copy_selections is set.
+    A last chunk that is shorter than a full chunk, which RfsStore pads when it
+    reads it, has no counterpart in Icechunk, so it is read from its file and
+    written into the repository. This is at most one chunk for each run of
+    contiguous data. An array whose bytes are interleaved with others in the
+    file has a shadowzarr.keep_bytes codec, which stays in its metadata, so its
+    chunks are virtual like any others; reading them needs shadowzarr installed.
 
     Two things in the metadata change. Icechunk refuses NaN and Infinity as
     bare words, which is how zarr-python writes such attributes, so they are
@@ -102,16 +98,12 @@ def rfs_to_icechunk(
         should read, which must be within one of the repository's virtual
         chunk containers. By default an http(s) URL is used as it is and a
         local path becomes a file:// URL.
-    copy_selections : bool
-        Copy the data of arrays that have a selection into the repository.
     validate_sources : bool
         Check the source files that are read against the sizes and ETags the
         references record. Default True.
 
     Raises
     ------
-    NotImplementedError
-        If an array has a selection and copy_selections is not set.
     ValueError
         If a file is not within any of the repository's virtual chunk containers.
     """
@@ -120,7 +112,6 @@ def rfs_to_icechunk(
     source = RfsStore(rfs, validate_sources=validate_sources)
     store = session.store
     refs = rfs["refs"]
-    selections = rfs.get("selections", {})
     etags = {url: info["etag"] for url, info in rfs.get("sources", {}).items() if "etag" in info}
     locate = url_for if url_for is not None else _location
 
@@ -148,18 +139,10 @@ def rfs_to_icechunk(
             arrays[_array_path(key)].add(key, ref)
 
     for path, chunks in arrays.items():
-        if path in selections:
-            if not copy_selections:
-                raise NotImplementedError(
-                    f"{path!r} has a selection, which Icechunk cannot express. Pass copy_selections=True "
-                    "to copy its data into the repository."
-                )
-            chunks.copy(chunks.urls != "")
-        else:
-            # A chunk that RfsStore would pad is not complete in the file
-            full = source._get_padded_size(chunk_key(path, [0] * len(chunks.grid)), 0) if chunks.grid else None
-            if full is not None:
-                chunks.copy((chunks.urls != "") & (chunks.lengths < full))
+        # A chunk that RfsStore would pad is not complete in the file
+        full = source._get_padded_size(chunk_key(path, [0] * len(chunks.grid)), 0) if chunks.grid else None
+        if full is not None:
+            chunks.copy((chunks.urls != "") & (chunks.lengths < full))
         sync(_copy_chunks(source, store, chunks.copied))
         _set_virtual_chunks(store, chunks, locate, etags)
 

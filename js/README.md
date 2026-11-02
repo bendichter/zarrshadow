@@ -17,7 +17,7 @@ store.children("acquisition"); // the names of the groups and arrays in a group
 
 ## What It Reads
 
-The store reads everything the Python `RfsStore` reads: inline values, references into files, URL templates, `gen` entries, chunk indexes, selections, and the padding of a short last chunk. `getRange` fetches only the bytes of a file that hold the part of a chunk that was asked for, also through a selection.
+The store reads everything the Python `RfsStore` reads: inline values, references into files, URL templates, `gen` entries, chunk indexes, the `shadowzarr.keep_bytes` codec, which it registers with zarrita, and the padding of a short last chunk. `getRange` fetches only the bytes of a file that hold the part of a chunk that was asked for.
 
 A DANDI asset download URL redirects to the file in the archive's bucket. The store follows that redirect once and reuses the result for ten minutes, so a chunk costs one request. `resolveUrl` replaces this.
 
@@ -71,4 +71,4 @@ npm install
 PYTHON=/path/to/python npm test
 ```
 
-The tests read reference files written by the Python package (`test/make_fixtures.py`) and compare every array with the values Python reads from the same files, so the interpreter needs shadowzarr and h5py installed. They cover HDF5 datasets that are chunked, compressed, contiguous, big-endian, partly written, scalar, and strings, with and without a chunk index, and arrays in raw binary files with selections, stacking, transposing, and a padded last chunk.
+The tests read reference files written by the Python package (`test/make_fixtures.py`) and compare every array with the values Python reads from the same files, so the interpreter needs shadowzarr and h5py installed. They cover HDF5 datasets that are chunked, compressed, contiguous, big-endian, partly written, scalar, and strings, with and without a chunk index, and arrays in raw binary files with `keep_bytes` codecs, stacking, transposing, and a padded last chunk.

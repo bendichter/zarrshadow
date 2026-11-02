@@ -18,6 +18,9 @@ dependencies = [
     "requests",
 ]
 
+[project.entry-points."zarr.codecs"]
+"shadowzarr.keep_bytes" = "shadowzarr.keep_bytes:KeepBytesCodec"
+
 [project.urls]
 Repository = "https://github.com/catalystneuro/shadowzarr"
 

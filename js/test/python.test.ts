@@ -70,12 +70,15 @@ describe("arrays match what Python reads", () => {
     await expectValues(await open(item.references), item);
   });
 
-  test("the cases cover indexes, gen entries, selections, and padding", async () => {
+  test("the cases cover indexes, gen entries, keep_bytes codecs, and padding", async () => {
     const hdf5 = (await open("hdf5.shadowzarr")).rfs;
     const binary = (await open("binary.shadowzarr")).rfs;
     expect(Object.keys(hdf5.indexes ?? {})).toEqual(["acquisition/many_chunks"]);
     expect(hdf5.gen?.length).toBeGreaterThan(0);
-    expect(Object.keys(binary.selections ?? {}).sort()).toEqual(["columns", "packets", "rows_and_one_column"]);
+    const withKeepBytes = Object.keys(binary.refs)
+      .filter((key) => key.endsWith("/zarr.json") && String(binary.refs[key]).includes('"shadowzarr.keep_bytes"'))
+      .map((key) => key.slice(0, -"/zarr.json".length));
+    expect(withKeepBytes.sort()).toEqual(["columns", "packets", "rows_and_one_column"]);
     // 1009 rows in chunks of 100: the last chunk is stored short
     expect(binary.refs["whole/c/10/0"]).toEqual([expect.any(String), 12100, 108]);
     expect((await (await open("binary.shadowzarr")).get("/whole/c/10/0"))?.length).toBe(1200);
@@ -107,7 +110,7 @@ describe("part of a chunk", () => {
     { suffixLength: 9 },
     { suffixLength: 100000 },
   ];
-  // A plain chunk, a compressed one, one from a chunk index, ones with selections, and a padded one
+  // A plain chunk, a compressed one, one from a chunk index, ones with keep_bytes codecs, and a padded one
   const keys: [string, string][] = [
     ["hdf5.shadowzarr", "acquisition/contiguous/c/0/0"],
     ["hdf5.shadowzarr", "acquisition/contiguous/c/6/0"],
@@ -149,11 +152,11 @@ describe("part of a chunk", () => {
     });
     // whole/c/3/0 is 1200 bytes at 100 + 3 * 1200
     await store.getRange("/whole/c/3/0", { offset: 24, length: 12 });
-    // packets/c/6/0 holds 100 records of 26 bytes, each giving 10 bytes: bytes 25 to 31 are in records 2 and 3
+    // packets/c/6/0 is 100 records of 26 bytes, which its keep_bytes codec decodes: a range is of the records
     await store.getRange("/packets/c/6/0", { offset: 25, length: 6 });
     expect(reads).toEqual([
       [3724, 12],
-      [6 * 2600 + 2 * 26, 2 * 26],
+      [6 * 2600 + 25, 6],
     ]);
   });
 

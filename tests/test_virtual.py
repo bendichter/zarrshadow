@@ -46,7 +46,7 @@ def test_contiguous(recording):
     raw, x = recording
     assert raw.shape == (10_000, 17) and raw.chunk_shape == (1000, 17) and raw.dtype == np.dtype("int16")
     rfs = _build(raw, attributes={"units": "uV"}, dimension_names=["time", "channel"])
-    assert "selections" not in rfs
+    assert not _selections(rfs)
     data = open_rfs(rfs)["data"]
     assert data.attrs["units"] == "uV" and data.metadata.dimension_names == ("time", "channel")
     np.testing.assert_array_equal(data[...], x)
@@ -74,14 +74,14 @@ def test_slices_compose(recording):
     raw, x = recording
     np.testing.assert_array_equal(_read(raw[500:9500, 1:][1000:2000, ::3]), x[500:9500, 1:][1000:2000, ::3])
     # Taking every column again is no selection at all
-    assert "selections" not in _build(raw[:, :17][2000:])
+    assert not _selections(_build(raw[:, :17][2000:]))
 
 
 def test_what_slicing_writes(recording):
     """Rows move the byte range, and columns become a selection."""
     raw, _ = recording
     rfs = _build(raw[3000:, :16])
-    assert rfs["selections"] == {"data": {"record_size": 34, "keep": [[0, 32]]}}
+    assert _selections(rfs) == {"data": {"record_size": 34, "keep": [[0, 32]]}}
     (entry,) = rfs["gen"]
     assert entry["offset"] == f"{{{{{HEADER + 3000 * 34} + i * 34000}}}}" and entry["dimensions"] == {"i": {"stop": 7}}
 
@@ -140,7 +140,7 @@ def test_stack_arrays_with_a_selection(recording):
     """Arrays that select the same bytes of each record stack, and the selection carries over."""
     raw, x = recording
     stacked = stack([raw[:5000, :16], raw[5000:, :16]])
-    assert _build(stacked)["selections"] == {"data": {"record_size": 34, "keep": [[0, 32]]}}
+    assert _selections(_build(stacked)) == {"data": {"record_size": 34, "keep": [[0, 32]]}}
     np.testing.assert_array_equal(_read(stacked), np.stack([x[:5000, :16], x[5000:, :16]]))
 
 
@@ -149,7 +149,7 @@ def test_stack_mismatches(recording, channel_files):
     arrays, _ = channel_files
     with pytest.raises(ValueError, match="array 1 has shape"):
         stack([raw, raw[:5000]])
-    with pytest.raises(ValueError, match="select different bytes"):
+    with pytest.raises(ValueError, match="array 1 has codecs"):
         stack([raw[:, :4], raw[:, 4:8]])
     with pytest.raises(ValueError, match="at least one"):
         stack([])
@@ -398,11 +398,11 @@ def test_records(packets):
     path, x, _ = packets
     array = VirtualArray.records(path, shape=x.shape, dtype="<i2", record_size=26, skip=13, offset=100, chunk_bytes=2600)
     assert array.shape == (5000, 5) and array.chunk_shape == (250, 5)
-    assert _build(array)["selections"] == {"data": {"record_size": 26, "keep": [[13, 23]]}}
+    assert _selections(_build(array)) == {"data": {"record_size": 26, "keep": [[13, 23]]}}
     np.testing.assert_array_equal(_read(array), x)
     # sliced like a contiguous array: rows move the byte range, and columns narrow what is kept of a record
     part = array[1000:4000, [4, 0]]
-    assert _build(part)["selections"] == {"data": {"record_size": 26, "keep": [[21, 23], [13, 15]]}}
+    assert _selections(_build(part)) == {"data": {"record_size": 26, "keep": [[21, 23], [13, 15]]}}
     np.testing.assert_array_equal(_read(part), x[1000:4000][:, [4, 0]])
     np.testing.assert_array_equal(_read(array[:, 2]), x[:, 2])
 
@@ -413,7 +413,7 @@ def test_records(packets):
     np.testing.assert_array_equal(_read(scattered), x[:, [3, 0]])
     # a record that holds only the row is a plain contiguous array
     plain = VirtualArray.records(path, shape=(100, 13), dtype="u1", record_size=13)
-    assert "selections" not in _build(plain)
+    assert not _selections(_build(plain))
 
     with pytest.raises(ValueError, match="does not fit in a record"):
         VirtualArray.records(path, shape=x.shape, dtype="<i2", record_size=26, skip=17)
@@ -427,7 +427,7 @@ def test_from_memmap(packets, tmp_path):
     mapped = np.memmap(path, dtype=dtype, mode="r", offset=100, shape=len(x))
     # one field of a structured map: the rest of each record is skipped
     samples = VirtualArray.from_memmap(mapped["samples"])
-    assert _build(samples)["selections"] == {"data": {"record_size": 26, "keep": [[13, 23]]}}
+    assert _selections(_build(samples)) == {"data": {"record_size": 26, "keep": [[13, 23]]}}
     np.testing.assert_array_equal(_read(samples), x)
     np.testing.assert_array_equal(_read(VirtualArray.from_memmap(mapped["samples"][100:200])), x[100:200])
 
@@ -437,7 +437,7 @@ def test_from_memmap(packets, tmp_path):
     file_bytes = np.memmap(tmp_path / "block.bin", dtype="uint8", mode="r")
     view = file_bytes[64:].view(">i4").reshape(-1, 10)
     local = VirtualArray.from_memmap(view[100:5000])
-    assert "selections" not in _build(local)
+    assert not _selections(_build(local))
     np.testing.assert_array_equal(_read(local), y[100:5000])
     # with a URL, the references point there in place of the local path
     block = VirtualArray.from_memmap(view[100:5000], url="https://example.org/block.bin", chunk_bytes=40_000)
@@ -489,7 +489,7 @@ def test_blocks(tmp_path):
             "dimensions": {"i": {"stop": n_blocks}},
         }
     ]
-    assert "selections" not in rfs
+    assert not _selections(rfs)
     # Whole blocks can be taken
     np.testing.assert_array_equal(_read(signal[60:150]), x[60:150])
 
@@ -515,3 +515,14 @@ def _rfs_without_sources(virtual):
     builder.add_group("")
     virtual.add_to(builder, "data")
     return builder.build(record_sources=False)
+
+
+def _selections(rfs):
+    """The keep_bytes codec configuration of each array that has one."""
+    out = {}
+    for key, meta in rfs["refs"].items():
+        if key.endswith("zarr.json"):
+            for codec in json.loads(meta).get("codecs", []):
+                if codec.get("name") == "shadowzarr.keep_bytes":
+                    out[key[: -len("/zarr.json")] if "/" in key else ""] = codec["configuration"]
+    return out

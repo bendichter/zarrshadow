@@ -10,6 +10,7 @@ These tests download about 300 MB and are not run by default. Run them with
 ``pytest -m gin``.
 """
 
+import json
 import os
 
 import numpy as np
@@ -368,7 +369,7 @@ def test_spikeglx_as_virtual_nwb(tmp_path):
 
     # Both series point into the one .ap.bin file, each keeping its own bytes of every sample
     assert len(rfs["sources"]) == 1
-    assert rfs["selections"] == {
+    assert _selections(rfs) == {
         "acquisition/ElectricalSeriesAP/data": {"record_size": 770, "keep": [[0, 768]]},
         "acquisition/sync/data": {"record_size": 770, "keep": [[768, 770]]},
     }
@@ -390,3 +391,14 @@ def test_spikeglx_as_virtual_nwb(tmp_path):
             expected = reader.get_analogsignal_chunk(block_index=0, seg_index=0, stream_index=streams.index(stream))
             np.testing.assert_array_equal(read.acquisition[series].data[...], expected)
         assert pynwb.validate(io=io) == []
+
+
+def _selections(rfs):
+    """The keep_bytes codec configuration of each array that has one."""
+    out = {}
+    for key, meta in rfs["refs"].items():
+        if key.endswith("zarr.json"):
+            for codec in json.loads(meta).get("codecs", []):
+                if codec.get("name") == "shadowzarr.keep_bytes":
+                    out[key[: -len("/zarr.json")] if "/" in key else ""] = codec["configuration"]
+    return out

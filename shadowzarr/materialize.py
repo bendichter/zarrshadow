@@ -121,7 +121,7 @@ def materialize(
 
 def _referenced_arrays(rfs: dict) -> set[str]:
     """The paths of the arrays with at least one chunk that is a reference to another file."""
-    paths = set(rfs.get("indexes", {})) | set(rfs.get("selections", {}))
+    paths = set(rfs.get("indexes", {}))
     for key, value in rfs["refs"].items():
         if isinstance(value, list):
             path = _array_path(key)

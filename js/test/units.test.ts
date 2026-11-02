@@ -13,9 +13,9 @@ import {
   itemSize,
   NON_FINITE_ATTRIBUTES_UUID,
   parseJson,
+  KeepBytesCodec,
   ReferenceStore,
   render,
-  Selection,
   toStrictJson,
 } from "../src/index.js";
 
@@ -87,28 +87,23 @@ describe("Generator", () => {
   });
 });
 
-describe("Selection", () => {
+describe("KeepBytesCodec", () => {
   // Records of 6 bytes, of which bytes 4 and 5, then 0 and 1, are kept
-  const selection = new Selection({ record_size: 6, keep: [[4, 6], [0, 2]] });
+  const codec = KeepBytesCodec.fromConfig({ record_size: 6, keep: [[4, 6], [0, 2]] });
   const data = Uint8Array.from({ length: 18 }, (_, i) => i);
 
-  test("apply", () => {
-    expect([...selection.apply(data)]).toEqual([4, 5, 0, 1, 10, 11, 6, 7, 16, 17, 12, 13]);
-    expect(selection.selectedSize(18)).toBe(12);
-    expect(() => selection.apply(data.subarray(0, 16))).toThrow(/not a whole number of 6 byte records/);
+  test("decode", () => {
+    expect([...codec.decode(data)]).toEqual([4, 5, 0, 1, 10, 11, 6, 7, 16, 17, 12, 13]);
+    expect(codec.encodedSize(12)).toBe(18);
+    expect(() => codec.decode(data.subarray(0, 16))).toThrow(/not a whole number of 6 byte records/);
+    expect(() => codec.encode()).toThrow(/cannot encode/);
   });
 
-  test("the records that hold a range of the selected bytes", () => {
-    expect(selection.sourceRange(0, 12)).toEqual({ offset: 0, length: 18, skip: 0 });
-    expect(selection.sourceRange(5, 7)).toEqual({ offset: 6, length: 6, skip: 1 });
-    expect(selection.sourceRange(3, 9)).toEqual({ offset: 0, length: 18, skip: 3 });
-  });
-
-  test("invalid selections", () => {
+  test("invalid configurations", () => {
     for (const keep of [[], [[2, 2]], [[0, 7]], [[-1, 2]]]) {
-      expect(() => new Selection({ record_size: 6, keep }), JSON.stringify(keep)).toThrow(/Invalid selection/);
+      expect(() => new KeepBytesCodec({ record_size: 6, keep }), JSON.stringify(keep)).toThrow(/Invalid keep_bytes/);
     }
-    expect(() => new Selection({ record_size: 0, keep: [[0, 1]] })).toThrow(/Invalid selection/);
+    expect(() => new KeepBytesCodec({ record_size: 0, keep: [[0, 1]] })).toThrow(/Invalid keep_bytes/);
   });
 });
 

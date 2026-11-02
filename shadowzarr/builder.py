@@ -18,7 +18,7 @@ or inline (add_inline_chunk). shadowzarr.hdf5 is the generator for HDF5 files.
 
 When an array is only part of what the file stores in each row, such as some
 of the channels of an interleaved recording, add_selection says which bytes
-of every row belong to it.
+of every row belong to it, with a keep_bytes codec (see shadowzarr.keep_bytes).
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ from zarr.codecs import BloscCodec
 from .bytes_attributes import encode_attributes as encode_bytes_attributes
 from .chunk_index import MISSING, ChunkIndex, index_block_shape
 from .gen import Generator
+from .keep_bytes import keep_bytes_codec, with_keep_bytes
 from .non_finite import encode_metadata
 from .sources import describe_source
 
@@ -134,7 +135,6 @@ class RfsBuilder:
         self.refs: dict[str, Any] = {}
         self.indexes: dict[str, dict] = {}
         self.gen: list[dict] = []
-        self.selections: dict[str, dict] = {}
 
     # -- Metadata --
 
@@ -258,18 +258,19 @@ class RfsBuilder:
         another order reorders the columns. columns_selection builds the
         arguments for a choice of columns.
 
-        The references of an array with a selection give the bytes in the
-        file, so their lengths are multiples of record_size. A selection applies to
-        uncompressed data.
+        The selection is a shadowzarr.keep_bytes codec, added to the codecs of
+        the array, which must already be in the builder, right after its
+        array-to-bytes codec. The references of the array give the bytes in the
+        file, so their lengths are multiples of record_size. A selection applies
+        to uncompressed data.
         """
-        record_size = int(record_size)
-        spans = [[int(a), int(b)] for a, b in keep]
-        if record_size <= 0 or not spans:
-            raise ValueError("A selection needs a positive record size and at least one byte range")
-        for a, b in spans:
-            if not 0 <= a < b <= record_size:
-                raise ValueError(f"Byte range [{a}, {b}) is not within a record of {record_size} bytes")
-        self.selections[path] = {"record_size": record_size, "keep": spans}
+        codec = keep_bytes_codec(record_size, keep)
+        key = metadata_key(path)
+        if key not in self.refs:
+            raise KeyError(f"Add the array {path!r} before its selection")
+        meta = json.loads(self.refs[key])
+        meta["codecs"] = with_keep_bytes(meta.get("codecs", []), codec)
+        self.refs[key] = json.dumps(meta, separators=(",", ":"))
 
     def add_contiguous_chunks(
         self,
@@ -378,14 +379,12 @@ class RfsBuilder:
         for key, value in self.refs.items():
             if isinstance(value, str) and (key == "zarr.json" or key.endswith("/zarr.json")):
                 self.refs[key] = encode_metadata(value)
-        extended = self.indexes or self.gen or self.selections
+        extended = self.indexes or self.gen
         rfs: dict[str, Any] = {"refs": self.refs, "version": 2 if extended else 1}
         if self.indexes:
             rfs["indexes"] = self.indexes
         if self.gen:
             rfs["gen"] = self.gen
-        if self.selections:
-            rfs["selections"] = self.selections
         if record_sources:
             rfs["sources"] = _describe_sources(rfs)
         _apply_templates(rfs)
@@ -397,8 +396,7 @@ def write_rfs(rfs: dict, output_path: str) -> None:
 
     A path ending in ".json" writes a single version 1 reference file in which
     every chunk of an indexed array is listed in refs, readable by any kerchunk
-    reader. Selections cannot be expressed in version 1, so a file that has
-    them stays version 2. Any other path writes a directory holding refs.json and, for each
+    reader. Any other path writes a directory holding refs.json and, for each
     chunk index, a zarr v3 array under index/<array path>. The "indexes" entry
     in refs.json gives that path, relative to refs.json, and the file is marked
     version 2 so that readers without index support refuse it. Opening the
@@ -445,8 +443,6 @@ def to_version1(rfs: dict) -> dict:
     """Return a version 1 copy of rfs with every indexed or generated chunk listed in refs.
 
     fsspec skips "gen" entries unless asked not to, so they are expanded too.
-    Selections have no version 1 form: a copy that has them keeps them and is
-    marked version 2, so that kerchunk readers refuse it.
     """
     indexes = rfs.get("indexes", {})
     gens = rfs.get("gen", [])
@@ -470,7 +466,7 @@ def to_version1(rfs: dict) -> dict:
         for key, ref in Generator(entry, templates).items():
             refs[key] = ref
     out = {k: v for k, v in rfs.items() if k not in ("indexes", "gen", "templates", "refs")}
-    out["version"] = 2 if out.get("selections") else 1
+    out["version"] = 1
     out["refs"] = refs
     _apply_templates(out)
     return out

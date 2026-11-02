@@ -13,7 +13,7 @@ export {
   parseJson,
   toStrictJson,
 } from "./json.js";
-export { Selection } from "./selection.js";
+export { findKeepBytes, KEEP_BYTES, KeepBytesCodec, type KeepBytesConfig } from "./keep-bytes.js";
 export {
   arrayPath,
   itemSize,
