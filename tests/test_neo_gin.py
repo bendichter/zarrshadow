@@ -10,6 +10,7 @@ These tests download about 300 MB and are not run by default. Run them with
 ``pytest -m gin``.
 """
 
+import inspect
 import os
 
 import numpy as np
@@ -220,13 +221,18 @@ def _download(folder):
 # Libraries that NEO needs to open the files of some readers
 READER_NEEDS = {"EDFRawIO": "pyedflib", "MEArecRawIO": "MEArec"}
 
+# Arguments some readers need. NEO 0.14.6 refuses a Neuralynx recording with gaps unless told how to
+# split it into segments, and a tolerance of 0 splits at every gap, as earlier versions did.
+READER_ARGUMENTS = {"NeuralynxRawIO": {"gap_tolerance_ms": 0.0}}
+
 
 def _reader(name, path):
     if name in READER_NEEDS:
         pytest.importorskip(READER_NEEDS[name])
     cls = getattr(neo_rawio, name)
     local = os.path.join(_download(path.split("/")[0]), path)
-    reader = cls(dirname=local) if cls.rawmode == "one-dir" else cls(filename=local)
+    arguments = READER_ARGUMENTS.get(name, {}) if "gap_tolerance_ms" in inspect.signature(cls).parameters else {}
+    reader = cls(dirname=local, **arguments) if cls.rawmode == "one-dir" else cls(filename=local, **arguments)
     reader.parse_header()
     return reader
 
