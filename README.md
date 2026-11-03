@@ -446,6 +446,22 @@ On the Allen Visual Coding LFP timestamps above (12.1 million values, 97 MB in 1
 
 `scripts/block_statistics_minmax_benchmark.py` measures `minmax_range` against reading a window on a remote recording. On the Allen LFP (89 channels, 4.3 GB), a 30 min window took 1.1 s, 180 requests and 17 MB, against 28 s, 4,361 requests and 419 MB to read it. `scripts/block_statistics_levels_benchmark.py` measures what levels add, on a rechunked copy with simulated storage latency.
 
+### In Xarray
+
+`shadowzarr.block_statistics_xarray.open_timeseries` opens an NWB TimeSeries group as an Xarray DataArray that uses the statistics without any change to the code that uses it:
+
+```python
+from shadowzarr.block_statistics_xarray import open_timeseries
+
+da = open_timeseries(root["acquisition/probe_729445652_lfp/probe_729445652_lfp_data"], dims=("time", "channel"))
+window = da.sel(time=slice(1000.0, 1600.0))   # bisects the timestamps' statistics
+window.max("time"), window.std("time")        # per channel, from the data's statistics
+```
+
+- **Selecting by time:** the time coordinate has a `BlockStatisticsIndex`. `.sel` with a slice, labels, or `method="nearest"` uses `searchsorted` on the timestamps' `minmax` statistics instead of loading the timestamps. A series with `starting_time` and `rate` gets a `RegularTimeIndex`, whose slices select the samples inside them.
+- **Reductions:** the data is a `StatsArray`, a lazy array that Xarray wraps like any other. `min`, `max`, `mean`, `var` and `std` over time, with or without `skipna`, are answered from its `minmax` and `moments` statistics when their blocks keep every channel (`[n, 1]`).
+- **Everything else reads the data as before**, such as `median`, arithmetic, or reducing over channels, so results always match numpy.
+
 hdmf-zarr reads every group, so `NWBZarrIO` warns once for each array under `.stats`; the file otherwise reads as before.
 
 Three statistic types are defined, given in the `"statistics"` option (default `["minmax"]`):
