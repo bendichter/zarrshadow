@@ -74,11 +74,27 @@ def main() -> None:
     print(f"{'':<18}{'operation':<28}{'time':>8}")
     for row in rows:
         print(f"{row[0]:<18}{row[1]:<28}{row[2]:>7.2f}s")
+    # Check both against float64 numpy on the window's data, to within a millionth of its spread:
+    # means near zero differ relatively more, since plain Xarray sums float32 data in float32
     plain_results = [r[3] for r in rows if r[0] == "plain xarray" and len(r) == 4]
     fast_results = [r[3] for r in rows if r[0] == "block statistics" and len(r) == 4]
-    for p, f in zip(plain_results, fast_results):
-        np.testing.assert_allclose(f, p, rtol=1e-4)  # plain Xarray accumulates float32 in float32
-    print("\nresults agree")
+    g = open_rfs(rfs)[args.group]
+    times = np.asarray(g["timestamps"][...])
+    i = 0
+    worst = {"plain xarray": 0.0, "block statistics": 0.0}
+    for window in args.windows.split(","):
+        a, b = (float(x) for x in window.split(":"))
+        lo, hi = np.searchsorted(times, a), np.searchsorted(times, b, "right")
+        data = np.asarray(g["data"][lo:hi]).astype(np.float64)
+        spread = data.std(axis=0)
+        for name in ("max", "mean", "std"):
+            reference = getattr(np, name)(data, axis=0)
+            for label, result in (("plain xarray", plain_results[i]), ("block statistics", fast_results[i])):
+                worst[label] = max(worst[label], float(np.max(np.abs(result - reference) / spread)))
+            i += 1
+    for label, error in worst.items():
+        print(f"{label}: largest difference from float64 numpy, relative to each channel's spread: {error:.1e}")
+    assert worst["block statistics"] < 1e-6
 
 
 class _Backend(xr.backends.BackendArray):
