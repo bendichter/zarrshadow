@@ -459,20 +459,38 @@ def searchsorted(array: zarr.Array, values: Any, side: str = "left") -> int | np
     (block,), minmax = loaded
     n = int(array.shape[0])
     flat = values.ravel()
+    # Work on the values in sorted order, so that the values of each block are
+    # one run; sorting is skipped when they are sorted already
+    order = None
+    if flat.size > 1 and not (flat[1:] >= flat[:-1]).all():
+        order = np.argsort(flat, kind="stable")
+        flat = flat[order]
     # Every block before b is entirely before the value's position, which is in block b
     blocks = np.searchsorted(minmax[:, 1], flat, side)
-    result = np.full(flat.shape, n, dtype=np.int64)
-    needed = np.unique(blocks[blocks < len(minmax)])
+    found = np.full(flat.shape, n, dtype=np.int64)
+    # Where each block's run of values starts and stops; blocks are nondecreasing
+    edges = np.flatnonzero(np.diff(blocks)) + 1
+    starts = np.concatenate([[0], edges]) if flat.size else np.array([], dtype=np.int64)
+    stops = np.concatenate([edges, [flat.size]]) if flat.size else np.array([], dtype=np.int64)
+    run_blocks = blocks[starts] if flat.size else blocks
+    keep = run_blocks < len(minmax)
+    starts, stops, run_blocks = starts[keep], stops[keep], run_blocks[keep]
     # Read runs of neighbouring blocks together
-    runs = np.split(needed, np.flatnonzero(np.diff(needed) != 1) + 1) if len(needed) else []
-    for run in runs:
-        start, stop = int(run[0]) * block, min((int(run[-1]) + 1) * block, n)
-        data = np.asarray(array[start:stop])
-        for b in run:
-            which = blocks == b
-            lo = int(b) * block - start
-            part = data[lo:lo + block]
-            result[which] = int(b) * block + np.searchsorted(part, flat[which], side)
+    groups = np.split(np.arange(len(run_blocks)), np.flatnonzero(np.diff(run_blocks) != 1) + 1) if len(run_blocks) else []
+    for group in groups:
+        first, last = int(run_blocks[group[0]]), int(run_blocks[group[-1]])
+        offset = first * block
+        data = np.asarray(array[offset:min((last + 1) * block, n)])
+        for i in group:
+            b = int(run_blocks[i])
+            lo = b * block - offset
+            a, z = starts[i], stops[i]
+            found[a:z] = b * block + np.searchsorted(data[lo:lo + block], flat[a:z], side)
+    if order is not None:
+        result = np.empty_like(found)
+        result[order] = found
+    else:
+        result = found
     result = result.reshape(values.shape)
     return int(result) if scalar else result
 
