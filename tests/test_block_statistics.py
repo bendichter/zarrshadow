@@ -174,15 +174,23 @@ def test_write_block_statistics_layout(tmp_path):
     array[...] = data
     attribute = write_block_statistics(array, block_shape=[500, 1])
     assert attribute == {
-        "statistics": [{"type": "minmax", "block_shape": [500, 1], "path": ".stats/acquisition/es/data/minmax"}]
+        "statistics": [{"type": "minmax", "block_shape": [500, 1], "path": ".stats/data/minmax"}]
     }
     reopened = zarr.open_group(str(tmp_path / "a.zarr"), mode="r")
-    stats = reopened[".stats/acquisition/es/data/minmax"]
+    stats = reopened["acquisition/es/.stats/data/minmax"]
     assert stats.shape == (6, 4, 2)
     assert stats.attrs["block_shape"] == [500, 1]
     block_shape, values = load_block_statistics(reopened["acquisition/es/data"])
     assert block_shape == [500, 1]
     np.testing.assert_array_equal(values, _expected_minmax(data, [500, 1]))
+    # A copy of the parent group carries the statistics
+    import shutil
+
+    copy_root = zarr.open_group(str(tmp_path / "b.zarr"), mode="w", zarr_format=3)
+    shutil.copytree(tmp_path / "a.zarr" / "acquisition" / "es", tmp_path / "b.zarr" / "moved")
+    copied = zarr.open_group(str(tmp_path / "b.zarr"), mode="r")["moved/data"]
+    np.testing.assert_array_equal(load_block_statistics(copied)[1], values)
+    assert copy_root is not None
     # Writing again replaces the entry rather than adding a second one
     attribute = write_block_statistics(array, block_shape=[1000, 4])
     assert [e["block_shape"] for e in attribute["statistics"]] == [[1000, 4]]
@@ -207,7 +215,7 @@ def _check_times(group, times):
     for name in ["chunked", "contiguous"]:
         array = group[name]
         assert array.attrs["block_statistics"]["sorted"] == "ascending"
-        found = find_range(array, 50.0, 60.0, root=group)
+        found = find_range(array, 50.0, 60.0)
         assert found == slice(int(np.searchsorted(times, 50.0)), int(np.searchsorted(times, 60.0, "right")))
 
 
@@ -297,5 +305,5 @@ def test_nwb_with_block_statistics_reads_with_hdmf_zarr(tmp_path):
     np.testing.assert_array_equal(read.acquisition["ts"].timestamps[:], times)
     io.close()
     group = open_rfs(rfs)
-    found = find_range(group["acquisition/ts/timestamps"], 10.0, 11.0, root=group)
+    found = find_range(group["acquisition/ts/timestamps"], 10.0, 11.0)
     assert found == slice(int(np.searchsorted(times, 10.0)), int(np.searchsorted(times, 11.0, "right")))

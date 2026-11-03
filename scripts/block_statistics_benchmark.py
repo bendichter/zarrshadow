@@ -77,7 +77,8 @@ def main() -> None:
     root = zarr.open_group(counting, mode="r", zarr_format=3)
     array = root[args.dataset]
     entry = array.attrs["block_statistics"]["statistics"][0]
-    stats_bytes = root[entry["path"]].nbytes
+    parent = root[args.dataset.rpartition("/")[0]] if "/" in args.dataset else root
+    stats_bytes = parent[entry["path"]].nbytes
     print(f"array: {array.shape[0]:,} values, {array.nbytes / 1e6:.1f} MB, chunks of {array.chunks[0]:,}")
     print(f"statistics: blocks of {entry['block_shape'][0]:,}, {stats_bytes / 1e3:.1f} KB, "
           f"computed in {stats_time:.1f} s (reads the whole array once)")
@@ -105,7 +106,7 @@ def main() -> None:
                 part = np.asarray(array[lo:hi])
                 found = slice(int(lo + np.searchsorted(part, a)), int(lo + np.searchsorted(part, b, "right")))
             else:
-                found = find_range(array, a, b, root=root)
+                found = find_range(array, a, b)
             assert found == want, (name, a, b, found, want)
         elapsed = (time.perf_counter() - t) / len(windows)
         per_requests = counting.requests / len(windows)

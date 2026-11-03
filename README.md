@@ -431,10 +431,10 @@ rfs = generate_rfs("https://api.dandiarchive.org/api/assets/86db184c-6fad-4005-8
 rfs = add_block_statistics(rfs, {path: {"sorted": "ascending"}})  # one block per chunk
 
 root = open_rfs(rfs)
-window = find_range(root[path], 1200.0, 1202.0, root=root)  # slice of the samples in [1200, 1202] s
+window = find_range(root[path], 1200.0, 1202.0)  # slice of the samples in [1200, 1202] s
 ```
 
-- `add_block_statistics` reads each listed array once and adds its statistics to the references as inline chunks at `.stats/<array path>/minmax`, so `write_rfs` and `rfs_to_icechunk` carry them. The array's `block_statistics` attribute lists them.
+- `add_block_statistics` reads each listed array once and adds its statistics to the references as inline chunks next to the array, at `.stats/<array name>/minmax` in the same group, so `write_rfs` and `rfs_to_icechunk` carry them. The array's `block_statistics` attribute lists them.
 - `block_shape` is in elements. Along each dimension it must divide the chunk size, be a multiple of it, or cover the whole dimension. A size of 1 keeps a dimension, so `[30000, 1]` on `(time, channel)` data gives a value per channel per 30,000 samples. `granularity=N` means N chunks per block.
 - `write_block_statistics` does the same for an array in a writable Zarr store, and `load_block_statistics` returns an array's statistics.
 - `find_range` bisects only arrays marked `sorted: "ascending"`. Without statistics it reads the whole array.

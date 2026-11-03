@@ -14,27 +14,38 @@ zone maps: Parquet stores them for every row group, and Iceberg for every file.
 
 ## Where the statistics are
 
-The statistics of the array at `<path>` are Zarr arrays at
-`.stats/<path>/<type>`, under the root group of the hierarchy. The array lists
-them in its `block_statistics` attribute:
+The statistics of an array named `<name>` are Zarr arrays next to it, in a
+`.stats` group in the same parent group, at `.stats/<name>/<type>`. Zarr arrays
+can't contain other nodes, so the parent group is the closest place; a copy of
+that group keeps its arrays' statistics. The array lists them in its
+`block_statistics` attribute:
+
+```
+acquisition/ts/
+├── timestamps          (attribute "block_statistics" below)
+├── data
+└── .stats/
+    └── timestamps/
+        └── minmax
+```
 
 ```json
 "block_statistics": {
   "sorted": "ascending",
   "statistics": [
-    {"type": "minmax", "block_shape": [10000], "path": ".stats/acquisition/ts/timestamps/minmax"}
+    {"type": "minmax", "block_shape": [10000], "path": ".stats/timestamps/minmax"}
   ]
 }
 ```
 
 - `statistics`: one entry per statistics array, giving its `type`, its
-  `block_shape`, and its `path` relative to the root group.
+  `block_shape`, and its `path` relative to the array's parent group.
 - `sorted` (optional): `"ascending"` if the array's values never decrease
   along its only dimension. Readers may bisect its `minmax` only then.
 
 An array may have several entries of the same type with different block shapes,
 for example at 1 s, 10 s and 100 s. Each statistics array's own attributes
-repeat `type` and `block_shape`, name the `array` it describes, and may record
+repeat `type` and `block_shape`, name the `array` it describes (its name in the parent group), and may record
 the `sources` it was computed from (the size and ETag of each file whose bytes
 were read), so that stale statistics can be detected.
 

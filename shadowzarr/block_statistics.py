@@ -7,9 +7,10 @@ the one or two blocks holding the times, and reads only those. Tabular formats
 call these per-block statistics zone maps; Parquet stores them for every row
 group. The convention is described in docs/block-statistics.md.
 
-The statistics of an array at "<path>" are Zarr arrays under the root group,
-at ".stats/<path>/<type>", and the array lists them in its "block_statistics"
-attribute:
+The statistics of an array named "<name>" are Zarr arrays next to it, in a
+".stats" group in the same parent group, at ".stats/<name>/<type>". A copy of
+the parent group keeps them. The array lists them in its "block_statistics"
+attribute, with paths relative to its parent group:
 
     "block_statistics": {
         "sorted": "ascending",
@@ -204,9 +205,22 @@ def compute_block_statistics(
     return resolved, values
 
 
-def _stats_path(array_path: str, name: str) -> str:
+def _split(array_path: str) -> tuple[str, str]:
+    """The parent group's path and the array's name."""
     array_path = array_path.strip("/")
-    return f"{STATS_GROUP}/{array_path}/{name}" if array_path else f"{STATS_GROUP}/{name}"
+    if not array_path:
+        raise ValueError("Block statistics need an array inside a group, not one at the root of a store")
+    parent, _, name = array_path.rpartition("/")
+    return parent, name
+
+
+def _stats_path(array_name: str, statistic: str) -> str:
+    """Where a statistic of the array array_name is, relative to the array's parent group."""
+    return f"{STATS_GROUP}/{array_name}/{statistic}"
+
+
+def _join(parent: str, path: str) -> str:
+    return f"{parent}/{path}" if parent else path
 
 
 def _stats_chunk_shape(shape: Sequence[int], itemsize: int) -> list[int]:
@@ -284,14 +298,16 @@ def add_block_statistics(
             block_shape=options.get("block_shape"),
             granularity=options.get("granularity"),
         )
+        parent, array_name = _split(array_path)
         entries = []
         for name, value in values.items():
-            path = _stats_path(array_path, name)
-            _add_groups(refs, path, created_groups)
-            _add_inline_array(refs, path, value, {
+            path = _stats_path(array_name, name)
+            full = _join(parent, path)
+            _add_groups(refs, full, created_groups)
+            _add_inline_array(refs, full, value, {
                 "type": name,
                 "block_shape": resolved,
-                "array": array_path,
+                "array": array_name,
                 "sources": copy.deepcopy(rfs.get("sources", {})),
             })
             entries.append(_statistic_entry(name, resolved, path))
@@ -353,37 +369,31 @@ def write_block_statistics(
     array: zarr.Array,
     statistics: Sequence[str] = ("minmax",),
     *,
-    root: zarr.Group | None = None,
     block_shape: Sequence[int | None] | None = None,
     granularity: int | Sequence[int] | None = None,
     sorted: str | None = None,  # noqa: A002 - the attribute's own name
 ) -> dict:
-    """Compute statistics of array and write them into its writable store.
+    """Compute statistics of array and write them next to it, in its writable store.
 
-    root is the group the ".stats" tree goes under; by default the root of
-    the array's store. Returns the array's new "block_statistics" attribute.
+    Returns the array's new "block_statistics" attribute.
     """
     _check_sorted(sorted)
-    if root is None:
-        root = zarr.open_group(array.store, mode="r+", zarr_format=3)
-    array_path = array.path.strip("/")
-    root_path = root.path.strip("/")
-    if root_path and array_path.startswith(root_path + "/"):
-        array_path = array_path[len(root_path) + 1:]
+    parent_path, array_name = _split(array.path)
+    parent = zarr.open_group(array.store, path=parent_path, mode="r+", zarr_format=3)
     resolved, values = compute_block_statistics(
         array, statistics, block_shape=block_shape, granularity=granularity
     )
     entries = []
     for name, value in values.items():
-        path = _stats_path(array_path, name)
-        stats = root.create_array(
+        path = _stats_path(array_name, name)
+        stats = parent.create_array(
             path,
             shape=value.shape,
             dtype=value.dtype,
             chunks=_stats_chunk_shape(value.shape, value.dtype.itemsize),
             compressors=[zarr.codecs.ZstdCodec(level=3)],
             fill_value=False if value.dtype.kind == "b" else 0,
-            attributes={"type": name, "block_shape": resolved, "array": array_path},
+            attributes={"type": name, "block_shape": resolved, "array": array_name},
             overwrite=True,
         )
         stats[...] = value
@@ -396,20 +406,16 @@ def write_block_statistics(
 # -- Reading --
 
 
-def load_block_statistics(array: zarr.Array, name: str = "minmax", *, root: zarr.Group | None = None):
-    """The block shape and values of one of array's statistics, or None if it has none.
-
-    root is the group its paths are relative to; by default the root of the
-    array's store.
-    """
+def load_block_statistics(array: zarr.Array, name: str = "minmax"):
+    """The block shape and values of one of array's statistics, or None if it has none."""
     attribute = array.attrs.get(STATISTICS_ATTRIBUTE)
     if not attribute:
         return None
     for entry in attribute.get("statistics", []):
         if entry["type"] == name:
-            if root is None:
-                root = zarr.open_group(array.store, mode="r", zarr_format=3)
-            return [int(b) for b in entry["block_shape"]], np.asarray(root[entry["path"]][...])
+            parent_path, _ = _split(array.path)
+            parent = zarr.open_group(array.store, path=parent_path, mode="r", zarr_format=3)
+            return [int(b) for b in entry["block_shape"]], np.asarray(parent[entry["path"]][...])
     return None
 
 
@@ -417,8 +423,6 @@ def find_range(
     array: zarr.Array,
     low: Any,
     high: Any,
-    *,
-    root: zarr.Group | None = None,
 ) -> slice:
     """The slice of a sorted one-dimensional array holding the values from low to high.
 
@@ -430,7 +434,7 @@ def find_range(
     if len(array.shape) != 1:
         raise ValueError("find_range needs a one-dimensional array")
     attribute = array.attrs.get(STATISTICS_ATTRIBUTE) or {}
-    loaded = load_block_statistics(array, "minmax", root=root) if attribute.get("sorted") == "ascending" else None
+    loaded = load_block_statistics(array, "minmax") if attribute.get("sorted") == "ascending" else None
     if loaded is None:
         data = np.asarray(array[...])
         return slice(int(np.searchsorted(data, low, "left")), int(np.searchsorted(data, high, "right")))
