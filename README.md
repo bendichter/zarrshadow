@@ -434,8 +434,9 @@ root = open_rfs(rfs)
 window = find_range(root[path], 1200.0, 1202.0)  # slice of the samples in [1200, 1202] s
 ```
 
-- `add_block_statistics` reads each listed array once and adds its statistics to the references as inline chunks next to the array, at `.stats/<array name>/minmax` in the same group, so `write_rfs` and `rfs_to_icechunk` carry them. The array's `block_statistics` attribute lists them.
+- `add_block_statistics` reads each listed array once and adds its statistics to the references as inline chunks next to the array, at `.stats/<array name>/minmax/<block shape>` in the same group (for example `.stats/timestamps/minmax/11799`), so `write_rfs` and `rfs_to_icechunk` carry them. The array's `block_statistics` attribute lists them.
 - `block_shape` is in elements. Along each dimension it must divide the chunk size, be a multiple of it, or cover the whole dimension. A size of 1 keeps a dimension, so `[30000, 1]` on `(time, channel)` data gives a value per channel per 30,000 samples. `granularity=N` means N chunks per block.
+- A list of option sets for one array adds several levels, one array per block shape.
 - `write_block_statistics` does the same for an array in a writable Zarr store, and `load_block_statistics` returns an array's statistics.
 - `find_range` bisects only arrays marked `sorted: "ascending"`. Without statistics it reads the whole array.
 

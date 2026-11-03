@@ -8,14 +8,15 @@ call these per-block statistics zone maps; Parquet stores them for every row
 group. The convention is described in docs/block-statistics.md.
 
 The statistics of an array named "<name>" are Zarr arrays next to it, in a
-".stats" group in the same parent group, at ".stats/<name>/<type>". A copy of
-the parent group keeps them. The array lists them in its "block_statistics"
+".stats" group in the same parent group, at ".stats/<name>/<type>/<shape>",
+where <shape> is the block shape with its sizes joined by "x". A statistic can
+have several block shapes, one array each. A copy of the parent group keeps them. The array lists them in its "block_statistics"
 attribute, with paths relative to its parent group:
 
     "block_statistics": {
         "sorted": "ascending",
         "statistics": [
-            {"type": "minmax", "block_shape": [10000], "path": ".stats/timestamps/minmax"}
+            {"type": "minmax", "block_shape": [10000], "path": ".stats/timestamps/minmax/10000"}
         ]
     }
 
@@ -214,9 +215,13 @@ def _split(array_path: str) -> tuple[str, str]:
     return parent, name
 
 
-def _stats_path(array_name: str, statistic: str) -> str:
-    """Where a statistic of the array array_name is, relative to the array's parent group."""
-    return f"{STATS_GROUP}/{array_name}/{statistic}"
+def _stats_path(array_name: str, statistic: str, block_shape: Sequence[int]) -> str:
+    """Where a statistic of the array array_name is, relative to the array's parent group.
+
+    Each type is a group holding one array per block shape, named by its
+    sizes joined with "x", so that the levels of one statistic sit together.
+    """
+    return f"{STATS_GROUP}/{array_name}/{statistic}/{'x'.join(str(int(b)) for b in block_shape) or 'scalar'}"
 
 
 def _join(parent: str, path: str) -> str:
@@ -253,7 +258,7 @@ def _merge_attribute(existing: dict | None, entries: list[dict], sorted_: str | 
 
 def add_block_statistics(
     rfs: dict,
-    arrays: Mapping[str, Mapping[str, Any]],
+    arrays: Mapping[str, Mapping[str, Any] | Sequence[Mapping[str, Any]]],
     *,
     validate_sources: bool = True,
 ) -> dict:
@@ -262,8 +267,9 @@ def add_block_statistics(
     arrays maps each array's path to its options: "statistics" (default
     ["minmax"]), "block_shape" or "granularity" (see resolve_block_shape),
     and "sorted" ("ascending", or None when the array isn't known to be
-    sorted). The array's data is read through the references, so this reads
-    every chunk of those arrays once.
+    sorted). A list of option sets adds several levels, one per block shape.
+    The array's data is read through the references, so this reads every
+    chunk of those arrays once for each level.
 
     The statistics are inline chunks in the references, so write_rfs and
     rfs_to_icechunk carry them like any other small array. Each statistics
@@ -281,7 +287,12 @@ def add_block_statistics(
     store = RfsStore(rfs, validate_sources=validate_sources)
     root = zarr.open_group(store, mode="r", zarr_format=3)
     created_groups: set[str] = set()
-    for array_path, options in arrays.items():
+    jobs = [
+        (path, options)
+        for path, given in arrays.items()
+        for options in ([given] if isinstance(given, Mapping) else list(given))
+    ]
+    for array_path, options in jobs:
         array_path = array_path.strip("/")
         options = dict(options)
         unknown = set(options) - {"statistics", "block_shape", "granularity", "sorted"}
@@ -301,7 +312,7 @@ def add_block_statistics(
         parent, array_name = _split(array_path)
         entries = []
         for name, value in values.items():
-            path = _stats_path(array_name, name)
+            path = _stats_path(array_name, name, resolved)
             full = _join(parent, path)
             _add_groups(refs, full, created_groups)
             _add_inline_array(refs, full, value, {
@@ -385,7 +396,7 @@ def write_block_statistics(
     )
     entries = []
     for name, value in values.items():
-        path = _stats_path(array_name, name)
+        path = _stats_path(array_name, name, resolved)
         stats = parent.create_array(
             path,
             shape=value.shape,
@@ -406,17 +417,24 @@ def write_block_statistics(
 # -- Reading --
 
 
-def load_block_statistics(array: zarr.Array, name: str = "minmax"):
-    """The block shape and values of one of array's statistics, or None if it has none."""
+def load_block_statistics(array: zarr.Array, name: str = "minmax", block_shape: Sequence[int] | None = None):
+    """The block shape and values of one of array's statistics, or None if it has none.
+
+    With several block shapes of the statistic, block_shape picks one; by
+    default the one with the smallest blocks.
+    """
     attribute = array.attrs.get(STATISTICS_ATTRIBUTE)
     if not attribute:
         return None
-    for entry in attribute.get("statistics", []):
-        if entry["type"] == name:
-            parent_path, _ = _split(array.path)
-            parent = zarr.open_group(array.store, path=parent_path, mode="r", zarr_format=3)
-            return [int(b) for b in entry["block_shape"]], np.asarray(parent[entry["path"]][...])
-    return None
+    entries = [e for e in attribute.get("statistics", []) if e["type"] == name]
+    if block_shape is not None:
+        entries = [e for e in entries if [int(b) for b in e["block_shape"]] == [int(b) for b in block_shape]]
+    if not entries:
+        return None
+    entry = min(entries, key=lambda e: int(np.prod(e["block_shape"], dtype=np.int64)))
+    parent_path, _ = _split(array.path)
+    parent = zarr.open_group(array.store, path=parent_path, mode="r", zarr_format=3)
+    return [int(b) for b in entry["block_shape"]], np.asarray(parent[entry["path"]][...])
 
 
 def find_range(

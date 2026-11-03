@@ -15,25 +15,32 @@ zone maps: Parquet stores them for every row group, and Iceberg for every file.
 ## Where the statistics are
 
 The statistics of an array named `<name>` are Zarr arrays next to it, in a
-`.stats` group in the same parent group, at `.stats/<name>/<type>`. Zarr arrays
-can't contain other nodes, so the parent group is the closest place; a copy of
-that group keeps its arrays' statistics. The array lists them in its
-`block_statistics` attribute:
+`.stats` group in the same parent group, at `.stats/<name>/<type>/<shape>`.
+Zarr arrays can't contain other nodes, so the parent group is the closest
+place; a copy of that group keeps its arrays' statistics.
+
+Each statistic type is a group, and each block shape of it is one array in
+that group, named by the block shape's sizes joined with `x`. The levels of
+one statistic therefore sit together, as a reader moving from coarse to fine
+blocks uses them:
 
 ```
-acquisition/ts/
-├── timestamps          (attribute "block_statistics" below)
-├── data
+acquisition/ecephys/
+├── data                (attribute "block_statistics")
 └── .stats/
-    └── timestamps/
-        └── minmax
+    └── data/
+        └── minmax/
+            ├── 30000x1
+            └── 300000x1
 ```
+
+The array lists its statistics in its `block_statistics` attribute:
 
 ```json
 "block_statistics": {
-  "sorted": "ascending",
   "statistics": [
-    {"type": "minmax", "block_shape": [10000], "path": ".stats/timestamps/minmax"}
+    {"type": "minmax", "block_shape": [30000, 1], "path": ".stats/data/minmax/30000x1"},
+    {"type": "minmax", "block_shape": [300000, 1], "path": ".stats/data/minmax/300000x1"}
   ]
 }
 ```
@@ -43,10 +50,15 @@ acquisition/ts/
 - `sorted` (optional): `"ascending"` if the array's values never decrease
   along its only dimension. Readers may bisect its `minmax` only then.
 
-An array may have several entries of the same type with different block shapes,
-for example at 1 s, 10 s and 100 s. Each statistics array's own attributes
-repeat `type` and `block_shape`, name the `array` it describes (its name in the parent group), and may record
-the `sources` it was computed from (the size and ETag of each file whose bytes
+Readers find statistics through the paths in this attribute and must not
+infer anything from the names. The naming above is what writers should use:
+recomputing a block shape replaces its own array, and adding a block shape
+adds a sibling. A block that covers a whole dimension is named by its
+resolved size, so `[null, 1]` on 12,081,285 rows is `12081285x1`.
+
+Each statistics array's own attributes repeat `type` and `block_shape`, name
+the `array` it describes (its name in the parent group), and may record the
+`sources` it was computed from (the size and ETag of each file whose bytes
 were read), so that stale statistics can be detected.
 
 ## Blocks
@@ -83,7 +95,16 @@ aren't stored count as their fill value.
 
 ## Planned
 
-Other types are planned but not yet defined: `nan_count`; `sum` and `sum_sq`
-for integer data; `mean` and `M2` for floating-point data; `set` and
-`bloom_filter` for categorical data. A shorthand for several levels may follow
-if people need it.
+Each type holds everything one kind of query needs at one block shape, so a
+reader never combines two types:
+
+- `nan_count`: the number of NaN values in each block.
+- `moments`: a last dimension of 2 holding `sum` and `sum_sq` as int64 for
+  integer data, which is exact, or `mean` and `M2` (the sum of squared
+  deviations from the block mean) as float64 for floating-point data, which
+  merge exactly between blocks without the precision lost in
+  `sum_sq - sum**2 / n`.
+- `set` and `bloom_filter` for categorical data.
+
+A shorthand for several levels, and building coarser levels from finer ones
+without reading the data, may follow.

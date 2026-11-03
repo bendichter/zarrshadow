@@ -174,10 +174,10 @@ def test_write_block_statistics_layout(tmp_path):
     array[...] = data
     attribute = write_block_statistics(array, block_shape=[500, 1])
     assert attribute == {
-        "statistics": [{"type": "minmax", "block_shape": [500, 1], "path": ".stats/data/minmax"}]
+        "statistics": [{"type": "minmax", "block_shape": [500, 1], "path": ".stats/data/minmax/500x1"}]
     }
     reopened = zarr.open_group(str(tmp_path / "a.zarr"), mode="r")
-    stats = reopened["acquisition/es/.stats/data/minmax"]
+    stats = reopened["acquisition/es/.stats/data/minmax/500x1"]
     assert stats.shape == (6, 4, 2)
     assert stats.attrs["block_shape"] == [500, 1]
     block_shape, values = load_block_statistics(reopened["acquisition/es/data"])
@@ -191,9 +191,17 @@ def test_write_block_statistics_layout(tmp_path):
     copied = zarr.open_group(str(tmp_path / "b.zarr"), mode="r")["moved/data"]
     np.testing.assert_array_equal(load_block_statistics(copied)[1], values)
     assert copy_root is not None
-    # Writing again replaces the entry rather than adding a second one
-    attribute = write_block_statistics(array, block_shape=[1000, 4])
-    assert [e["block_shape"] for e in attribute["statistics"]] == [[1000, 4]]
+    # The same block shape again replaces its entry; another block shape is a second level
+    attribute = write_block_statistics(array, block_shape=[500, 1])
+    assert [e["block_shape"] for e in attribute["statistics"]] == [[500, 1]]
+    attribute = write_block_statistics(array, block_shape=[3000, 1])
+    assert [e["path"] for e in attribute["statistics"]] == [".stats/data/minmax/500x1", ".stats/data/minmax/3000x1"]
+    reopened = zarr.open_group(str(tmp_path / "a.zarr"), mode="r")
+    assert sorted(reopened["acquisition/es/.stats/data/minmax"].array_keys()) == ["3000x1", "500x1"]
+    # The smallest blocks by default, or the block shape asked for
+    assert load_block_statistics(reopened["acquisition/es/data"])[0] == [500, 1]
+    block_shape, coarse = load_block_statistics(reopened["acquisition/es/data"], block_shape=[3000, 1])
+    np.testing.assert_array_equal(coarse, _expected_minmax(data, [3000, 1]))
 
 
 # -- In a reference file system --
@@ -227,7 +235,7 @@ def test_add_block_statistics_to_rfs(h5_times, tmp_path, output):
     rfs = add_block_statistics(rfs, {
         "chunked": {"block_shape": [1000], "sorted": "ascending"},
         "contiguous": {"block_shape": [1000], "sorted": "ascending"},
-        "signal": {"block_shape": [500, 1]},
+        "signal": [{"block_shape": [500, 1]}, {"block_shape": [6000, None]}],
     })
     if output:
         out = str(tmp_path / ("out.shadowzarr" if output == "directory" else "refs.json"))
@@ -237,7 +245,10 @@ def test_add_block_statistics_to_rfs(h5_times, tmp_path, output):
     _check_times(group, times)
     _, values = load_block_statistics(group["signal"])
     np.testing.assert_array_equal(values, _expected_minmax(group["signal"][...], [500, 1]))
-    stats = group[".stats/chunked/minmax"]
+    _, coarse = load_block_statistics(group["signal"], block_shape=[6000, 4])
+    np.testing.assert_array_equal(coarse, _expected_minmax(group["signal"][...], [6000, 4]))
+    assert sorted(group[".stats/signal/minmax"].array_keys()) == ["500x1", "6000x4"]
+    stats = group[".stats/chunked/minmax/1000"]
     assert stats.attrs["array"] == "chunked"
     assert path in str(stats.attrs["sources"])
 
