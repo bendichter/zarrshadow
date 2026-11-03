@@ -436,12 +436,15 @@ window = find_range(root[path], 1200.0, 1202.0)  # slice of the samples in [1200
 
 - `add_block_statistics` reads each listed array once and adds its statistics to the references as inline chunks next to the array, at `.stats/<array name>/minmax/<block shape>` in the same group (for example `.stats/timestamps/minmax/11799`), so `write_rfs` and `rfs_to_icechunk` carry them. The array's `block_statistics` attribute lists them.
 - `block_shape` is in elements. Along each dimension it must divide the chunk size, be a multiple of it, or cover the whole dimension. A size of 1 keeps a dimension, so `[30000, 1]` on `(time, channel)` data gives a value per channel per 30,000 samples. `granularity=N` means N chunks per block.
-- A list of option sets for one array adds several levels, one array per block shape.
+- A list of option sets for one array adds several levels, one array per block shape. The data is read once: a level whose blocks are whole numbers of a finer level's is rolled up from it. `write_block_statistics(array, levels=[...])` does the same in a Zarr store.
 - `write_block_statistics` does the same for an array in a writable Zarr store, and `load_block_statistics` returns an array's statistics.
-- `searchsorted(array, values, side)` gives what `np.searchsorted` gives. `values` may be a scalar or an array in any order; each block they fall in is read once. `find_range(array, low, high)` is the slice between two of them.
+- `searchsorted(array, values, side)` gives what `np.searchsorted` gives. `values` may be a scalar or an array in any order. It bisects the coarsest level, then reads only the parts of finer levels and of the data that the values fall in, each block once. `find_range(array, low, high)` is the slice between two of them.
+- `minmax_range(array, start, stop)` gives the exact minimum and maximum of `array[start:stop]` along the first dimension, per channel with blocks of `[n, 1]`. It uses whole coarse blocks inside the range, finer levels toward the edges, and reads the data only for the partial blocks at the two ends.
 - Both bisect only arrays marked `sorted: "ascending"`. Without statistics they read the whole array.
 
 On the Allen Visual Coding LFP timestamps above (12.1 million values, 97 MB in 1,024 chunks), finding a 2 s window took 0.13 s, 3 requests and 0.14 MB, against 7.4 s, 1,024 requests and 63 MB to read the whole array. The statistics are 16 KB and took 7 s to compute. `scripts/block_statistics_benchmark.py` measures this for any file and also compares the 1 s index temporaldata uses.
+
+`scripts/block_statistics_minmax_benchmark.py` measures `minmax_range` against reading a window on a remote recording. On the Allen LFP (89 channels, 4.3 GB), a 30 min window took 1.1 s, 180 requests and 17 MB, against 28 s, 4,361 requests and 419 MB to read it. `scripts/block_statistics_levels_benchmark.py` measures what levels add, on a rechunked copy with simulated storage latency.
 
 hdmf-zarr reads every group, so `NWBZarrIO` warns once for each array under `.stats`; the file otherwise reads as before.
 

@@ -83,6 +83,21 @@ chunks.
 Blocks are independent of how a reader fetches the data. Blocks smaller than a
 chunk only save reads when the reader can read part of a chunk.
 
+## Levels
+
+A statistic may have several block shapes. A reader uses them as levels when
+each coarser block is a whole number of the next finer block along every
+dimension, or covers the whole dimension. For a sorted array, a reader can
+bisect the coarsest level, then read only the parts of each finer level that
+the values fall in. For a range of the first dimension, it can combine whole
+blocks of the coarsest level that fit inside the range with finer levels
+toward its edges, and read the data only at the two ends.
+
+Writers can compute coarser levels from finer ones without reading the data
+again. For `minmax`, a coarse block's minimum is the minimum of its fine
+blocks' minima, and likewise for the maximum. The result is the same as
+computing the coarse level from the data.
+
 ## Statistic types
 
 ### `minmax`
@@ -106,5 +121,5 @@ reader never combines two types:
   `sum_sq - sum**2 / n`.
 - `set` and `bloom_filter` for categorical data.
 
-A shorthand for several levels, and building coarser levels from finer ones
-without reading the data, may follow.
+A shorthand for several levels, such as a base block shape with a factor and
+a count, may follow if people need it.

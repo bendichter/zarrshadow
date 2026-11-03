@@ -31,10 +31,16 @@ plus a last dimension of 2, holding each block's minimum and maximum, with the
 array's own data type. NaN is ignored, and a block holding only NaN has NaN
 for both.
 
+A statistic can have several block shapes. When each coarser block is a
+whole number of finer ones, they are levels: coarser levels are rolled up
+from finer ones without reading the data again, and readers start at the
+coarsest and read only what they need of the finer ones.
+
 add_block_statistics adds statistics to a reference file system, inline, so
 that they travel with it into a directory, a kerchunk JSON file or an
 Icechunk repo. write_block_statistics adds them to an array in a writable
-Zarr store. find_range uses them to find a range of a sorted array.
+Zarr store. searchsorted and find_range use them to search a sorted array,
+and minmax_range to find the minimum and maximum over a range.
 """
 
 from __future__ import annotations
@@ -58,6 +64,8 @@ SORTED_VALUES = ("ascending",)
 
 # Statistics arrays are split into chunks of about this many bytes along their first axis.
 _STATS_CHUNK_BYTES = 2**20
+# Readers skip coarser levels when reading this much of a finer one is enough.
+DEFAULT_MAX_BYTES = 2**20
 _STATS_CODECS = [
     {"name": "bytes", "configuration": {"endian": "little"}},
     {"name": "zstd", "configuration": {"level": 3, "checksum": False}},
@@ -206,6 +214,81 @@ def compute_block_statistics(
     return resolved, values
 
 
+def _nests(fine: Sequence[int], coarse: Sequence[int], shape: Sequence[int]) -> bool:
+    """Whether every coarse block is a whole number of fine blocks along each dimension."""
+    return all(c % f == 0 or c >= s for f, c, s in zip(fine, coarse, shape))
+
+
+def rollup_minmax(
+    values: np.ndarray, fine_block_shape: Sequence[int], coarse_block_shape: Sequence[int], shape: Sequence[int]
+) -> np.ndarray:
+    """The minmax of coarse blocks, from the minmax of fine blocks of an array of shape.
+
+    Each coarse block must be a whole number of fine blocks along every
+    dimension, or cover the whole dimension. No data is read, and the result
+    equals compute_minmax at the coarse block shape.
+    """
+    fine = [int(b) for b in fine_block_shape]
+    coarse = [int(b) for b in coarse_block_shape]
+    shape = [int(s) for s in shape]
+    if not _nests(fine, coarse, shape):
+        raise ValueError(f"Blocks of {coarse} are not whole numbers of blocks of {fine}")
+    fine_grid = list(values.shape[:-1])
+    factor = [n if c >= s else c // f for n, f, c, s in zip(fine_grid, fine, coarse, shape)]
+    groups = [math.ceil(n / k) for n, k in zip(fine_grid, factor)]
+    # Repeat edge blocks to fill the last group; a repeated value changes neither minimum nor maximum
+    pad = [(0, g * k - n) for g, k, n in zip(groups, factor, fine_grid)] + [(0, 0)]
+    if any(after for _, after in pad):
+        values = np.pad(values, pad, mode="edge")
+    split = [x for g, k in zip(groups, factor) for x in (g, k)] + [2]
+    pieces = values.reshape(split)
+    axes = tuple(range(1, 2 * len(fine_grid), 2))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        if values.dtype.kind == "f":
+            low, high = np.nanmin(pieces[..., 0], axis=axes), np.nanmax(pieces[..., 1], axis=axes)
+        else:
+            low, high = pieces[..., 0].min(axis=axes), pieces[..., 1].max(axis=axes)
+    return np.stack([low, high], axis=-1)
+
+
+_ROLLUP = {"minmax": rollup_minmax}
+
+
+def compute_block_statistics_levels(
+    array: Any,
+    statistics: Sequence[str] = ("minmax",),
+    block_shapes: Sequence[Sequence[int | None]] = (),
+) -> list[tuple[list[int], dict[str, np.ndarray]]]:
+    """Compute statistics at several block shapes, reading the data as few times as possible.
+
+    Block shapes are computed from the smallest up. A block shape that is a
+    whole number of an already computed one is rolled up from it without
+    reading the data; any other is computed from the data. Returns the
+    resolved block shape and values of each, in the order given.
+    """
+    resolved = [resolve_block_shape(array.shape, array.chunks, b) for b in block_shapes]
+    order = sorted(range(len(resolved)), key=lambda i: int(np.prod(resolved[i], dtype=np.int64)))
+    done: dict[int, dict[str, np.ndarray]] = {}
+    for i in order:
+        values = {}
+        for name in statistics:
+            if name not in _COMPUTE:
+                raise ValueError(f"Unknown statistic {name!r}; known: {', '.join(TYPES)}")
+            source = next(
+                (j for j in reversed([j for j in order if j in done]) if _nests(resolved[j], resolved[i], array.shape)),
+                None,
+            )
+            if source is not None and resolved[source] != resolved[i]:
+                values[name] = _ROLLUP[name](done[source][name], resolved[source], resolved[i], array.shape)
+            elif source is not None:
+                values[name] = done[source][name]
+            else:
+                values[name] = _COMPUTE[name](array, resolved[i])
+        done[i] = values
+    return [(resolved[i], done[i]) for i in range(len(resolved))]
+
+
 def _split(array_path: str) -> tuple[str, str]:
     """The parent group's path and the array's name."""
     array_path = array_path.strip("/")
@@ -268,8 +351,8 @@ def add_block_statistics(
     ["minmax"]), "block_shape" or "granularity" (see resolve_block_shape),
     and "sorted" ("ascending", or None when the array isn't known to be
     sorted). A list of option sets adds several levels, one per block shape.
-    The array's data is read through the references, so this reads every
-    chunk of those arrays once for each level.
+    The array's data is read through the references once; a level whose
+    blocks are whole numbers of a finer level's is rolled up from it.
 
     The statistics are inline chunks in the references, so write_rfs and
     rfs_to_icechunk carry them like any other small array. Each statistics
@@ -287,41 +370,42 @@ def add_block_statistics(
     store = RfsStore(rfs, validate_sources=validate_sources)
     root = zarr.open_group(store, mode="r", zarr_format=3)
     created_groups: set[str] = set()
-    jobs = [
-        (path, options)
-        for path, given in arrays.items()
-        for options in ([given] if isinstance(given, Mapping) else list(given))
-    ]
-    for array_path, options in jobs:
+    for array_path, given in arrays.items():
         array_path = array_path.strip("/")
-        options = dict(options)
-        unknown = set(options) - {"statistics", "block_shape", "granularity", "sorted"}
-        if unknown:
-            raise ValueError(f"Unknown options for {array_path}: {sorted(unknown)}")
-        sorted_ = options.get("sorted")
-        _check_sorted(sorted_)
+        option_sets = [dict(given)] if isinstance(given, Mapping) else [dict(o) for o in given]
+        sorted_ = None
+        for options in option_sets:
+            unknown = set(options) - {"statistics", "block_shape", "granularity", "sorted"}
+            if unknown:
+                raise ValueError(f"Unknown options for {array_path}: {sorted(unknown)}")
+            _check_sorted(options.get("sorted"))
+            sorted_ = options.get("sorted") or sorted_
         array = root[array_path]
         if not isinstance(array, zarr.Array):
             raise ValueError(f"{array_path} is not an array")
-        resolved, values = compute_block_statistics(
-            array,
-            options.get("statistics", ("minmax",)),
-            block_shape=options.get("block_shape"),
-            granularity=options.get("granularity"),
-        )
+        # Each option set is one level; levels that share statistics are computed together
+        levels = []
+        by_statistics: dict[tuple[str, ...], list[int]] = {}
+        for i, options in enumerate(option_sets):
+            shape = resolve_block_shape(array.shape, array.chunks, options.get("block_shape"), options.get("granularity"))
+            by_statistics.setdefault(tuple(options.get("statistics", ("minmax",))), []).append(i)
+            levels.append(shape)
         parent, array_name = _split(array_path)
         entries = []
-        for name, value in values.items():
-            path = _stats_path(array_name, name, resolved)
-            full = _join(parent, path)
-            _add_groups(refs, full, created_groups)
-            _add_inline_array(refs, full, value, {
-                "type": name,
-                "block_shape": resolved,
-                "array": array_name,
-                "sources": copy.deepcopy(rfs.get("sources", {})),
-            })
-            entries.append(_statistic_entry(name, resolved, path))
+        for statistics, indexes in by_statistics.items():
+            computed = compute_block_statistics_levels(array, statistics, [levels[i] for i in indexes])
+            for resolved, values in computed:
+                for name, value in values.items():
+                    path = _stats_path(array_name, name, resolved)
+                    full = _join(parent, path)
+                    _add_groups(refs, full, created_groups)
+                    _add_inline_array(refs, full, value, {
+                        "type": name,
+                        "block_shape": resolved,
+                        "array": array_name,
+                        "sources": copy.deepcopy(rfs.get("sources", {})),
+                    })
+                    entries.append(_statistic_entry(name, resolved, path))
         meta_key = metadata_key(array_path)
         meta = json.loads(refs[meta_key])
         attributes = meta.setdefault("attributes", {})
@@ -382,18 +466,33 @@ def write_block_statistics(
     *,
     block_shape: Sequence[int | None] | None = None,
     granularity: int | Sequence[int] | None = None,
+    levels: Sequence[Sequence[int | None]] | None = None,
     sorted: str | None = None,  # noqa: A002 - the attribute's own name
 ) -> dict:
     """Compute statistics of array and write them next to it, in its writable store.
 
-    Returns the array's new "block_statistics" attribute.
+    levels, a list of block shapes, writes several levels at once: the data
+    is read once, and coarser levels are rolled up from finer ones. Returns
+    the array's new "block_statistics" attribute.
     """
     _check_sorted(sorted)
     parent_path, array_name = _split(array.path)
     parent = zarr.open_group(array.store, path=parent_path, mode="r+", zarr_format=3)
-    resolved, values = compute_block_statistics(
-        array, statistics, block_shape=block_shape, granularity=granularity
-    )
+    if levels is not None:
+        if block_shape is not None or granularity is not None:
+            raise ValueError("Give levels, or block_shape or granularity, not both")
+        computed = compute_block_statistics_levels(array, statistics, levels)
+    else:
+        computed = [compute_block_statistics(array, statistics, block_shape=block_shape, granularity=granularity)]
+    entries = []
+    for resolved, values in computed:
+        entries += _write_level(parent, array_name, resolved, values)
+    attribute = _merge_attribute(array.attrs.get(STATISTICS_ATTRIBUTE), entries, sorted)
+    array.attrs[STATISTICS_ATTRIBUTE] = attribute
+    return attribute
+
+
+def _write_level(parent: zarr.Group, array_name: str, resolved: list[int], values: dict) -> list[dict]:
     entries = []
     for name, value in values.items():
         path = _stats_path(array_name, name, resolved)
@@ -409,9 +508,7 @@ def write_block_statistics(
         )
         stats[...] = value
         entries.append(_statistic_entry(name, resolved, path))
-    attribute = _merge_attribute(array.attrs.get(STATISTICS_ATTRIBUTE), entries, sorted)
-    array.attrs[STATISTICS_ATTRIBUTE] = attribute
-    return attribute
+    return entries
 
 
 # -- Reading --
@@ -437,13 +534,114 @@ def load_block_statistics(array: zarr.Array, name: str = "minmax", block_shape: 
     return [int(b) for b in entry["block_shape"]], np.asarray(parent[entry["path"]][...])
 
 
-def searchsorted(array: zarr.Array, values: Any, side: str = "left") -> int | np.ndarray:
+class _LazyStatistics:
+    """A statistics array that is opened when first read.
+
+    Its shape and data type follow from the array it describes, so a reader
+    can weigh levels without fetching their metadata.
+    """
+
+    def __init__(self, array: zarr.Array, path: str, block_shape: list[int]):
+        self._array, self._path = array, path
+        self.shape = tuple(block_grid(array.shape, block_shape)) + (2,)
+        self.dtype = np.dtype(array.dtype)
+        self._opened = None
+
+    def open(self) -> zarr.Array:
+        if self._opened is None:
+            parent_path, _ = _split(self._array.path)
+            parent = zarr.open_group(self._array.store, path=parent_path, mode="r", zarr_format=3)
+            self._opened = parent[self._path]
+        return self._opened
+
+    def __getitem__(self, key):
+        return self.open()[key]
+
+
+def _read_all(reads: list[tuple[Any, tuple]]) -> list[np.ndarray]:
+    """Read several selections at once, each (array, selection), in parallel threads."""
+    if len(reads) <= 1:
+        return [np.asarray(a[sel]) for a, sel in reads]
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=min(len(reads), 16)) as pool:
+        return list(pool.map(lambda read: np.asarray(read[0][read[1]]), reads))
+
+
+def _minmax_levels(array: zarr.Array) -> list[tuple[list[int], _LazyStatistics]]:
+    """The array's minmax statistics as (block shape, statistics array), smallest blocks first."""
+    attribute = array.attrs.get(STATISTICS_ATTRIBUTE) or {}
+    entries = [e for e in attribute.get("statistics", []) if e["type"] == "minmax"]
+    levels = []
+    for e in entries:
+        block_shape = [int(b) for b in e["block_shape"]]
+        levels.append((block_shape, _LazyStatistics(array, e["path"], block_shape)))
+    return sorted(levels, key=lambda level: int(np.prod(level[0], dtype=np.int64)))
+
+
+def _nested(levels: list[tuple[list[int], Any]], shape: Sequence[int]) -> list[tuple[list[int], Any]]:
+    """From the finest level up, the levels whose blocks are whole numbers of the previous one's."""
+    chain: list[tuple[list[int], Any]] = []
+    for level in levels:
+        if not chain or (level[0] != chain[-1][0] and _nests(chain[-1][0], level[0], shape)):
+            chain.append(level)
+    return chain
+
+
+def _runs(blocks: np.ndarray, limit: int):
+    """The runs of equal values in nondecreasing blocks, as (block, start, stop), for blocks below limit."""
+    if not blocks.size:
+        return []
+    edges = np.flatnonzero(np.diff(blocks)) + 1
+    starts = np.concatenate([[0], edges])
+    stops = np.concatenate([edges, [blocks.size]])
+    return [(int(blocks[a]), int(a), int(z)) for a, z in zip(starts, stops) if blocks[a] < limit]
+
+
+def _refine(blocks, values, n_blocks, ratio, n_fine, read, side):
+    """The position of each value one level finer, from its block at this level.
+
+    values are sorted, and blocks[i] is the block of values[i]. Each block
+    holds ratio finer entries; read(start, stop) returns the sorted keys of
+    the finer entries from start to stop, which are the maxima of a finer
+    level or the data itself. Neighbouring blocks are read together.
+    """
+    out = np.full(values.shape, n_fine, dtype=np.int64)
+    runs = _runs(blocks, n_blocks)
+    i = 0
+    while i < len(runs):
+        j = i
+        while j + 1 < len(runs) and runs[j + 1][0] == runs[j][0] + 1:
+            j += 1
+        offset = runs[i][0] * ratio
+        keys = read(offset, min((runs[j][0] + 1) * ratio, n_fine))
+        for b, a, z in runs[i:j + 1]:
+            lo = b * ratio - offset
+            out[a:z] = b * ratio + np.searchsorted(keys[lo:lo + ratio], values[a:z], side)
+        i = j + 1
+    return out
+
+
+def _level_bytes(level: tuple[list[int], Any], rows: int) -> int:
+    """The bytes of rows entries along the first dimension of a statistics array."""
+    stats = level[1]
+    return rows * int(np.prod(stats.shape[1:], dtype=np.int64)) * stats.dtype.itemsize
+
+
+def searchsorted(
+    array: zarr.Array, values: Any, side: str = "left", *, max_bytes: int = DEFAULT_MAX_BYTES
+) -> int | np.ndarray:
     """Where values would go in a sorted one-dimensional array, as np.searchsorted gives.
 
-    With the array's minmax statistics, it reads only those and the blocks
-    the values fall in: each block once, and runs of neighbouring blocks in
-    one read. An array without them, or not marked sorted, is read whole.
-    A scalar gives an int, an array of values an int64 array of their shape.
+    With the array's minmax statistics, it bisects the coarsest level, then
+    reads only the parts of each finer level and of the data that the values
+    fall in: each block once, and runs of neighbouring blocks in one read.
+    Levels are used when each one's blocks are whole numbers of the next
+    finer one's. Search starts at the finest level of at most max_bytes,
+    since reading that whole is no slower than stepping through coarser
+    ones, or at the coarsest level when every level is larger. An array
+    without statistics, or not marked sorted, is read whole. A scalar gives an int, an array of values an int64 array of their
+    shape; the values may be in any order.
     """
     if side not in ("left", "right"):
         raise ValueError(f"side must be 'left' or 'right', not {side!r}")
@@ -452,11 +650,13 @@ def searchsorted(array: zarr.Array, values: Any, side: str = "left") -> int | np
     scalar = np.ndim(values) == 0
     values = np.asarray(values)
     attribute = array.attrs.get(STATISTICS_ATTRIBUTE) or {}
-    loaded = load_block_statistics(array, "minmax") if attribute.get("sorted") == "ascending" else None
-    if loaded is None:
+    levels = _nested(_minmax_levels(array), array.shape) if attribute.get("sorted") == "ascending" else []
+    small = [i for i, level in enumerate(levels) if _level_bytes(level, level[1].shape[0]) <= max_bytes]
+    if small:
+        levels = levels[: small[0] + 1]
+    if not levels:
         result = np.searchsorted(np.asarray(array[...]), values, side).astype(np.int64)
         return int(result) if scalar else result
-    (block,), minmax = loaded
     n = int(array.shape[0])
     flat = values.ravel()
     # Work on the values in sorted order, so that the values of each block are
@@ -466,33 +666,114 @@ def searchsorted(array: zarr.Array, values: Any, side: str = "left") -> int | np
         order = np.argsort(flat, kind="stable")
         flat = flat[order]
     # Every block before b is entirely before the value's position, which is in block b
-    blocks = np.searchsorted(minmax[:, 1], flat, side)
-    found = np.full(flat.shape, n, dtype=np.int64)
-    # Where each block's run of values starts and stops; blocks are nondecreasing
-    edges = np.flatnonzero(np.diff(blocks)) + 1
-    starts = np.concatenate([[0], edges]) if flat.size else np.array([], dtype=np.int64)
-    stops = np.concatenate([edges, [flat.size]]) if flat.size else np.array([], dtype=np.int64)
-    run_blocks = blocks[starts] if flat.size else blocks
-    keep = run_blocks < len(minmax)
-    starts, stops, run_blocks = starts[keep], stops[keep], run_blocks[keep]
-    # Read runs of neighbouring blocks together
-    groups = np.split(np.arange(len(run_blocks)), np.flatnonzero(np.diff(run_blocks) != 1) + 1) if len(run_blocks) else []
-    for group in groups:
-        first, last = int(run_blocks[group[0]]), int(run_blocks[group[-1]])
-        offset = first * block
-        data = np.asarray(array[offset:min((last + 1) * block, n)])
-        for i in group:
-            b = int(run_blocks[i])
-            lo = b * block - offset
-            a, z = starts[i], stops[i]
-            found[a:z] = b * block + np.searchsorted(data[lo:lo + block], flat[a:z], side)
+    (block,), coarsest = levels[-1]
+    maxima = np.asarray(coarsest[:, 1])
+    blocks = np.searchsorted(maxima, flat, side)
+    n_blocks = len(maxima)
+    for (fine_block,), fine in [*reversed(levels[:-1]), ([1], None)]:
+        if fine is None:
+            n_fine = n
+            read = lambda a, z: np.asarray(array[a:z])  # noqa: E731
+        else:
+            n_fine = int(fine.shape[0])
+            read = lambda a, z, fine=fine: np.asarray(fine[a:z, 1])  # noqa: E731
+        ratio = math.ceil(block / fine_block)
+        blocks = _refine(blocks, flat, n_blocks, ratio, n_fine, read, side)
+        n_blocks, block = n_fine, fine_block
     if order is not None:
-        result = np.empty_like(found)
-        result[order] = found
+        result = np.empty_like(blocks)
+        result[order] = blocks
     else:
-        result = found
+        result = blocks
     result = result.reshape(values.shape)
     return int(result) if scalar else result
+
+
+def minmax_range(
+    array: zarr.Array, start: int, stop: int, *, max_bytes: int = DEFAULT_MAX_BYTES
+) -> tuple[Any, Any]:
+    """The exact minimum and maximum of array[start:stop] along the first dimension.
+
+    Uses the array's minmax levels: whole blocks of the coarsest level that
+    fit inside the range, then finer levels toward its edges, and the data
+    itself only for the parts of the finest blocks at the two ends. Along the
+    other dimensions the result has one value per block, so a block size of
+    1 there gives a value per element (per channel), and the whole size one
+    value. Those block sizes must be 1 or the whole dimension. NaN is ignored.
+    It starts at the finest level whose blocks in the range take at most
+    max_bytes, so coarser levels are read only when they save reading more
+    than that. Without statistics the range is read whole.
+    """
+    shape = [int(x) for x in array.shape]
+    n = shape[0]
+    start, stop = int(start), int(stop)
+    if not 0 <= start < stop <= n:
+        raise ValueError(f"Need 0 <= start < stop <= {n}, not {start}, {stop}")
+    levels = _minmax_levels(array)
+    if levels:
+        # The levels that share the finest level's blocks along the other dimensions
+        others = levels[0][0][1:]
+        levels = _nested([lv for lv in levels if lv[0][1:] == others], shape)
+    else:
+        others = [1] * (len(shape) - 1)
+    for size, block in zip(shape[1:], others):
+        if block != 1 and block < size:
+            raise ValueError("minmax_range needs blocks of 1 or the whole size along the other dimensions")
+    reduce_axes = tuple(d for d, (size, block) in enumerate(zip(shape[1:], others)) if block != 1 and size > 1)
+    # The finest level whose blocks inside the range fit in max_bytes, and finer ones for the edges
+    for k, level in enumerate(levels):
+        if _level_bytes(level, math.ceil((stop - start) / level[0][0])) <= max_bytes:
+            levels = levels[: k + 1]
+            break
+
+    def reduce_data(data: np.ndarray):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            low = np.nanmin(data, axis=0) if data.dtype.kind == "f" else data.min(axis=0)
+            high = np.nanmax(data, axis=0) if data.dtype.kind == "f" else data.max(axis=0)
+            if reduce_axes:
+                low = (np.nanmin if data.dtype.kind == "f" else np.min)(low, axis=reduce_axes, keepdims=True)
+                high = (np.nanmax if data.dtype.kind == "f" else np.max)(high, axis=reduce_axes, keepdims=True)
+        return low, high
+
+    def reduce_level(values: np.ndarray):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            if values.dtype.kind == "f":
+                return np.nanmin(values[..., 0], axis=0), np.nanmax(values[..., 1], axis=0)
+            return values[..., 0].min(axis=0), values[..., 1].max(axis=0)
+
+    # Which pieces to read depends only on start and stop, so plan them all,
+    # then read them together
+    plan: list[tuple[int, int, int]] = []  # (level, or -1 for the data; first; last)
+
+    def cover(lo: int, hi: int, k: int) -> None:
+        if lo >= hi:
+            return
+        if k < 0:
+            plan.append((-1, lo, hi))
+            return
+        block = levels[k][0][0]
+        first = math.ceil(lo / block)
+        last = math.ceil(n / block) if hi >= n else hi // block
+        if first >= last:
+            cover(lo, hi, k - 1)
+            return
+        plan.append((k, first, last))
+        cover(lo, first * block, k - 1)
+        cover(min(last * block, n), hi, k - 1)
+
+    cover(start, stop, len(levels) - 1)
+    reads = [(array if k < 0 else levels[k][1].open(), (slice(a, z),)) for k, a, z in plan]
+    values = _read_all(reads)
+    parts = [reduce_data(v) if k < 0 else reduce_level(v) for (k, _, _), v in zip(plan, values)]
+    low = parts[0][0]
+    high = parts[0][1]
+    for part_low, part_high in parts[1:]:
+        low, high = np.fmin(low, part_low), np.fmax(high, part_high)
+    if len(shape) == 1:
+        return low[()], high[()]
+    return low, high
 
 
 def find_range(
