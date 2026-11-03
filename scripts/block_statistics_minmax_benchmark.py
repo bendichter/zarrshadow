@@ -1,4 +1,4 @@
-"""Benchmark the per-channel minimum and maximum over windows of a remote recording.
+"""Benchmark per-channel minimum, maximum, mean and variance over windows of a remote recording.
 
 The statistics are a minmax per channel at several levels: one block per
 chunk along time, and coarser levels rolled up from it. For each window
@@ -24,7 +24,7 @@ import numpy as np
 import zarr
 
 from shadowzarr import generate_rfs
-from shadowzarr.block_statistics import add_block_statistics, minmax_range
+from shadowzarr.block_statistics import add_block_statistics, minmax_range, moments_range
 from shadowzarr.rfs_store import RfsStore
 
 
@@ -71,7 +71,8 @@ def main() -> None:
     print(f"references: {time.perf_counter() - t:.1f} s")
     probe = zarr.open_group(RfsStore(rfs), mode="r", zarr_format=3)[args.dataset]
     chunk = probe.chunks[0]
-    levels = [{"block_shape": [f * chunk] + [1] * (probe.ndim - 1)} for f in factors]
+    levels = [{"block_shape": [f * chunk] + [1] * (probe.ndim - 1), "statistics": ["minmax", "moments"]}
+              for f in factors]
 
     t = time.perf_counter()
     rfs = add_block_statistics(rfs, {args.dataset: levels})
@@ -84,12 +85,13 @@ def main() -> None:
     entries = array.attrs["block_statistics"]["statistics"]
     stats_bytes = sum(parent[e["path"]].nbytes for e in entries)
     print(f"array: {array.shape} {array.dtype}, {array.nbytes / 1e9:.2f} GB, chunks of {array.chunks}")
-    print(f"statistics: levels of {', '.join(str(e['block_shape'][0]) for e in entries)} samples per channel, "
+    shapes = sorted({e["block_shape"][0] for e in entries})
+    print(f"statistics: minmax and moments, levels of {', '.join(map(str, shapes))} samples per channel, "
           f"{stats_bytes / 1e6:.2f} MB, computed in {stats_time:.0f} s (one read of the whole array)")
 
     # The same array, seeing only the finest level
     finest = dict(array.attrs["block_statistics"])
-    finest["statistics"] = [min(entries, key=lambda e: e["block_shape"][0])]
+    finest["statistics"] = [e for e in entries if e["block_shape"][0] == min(x["block_shape"][0] for x in entries)]
     one_level = _OneLevel(array, finest)
 
     rng = np.random.default_rng(0)
@@ -109,7 +111,12 @@ def main() -> None:
         if expected is not None:
             np.testing.assert_array_equal(result[0], expected[0])
             np.testing.assert_array_equal(result[1], expected[1])
-        rows.append((f"minmax_range, {len(entries)} levels", *cost))
+        rows.append((f"minmax_range, {len(shapes)} levels", *cost))
+        result_m, *cost = _measure(counting, lambda: moments_range(array, start, stop))
+        if expected is not None:
+            np.testing.assert_allclose(result_m["mean"], whole.astype(np.float64).mean(axis=0), rtol=1e-6)
+            np.testing.assert_allclose(result_m["variance"], whole.astype(np.float64).var(axis=0), rtol=1e-6)
+        rows.append((f"moments_range, {len(shapes)} levels", *cost))
         single, *cost = _measure(counting, lambda: minmax_range(one_level, start, stop))
         np.testing.assert_array_equal(single[0], result[0])
         np.testing.assert_array_equal(single[1], result[1])

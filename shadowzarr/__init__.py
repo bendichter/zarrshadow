@@ -1,4 +1,4 @@
-from .block_statistics import add_block_statistics, find_range, minmax_range, searchsorted, write_block_statistics
+from .block_statistics import add_block_statistics, find_range, minmax_range, moments_range, searchsorted, write_block_statistics
 from .builder import RfsBuilder, write_rfs
 from .hdf5 import generate_rfs
 from .local_cache import LocalCache
@@ -36,4 +36,5 @@ __all__ = [
     "find_range",
     "searchsorted",
     "minmax_range",
+    "moments_range",
 ]

@@ -26,10 +26,13 @@ size must divide the chunk size or be a multiple of it, so that no block is
 split unevenly between chunks. A size of 1 keeps that dimension (a value per
 channel) and the size of the whole dimension reduces over it.
 
-Only "minmax" is defined so far. Its array has the shape of the block grid
-plus a last dimension of 2, holding each block's minimum and maximum, with the
-array's own data type. NaN is ignored, and a block holding only NaN has NaN
-for both.
+Three statistics are defined. "minmax" has the shape of the block grid plus
+a last dimension of 2, holding each block's minimum and maximum, with the
+array's own data type; NaN is ignored. "missing_count" counts each block's
+missing values: NaN for floats by default, or values named in "missing".
+"moments" holds each block's count of valid values with their sum and sum of
+squares (int64, exact, for integers of up to 16 bits) or mean and M2 (float64),
+from which means and variances of any set of blocks follow.
 
 A statistic can have several block shapes. When each coarser block is a
 whole number of finer ones, they are levels: coarser levels are rolled up
@@ -40,7 +43,8 @@ add_block_statistics adds statistics to a reference file system, inline, so
 that they travel with it into a directory, a kerchunk JSON file or an
 Icechunk repo. write_block_statistics adds them to an array in a writable
 Zarr store. searchsorted and find_range use them to search a sorted array,
-and minmax_range to find the minimum and maximum over a range.
+minmax_range to find the minimum and maximum over a range, and moments_range
+its count, mean and variance.
 """
 
 from __future__ import annotations
@@ -59,7 +63,7 @@ from .builder import chunk_key, inline_value, metadata_key, zarr_data_type
 
 STATISTICS_ATTRIBUTE = "block_statistics"
 STATS_GROUP = ".stats"
-TYPES = ("minmax",)
+TYPES = ("minmax", "missing_count", "moments")
 SORTED_VALUES = ("ascending",)
 
 # Statistics arrays are split into chunks of about this many bytes along their first axis.
@@ -123,40 +127,55 @@ def block_grid(shape: Sequence[int], block_shape: Sequence[int]) -> list[int]:
 # -- Computing --
 
 
-def compute_minmax(array: Any, block_shape: Sequence[int], *, read_bytes: int = 64 * 2**20) -> np.ndarray:
-    """The minimum and maximum of every block, as an array of shape (*block_grid, 2).
+def resolve_missing(dtype: Any, missing: Sequence[Any] | None = None) -> list[Any]:
+    """The values that count as missing in an array of dtype.
 
-    array is a zarr Array (or anything with shape, dtype, chunks and numpy
-    indexing). It is read in pieces of whole chunks of about read_bytes, so
-    memory stays near that. NaN is ignored; a block of only NaN gives NaN.
+    By default NaN for floating-point arrays and nothing for others. A list
+    names them explicitly, for example [-32768] for a sentinel, or the
+    array's fill value when it marks data that was never written.
+    """
+    dtype = np.dtype(dtype)
+    if missing is None:
+        return [float("nan")] if dtype.kind == "f" else []
+    return [float("nan") if (isinstance(m, str) and m == "NaN") or (isinstance(m, float) and np.isnan(m)) else m
+            for m in missing]
+
+
+def _missing_json(missing: Sequence[Any]) -> list[Any]:
+    """missing as JSON can hold it, with NaN as the string "NaN"."""
+    return ["NaN" if isinstance(m, float) and np.isnan(m) else (m.item() if hasattr(m, "item") else m) for m in missing]
+
+
+def _valid(data: np.ndarray, missing: Sequence[Any]) -> np.ndarray:
+    """Where data holds a value that isn't missing."""
+    valid = np.ones(data.shape, dtype=bool)
+    for m in missing:
+        if isinstance(m, float) and np.isnan(m):
+            if data.dtype.kind == "f":
+                valid &= ~np.isnan(data)
+        else:
+            valid &= data != m
+    return valid
+
+
+def moments_dtype(dtype: Any) -> np.dtype:
+    """int64 (count, sum, sum_sq) for integers of up to 16 bits, which is exact; float64 (count, mean, M2) otherwise."""
+    dtype = np.dtype(dtype)
+    return np.dtype("int64") if dtype.kind in "iub" and dtype.itemsize <= 2 else np.dtype("float64")
+
+
+def _pieces(array: Any, block_shape: Sequence[int], read_bytes: int):
+    """Yield (data, valid, index) for every piece of every chunk, read a few chunks at a time.
+
+    data and valid have shape (n0, p0, n1, p1, ...): pieces of
+    min(block, chunk) elements, with the short last piece padded and marked
+    not valid. index (from np.ix_) gives each piece's block.
     """
     shape = [int(s) for s in array.shape]
     chunk_shape = [int(c) for c in array.chunks]
     block_shape = [int(b) for b in block_shape]
-    dtype = np.dtype(array.dtype)
-    if dtype.kind not in "iufb":
-        raise TypeError(f"minmax needs a numeric array, not {dtype}")
-    grid = block_grid(shape, block_shape)
-    is_float = dtype.kind == "f"
-    if is_float:
-        low = np.full(grid, np.inf, dtype=dtype)
-        high = np.full(grid, -np.inf, dtype=dtype)
-        seen = np.zeros(grid, dtype=bool)
-    else:
-        info = np.iinfo(dtype) if dtype.kind in "iu" else None
-        low = np.full(grid, info.max if info else True, dtype=dtype)
-        high = np.full(grid, info.min if info else False, dtype=dtype)
-    if not shape:
-        value = np.asarray(array[...])
-        return np.array([value, value], dtype=dtype)
-    if 0 in shape:
-        return np.stack([low, high], axis=-1)
-
-    # Each chunk is cut into pieces of min(block, chunk) along every dimension;
-    # every piece lies in exactly one block. Several chunks along the first
-    # dimension are read at once, so that a remote store fetches them concurrently.
     piece = [min(b, c) for b, c in zip(block_shape, chunk_shape)]
-    chunk_bytes = dtype.itemsize * int(np.prod(chunk_shape, dtype=np.int64))
+    chunk_bytes = np.dtype(array.dtype).itemsize * int(np.prod(chunk_shape, dtype=np.int64))
     read_shape = [chunk_shape[0] * max(1, read_bytes // max(chunk_bytes, 1))] + chunk_shape[1:]
     read_grid = [math.ceil(s / r) for s, r in zip(shape, read_shape)]
     for coords in np.ndindex(*read_grid):
@@ -164,34 +183,187 @@ def compute_minmax(array: Any, block_shape: Sequence[int], *, read_bytes: int = 
         stop = [min(s0 + r, s) for s0, r, s in zip(start, read_shape, shape)]
         data = np.asarray(array[tuple(slice(a, b) for a, b in zip(start, stop))])
         n_pieces = [math.ceil((b - a) / p) for a, b, p in zip(start, stop, piece)]
-        # Repeat edge values to fill the last piece; a repeated value changes neither minimum nor maximum
         pad = [(0, n * p - (b - a)) for n, p, a, b in zip(n_pieces, piece, start, stop)]
+        inside = np.ones(data.shape, dtype=bool)
         if any(after for _, after in pad):
-            data = np.pad(data, pad, mode="edge")
+            data = np.pad(data, pad)
+            inside = np.pad(inside, pad)
         split = [x for n, p in zip(n_pieces, piece) for x in (n, p)]
-        pieces = data.reshape(split)
-        axes = tuple(range(1, 2 * len(shape), 2))
+        index = np.ix_(*[(a + np.arange(n) * p) // b for a, n, p, b in zip(start, n_pieces, piece, block_shape)])
+        yield data.reshape(split), inside.reshape(split), index
+
+
+class _MinMaxAccumulator:
+    def __init__(self, grid, dtype, missing):
+        self.dtype = np.dtype(dtype)
+        if self.dtype.kind not in "iufb":
+            raise TypeError(f"minmax needs a numeric array, not {self.dtype}")
+        self.is_float = self.dtype.kind == "f"
+        if self.is_float:
+            self.low = np.full(grid, np.inf, dtype=self.dtype)
+            self.high = np.full(grid, -np.inf, dtype=self.dtype)
+            self.seen = np.zeros(grid, dtype=bool)
+            self.empty_low = self.empty_high = np.nan
+        else:
+            info = np.iinfo(self.dtype) if self.dtype.kind in "iu" else None
+            self.empty_low = info.max if info else True
+            self.empty_high = info.min if info else False
+            self.low = np.full(grid, self.empty_low, dtype=self.dtype)
+            self.high = np.full(grid, self.empty_high, dtype=self.dtype)
+
+    def update(self, data, inside, index, axes):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
-            piece_low = np.nanmin(pieces, axis=axes) if is_float else pieces.min(axis=axes)
-            piece_high = np.nanmax(pieces, axis=axes) if is_float else pieces.max(axis=axes)
-        # The block of every piece
-        index = np.ix_(*[(a + np.arange(n) * p) // b for a, n, p, b in zip(start, n_pieces, piece, block_shape)])
-        if is_float:
-            valid = ~np.isnan(piece_low)
-            np.logical_or.at(seen, index, valid)
-            np.fmin.at(low, index, piece_low)
-            np.fmax.at(high, index, piece_high)
+            if self.is_float:
+                values = np.where(inside, data, np.nan)
+                piece_low, piece_high = np.nanmin(values, axis=axes), np.nanmax(values, axis=axes)
+                np.logical_or.at(self.seen, index, ~np.isnan(piece_low))
+                np.fmin.at(self.low, index, piece_low)
+                np.fmax.at(self.high, index, piece_high)
+            else:
+                np.minimum.at(self.low, index, np.where(inside, data, self.empty_low).min(axis=axes))
+                np.maximum.at(self.high, index, np.where(inside, data, self.empty_high).max(axis=axes))
+
+    def result(self):
+        if self.is_float:
+            self.low[~self.seen] = np.nan
+            self.high[~self.seen] = np.nan
+        return np.stack([self.low, self.high], axis=-1)
+
+
+class _MissingCountAccumulator:
+    def __init__(self, grid, dtype, missing):
+        self.missing = missing
+        self.count = np.zeros(grid, dtype=np.int64)
+
+    def update(self, data, inside, index, axes):
+        np.add.at(self.count, index, (inside & ~_valid(data, self.missing)).sum(axis=axes))
+
+    def result(self):
+        return self.count
+
+
+class _MomentsAccumulator:
+    def __init__(self, grid, dtype, missing):
+        self.missing = missing
+        self.ndim = len(grid)
+        self.exact = moments_dtype(dtype).kind == "i"
+        self.count = np.zeros(grid, dtype=np.int64)
+        if self.exact:
+            self.total = np.zeros(grid, dtype=np.int64)
+            self.squares = np.zeros(grid, dtype=np.int64)
         else:
-            np.minimum.at(low, index, piece_low)
-            np.maximum.at(high, index, piece_high)
-    if is_float:
-        low[~seen] = np.nan
-        high[~seen] = np.nan
-    return np.stack([low, high], axis=-1)
+            self.shift = np.full(grid, np.nan)
+            self.total = np.zeros(grid)
+            self.squares = np.zeros(grid)
+
+    def update(self, data, inside, index, axes):
+        keep = inside & _valid(data, self.missing)
+        piece_count = keep.sum(axis=axes)
+        np.add.at(self.count, index, piece_count)
+        if self.exact:
+            values = np.where(keep, data, 0).astype(np.int64)
+            np.add.at(self.total, index, values.sum(axis=axes))
+            np.add.at(self.squares, index, (values * values).sum(axis=axes))
+            return
+        values = np.where(keep, data, 0).astype(np.float64)
+        # Each block's shift is the mean of the first piece with values that reaches it,
+        # so that the sums below are of small deviations and keep their precision
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            piece_mean = values.sum(axis=axes) / piece_count
+        unset = np.isnan(self.shift[index]) & ~np.isnan(piece_mean)
+        if unset.any():
+            self.shift[index] = np.where(unset, piece_mean, self.shift[index])
+        expand = tuple(slice(None) if i % 2 == 0 else None for i in range(2 * self.ndim))
+        centred = np.where(keep, values - np.nan_to_num(self.shift[index])[expand], 0.0)
+        np.add.at(self.total, index, centred.sum(axis=axes))
+        np.add.at(self.squares, index, (centred * centred).sum(axis=axes))
+
+    def result(self):
+        if self.exact:
+            return np.stack([self.count, self.total, self.squares], axis=-1)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            has = self.count > 0
+            mean = np.where(has, np.nan_to_num(self.shift) + self.total / np.maximum(self.count, 1), np.nan)
+            m2 = np.where(has, self.squares - self.total * self.total / np.maximum(self.count, 1), np.nan)
+        return np.stack([self.count.astype(np.float64), mean, np.where(has, np.maximum(m2, 0.0), np.nan)], axis=-1)
 
 
-_COMPUTE = {"minmax": compute_minmax}
+_ACCUMULATORS = {"minmax": _MinMaxAccumulator, "missing_count": _MissingCountAccumulator, "moments": _MomentsAccumulator}
+
+
+class _AsOneDimensional:
+    """A zero-dimensional array seen as one element along one dimension."""
+
+    def __init__(self, array):
+        self._value = np.asarray(array[...]).reshape(1)
+        self.shape, self.chunks, self.dtype = (1,), (1,), self._value.dtype
+
+    def __getitem__(self, key):
+        return self._value[key]
+
+
+def compute_statistics(
+    array: Any,
+    block_shape: Sequence[int],
+    statistics: Sequence[str] = ("minmax",),
+    missing: Sequence[Any] | None = None,
+    *,
+    read_bytes: int = 64 * 2**20,
+) -> dict[str, np.ndarray]:
+    """Compute several statistics of the blocks of array in one pass over its data.
+
+    block_shape must already be resolved (see resolve_block_shape). The array
+    is read in pieces of whole chunks of about read_bytes, so memory stays
+    near that.
+    """
+    for name in statistics:
+        if name not in _ACCUMULATORS:
+            raise ValueError(f"Unknown statistic {name!r}; known: {', '.join(TYPES)}")
+    missing = resolve_missing(array.dtype, missing)
+    scalar = len(array.shape) == 0
+    if scalar:
+        array, block_shape = _AsOneDimensional(array), [1]
+    grid = block_grid(array.shape, block_shape)
+    accumulators = {name: _ACCUMULATORS[name](grid, array.dtype, missing) for name in statistics}
+    if 0 not in [int(s) for s in array.shape]:
+        axes = tuple(range(1, 2 * len(grid), 2))
+        for data, inside, index in _pieces(array, block_shape, read_bytes):
+            for accumulator in accumulators.values():
+                accumulator.update(data, inside, index, axes)
+    results = {name: accumulator.result() for name, accumulator in accumulators.items()}
+    return {name: value[0] for name, value in results.items()} if scalar else results
+
+
+def compute_minmax(array: Any, block_shape: Sequence[int], *, read_bytes: int = 64 * 2**20) -> np.ndarray:
+    """The minimum and maximum of every block, shape (*block_grid, 2), in the array's data type.
+
+    NaN is ignored; a block of only NaN gives NaN.
+    """
+    return compute_statistics(array, block_shape, ["minmax"], read_bytes=read_bytes)["minmax"]
+
+
+def compute_missing_count(
+    array: Any, block_shape: Sequence[int], missing: Sequence[Any] | None = None, *, read_bytes: int = 64 * 2**20
+) -> np.ndarray:
+    """The number of missing values (see resolve_missing) in every block, int64 of the block grid's shape."""
+    return compute_statistics(array, block_shape, ["missing_count"], missing, read_bytes=read_bytes)["missing_count"]
+
+
+def compute_moments(
+    array: Any, block_shape: Sequence[int], missing: Sequence[Any] | None = None, *, read_bytes: int = 64 * 2**20
+) -> np.ndarray:
+    """The count of valid values and their moments in every block, shape (*block_grid, 3).
+
+    For integers of up to 16 bits, int64 (count, sum, sum of squares), exact.
+    Otherwise float64 (count, mean, M2), M2 being the sum of squared
+    deviations from the block's mean, accumulated about a shift taken from
+    the block's own data so that precision isn't lost. Missing values
+    (see resolve_missing) are left out.
+    """
+    return compute_statistics(array, block_shape, ["moments"], missing, read_bytes=read_bytes)["moments"]
 
 
 def compute_block_statistics(
@@ -200,18 +372,15 @@ def compute_block_statistics(
     *,
     block_shape: Sequence[int | None] | None = None,
     granularity: int | Sequence[int] | None = None,
+    missing: Sequence[Any] | None = None,
 ) -> tuple[list[int], dict[str, np.ndarray]]:
     """Compute statistics of the blocks of array, without storing them.
 
-    Returns the resolved block shape and each statistic's array.
+    missing names the values missing_count counts and moments leave out (see
+    resolve_missing). Returns the resolved block shape and each statistic's array.
     """
     resolved = resolve_block_shape(array.shape, array.chunks, block_shape, granularity)
-    values = {}
-    for name in statistics:
-        if name not in _COMPUTE:
-            raise ValueError(f"Unknown statistic {name!r}; known: {', '.join(TYPES)}")
-        values[name] = _COMPUTE[name](array, resolved)
-    return resolved, values
+    return resolved, compute_statistics(array, resolved, statistics, missing)
 
 
 def _nests(fine: Sequence[int], coarse: Sequence[int], shape: Sequence[int]) -> bool:
@@ -252,13 +421,61 @@ def rollup_minmax(
     return np.stack([low, high], axis=-1)
 
 
-_ROLLUP = {"minmax": rollup_minmax}
+def _group(values: np.ndarray, fine: Sequence[int], coarse: Sequence[int], shape: Sequence[int], trailing: int):
+    """Fine blocks grouped into coarse ones: shape (g0, k0, g1, k1, ..., *trailing dims), padded with zeros."""
+    fine = [int(b) for b in fine]
+    coarse = [int(b) for b in coarse]
+    shape = [int(s) for s in shape]
+    if not _nests(fine, coarse, shape):
+        raise ValueError(f"Blocks of {coarse} are not whole numbers of blocks of {fine}")
+    fine_grid = list(values.shape[: values.ndim - trailing])
+    factor = [n if c >= s else c // f for n, f, c, s in zip(fine_grid, fine, coarse, shape)]
+    groups = [math.ceil(n / k) for n, k in zip(fine_grid, factor)]
+    pad = [(0, g * k - n) for g, k, n in zip(groups, factor, fine_grid)] + [(0, 0)] * trailing
+    if any(after for _, after in pad):
+        values = np.pad(values, pad)
+    split = [x for g, k in zip(groups, factor) for x in (g, k)] + list(values.shape[values.ndim - trailing:])
+    return values.reshape(split), tuple(range(1, 2 * len(fine_grid), 2))
+
+
+def rollup_missing_count(values, fine_block_shape, coarse_block_shape, shape) -> np.ndarray:
+    """The missing_count of coarse blocks, from that of fine blocks."""
+    grouped, axes = _group(values, fine_block_shape, coarse_block_shape, shape, 0)
+    return grouped.sum(axis=axes)
+
+
+def _merge_moments(parts: np.ndarray, axes: tuple[int, ...]) -> np.ndarray:
+    """Merge moments along axes. parts has a last dimension of 3."""
+    if parts.dtype.kind == "i":
+        return parts.sum(axis=axes)
+    count, mean, m2 = parts[..., 0], parts[..., 1], parts[..., 2]
+    total = count.sum(axis=axes)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        weighted = np.where(count > 0, count * np.nan_to_num(mean), 0.0)
+        merged_mean = weighted.sum(axis=axes) / total
+        expanded = np.expand_dims(merged_mean, axes)
+        spread = np.where(count > 0, np.nan_to_num(m2) + count * (np.nan_to_num(mean) - expanded) ** 2, 0.0)
+        merged_m2 = spread.sum(axis=axes)
+    merged_mean = np.where(total > 0, merged_mean, np.nan)
+    merged_m2 = np.where(total > 0, merged_m2, np.nan)
+    return np.stack([total, merged_mean, merged_m2], axis=-1)
+
+
+def rollup_moments(values, fine_block_shape, coarse_block_shape, shape) -> np.ndarray:
+    """The moments of coarse blocks, from those of fine blocks."""
+    grouped, axes = _group(values, fine_block_shape, coarse_block_shape, shape, 1)
+    return _merge_moments(grouped, axes)
+
+
+_ROLLUP = {"minmax": rollup_minmax, "missing_count": rollup_missing_count, "moments": rollup_moments}
 
 
 def compute_block_statistics_levels(
     array: Any,
     statistics: Sequence[str] = ("minmax",),
     block_shapes: Sequence[Sequence[int | None]] = (),
+    missing: Sequence[Any] | None = None,
 ) -> list[tuple[list[int], dict[str, np.ndarray]]]:
     """Compute statistics at several block shapes, reading the data as few times as possible.
 
@@ -269,23 +486,25 @@ def compute_block_statistics_levels(
     """
     resolved = [resolve_block_shape(array.shape, array.chunks, b) for b in block_shapes]
     order = sorted(range(len(resolved)), key=lambda i: int(np.prod(resolved[i], dtype=np.int64)))
+    for name in statistics:
+        if name not in _ACCUMULATORS:
+            raise ValueError(f"Unknown statistic {name!r}; known: {', '.join(TYPES)}")
     done: dict[int, dict[str, np.ndarray]] = {}
     for i in order:
-        values = {}
-        for name in statistics:
-            if name not in _COMPUTE:
-                raise ValueError(f"Unknown statistic {name!r}; known: {', '.join(TYPES)}")
-            source = next(
-                (j for j in reversed([j for j in order if j in done]) if _nests(resolved[j], resolved[i], array.shape)),
-                None,
-            )
-            if source is not None and resolved[source] != resolved[i]:
-                values[name] = _ROLLUP[name](done[source][name], resolved[source], resolved[i], array.shape)
-            elif source is not None:
-                values[name] = done[source][name]
-            else:
-                values[name] = _COMPUTE[name](array, resolved[i])
-        done[i] = values
+        source = next(
+            (j for j in reversed([j for j in order if j in done]) if _nests(resolved[j], resolved[i], array.shape)),
+            None,
+        )
+        if source is None:
+            # Every statistic of this level in one pass over the data
+            done[i] = compute_statistics(array, resolved[i], statistics, missing)
+        elif resolved[source] == resolved[i]:
+            done[i] = done[source]
+        else:
+            done[i] = {
+                name: _ROLLUP[name](done[source][name], resolved[source], resolved[i], array.shape)
+                for name in statistics
+            }
     return [(resolved[i], done[i]) for i in range(len(resolved))]
 
 
@@ -318,8 +537,11 @@ def _stats_chunk_shape(shape: Sequence[int], itemsize: int) -> list[int]:
     return [min(shape[0], rows) if shape[0] else 1] + [max(s, 1) for s in shape[1:]]
 
 
-def _statistic_entry(name: str, block_shape: list[int], path: str) -> dict:
-    return {"type": name, "block_shape": block_shape, "path": path}
+def _statistic_entry(name: str, block_shape: list[int], path: str, missing: list[Any] | None = None) -> dict:
+    entry = {"type": name, "block_shape": block_shape, "path": path}
+    if name in ("missing_count", "moments") and missing is not None:
+        entry["missing"] = _missing_json(missing)
+    return entry
 
 
 def _check_sorted(sorted_: str | None) -> None:
@@ -350,7 +572,9 @@ def add_block_statistics(
     arrays maps each array's path to its options: "statistics" (default
     ["minmax"]), "block_shape" or "granularity" (see resolve_block_shape),
     and "sorted" ("ascending", or None when the array isn't known to be
-    sorted). A list of option sets adds several levels, one per block shape.
+    sorted), and "missing" (the values missing_count counts and moments
+    leave out; see resolve_missing). A list of option sets adds several
+    levels, one per block shape.
     The array's data is read through the references once; a level whose
     blocks are whole numbers of a finer level's is rolled up from it.
 
@@ -375,7 +599,7 @@ def add_block_statistics(
         option_sets = [dict(given)] if isinstance(given, Mapping) else [dict(o) for o in given]
         sorted_ = None
         for options in option_sets:
-            unknown = set(options) - {"statistics", "block_shape", "granularity", "sorted"}
+            unknown = set(options) - {"statistics", "block_shape", "granularity", "sorted", "missing"}
             if unknown:
                 raise ValueError(f"Unknown options for {array_path}: {sorted(unknown)}")
             _check_sorted(options.get("sorted"))
@@ -385,27 +609,30 @@ def add_block_statistics(
             raise ValueError(f"{array_path} is not an array")
         # Each option set is one level; levels that share statistics are computed together
         levels = []
-        by_statistics: dict[tuple[str, ...], list[int]] = {}
+        by_statistics: dict[tuple, list[int]] = {}
         for i, options in enumerate(option_sets):
             shape = resolve_block_shape(array.shape, array.chunks, options.get("block_shape"), options.get("granularity"))
-            by_statistics.setdefault(tuple(options.get("statistics", ("minmax",))), []).append(i)
+            missing = resolve_missing(array.dtype, options.get("missing"))
+            key = (tuple(options.get("statistics", ("minmax",))), json.dumps(_missing_json(missing)))
+            by_statistics.setdefault(key, []).append(i)
             levels.append(shape)
         parent, array_name = _split(array_path)
         entries = []
-        for statistics, indexes in by_statistics.items():
-            computed = compute_block_statistics_levels(array, statistics, [levels[i] for i in indexes])
+        for (statistics, missing_key), indexes in by_statistics.items():
+            missing = resolve_missing(array.dtype, json.loads(missing_key))
+            computed = compute_block_statistics_levels(array, statistics, [levels[i] for i in indexes], missing)
             for resolved, values in computed:
                 for name, value in values.items():
                     path = _stats_path(array_name, name, resolved)
                     full = _join(parent, path)
                     _add_groups(refs, full, created_groups)
+                    entry = _statistic_entry(name, resolved, path, missing)
                     _add_inline_array(refs, full, value, {
-                        "type": name,
-                        "block_shape": resolved,
+                        **{k: v for k, v in entry.items() if k != "path"},
                         "array": array_name,
                         "sources": copy.deepcopy(rfs.get("sources", {})),
                     })
-                    entries.append(_statistic_entry(name, resolved, path))
+                    entries.append(entry)
         meta_key = metadata_key(array_path)
         meta = json.loads(refs[meta_key])
         attributes = meta.setdefault("attributes", {})
@@ -467,6 +694,7 @@ def write_block_statistics(
     block_shape: Sequence[int | None] | None = None,
     granularity: int | Sequence[int] | None = None,
     levels: Sequence[Sequence[int | None]] | None = None,
+    missing: Sequence[Any] | None = None,
     sorted: str | None = None,  # noqa: A002 - the attribute's own name
 ) -> dict:
     """Compute statistics of array and write them next to it, in its writable store.
@@ -481,20 +709,24 @@ def write_block_statistics(
     if levels is not None:
         if block_shape is not None or granularity is not None:
             raise ValueError("Give levels, or block_shape or granularity, not both")
-        computed = compute_block_statistics_levels(array, statistics, levels)
+        computed = compute_block_statistics_levels(array, statistics, levels, missing)
     else:
-        computed = [compute_block_statistics(array, statistics, block_shape=block_shape, granularity=granularity)]
+        computed = [compute_block_statistics(
+            array, statistics, block_shape=block_shape, granularity=granularity, missing=missing
+        )]
+    resolved_missing = resolve_missing(array.dtype, missing)
     entries = []
     for resolved, values in computed:
-        entries += _write_level(parent, array_name, resolved, values)
+        entries += _write_level(parent, array_name, resolved, values, resolved_missing)
     attribute = _merge_attribute(array.attrs.get(STATISTICS_ATTRIBUTE), entries, sorted)
     array.attrs[STATISTICS_ATTRIBUTE] = attribute
     return attribute
 
 
-def _write_level(parent: zarr.Group, array_name: str, resolved: list[int], values: dict) -> list[dict]:
+def _write_level(parent: zarr.Group, array_name: str, resolved: list[int], values: dict, missing) -> list[dict]:
     entries = []
     for name, value in values.items():
+        entry = _statistic_entry(name, resolved, _stats_path(array_name, name, resolved), missing)
         path = _stats_path(array_name, name, resolved)
         stats = parent.create_array(
             path,
@@ -503,11 +735,11 @@ def _write_level(parent: zarr.Group, array_name: str, resolved: list[int], value
             chunks=_stats_chunk_shape(value.shape, value.dtype.itemsize),
             compressors=[zarr.codecs.ZstdCodec(level=3)],
             fill_value=False if value.dtype.kind == "b" else 0,
-            attributes={"type": name, "block_shape": resolved, "array": array_name},
+            attributes={**{k: v for k, v in entry.items() if k != "path"}, "array": array_name},
             overwrite=True,
         )
         stats[...] = value
-        entries.append(_statistic_entry(name, resolved, path))
+        entries.append(entry)
     return entries
 
 
@@ -541,10 +773,15 @@ class _LazyStatistics:
     can weigh levels without fetching their metadata.
     """
 
-    def __init__(self, array: zarr.Array, path: str, block_shape: list[int]):
+    def __init__(self, array: zarr.Array, path: str, block_shape: list[int], kind: str = "minmax"):
         self._array, self._path = array, path
-        self.shape = tuple(block_grid(array.shape, block_shape)) + (2,)
-        self.dtype = np.dtype(array.dtype)
+        grid = tuple(block_grid(array.shape, block_shape))
+        if kind == "minmax":
+            self.shape, self.dtype = grid + (2,), np.dtype(array.dtype)
+        elif kind == "moments":
+            self.shape, self.dtype = grid + (3,), moments_dtype(array.dtype)
+        else:
+            self.shape, self.dtype = grid, np.dtype("int64")
         self._opened = None
 
     def open(self) -> zarr.Array:
@@ -568,15 +805,28 @@ def _read_all(reads: list[tuple[Any, tuple]]) -> list[np.ndarray]:
         return list(pool.map(lambda read: np.asarray(read[0][read[1]]), reads))
 
 
-def _minmax_levels(array: zarr.Array) -> list[tuple[list[int], _LazyStatistics]]:
-    """The array's minmax statistics as (block shape, statistics array), smallest blocks first."""
+def _levels(array: zarr.Array, kind: str, missing: Any = None) -> list[tuple[list[int], _LazyStatistics]]:
+    """The array's statistics of one type as (block shape, statistics array), smallest blocks first.
+
+    For types that leave out missing values, only entries with the given
+    missing values (as JSON) count; by default those of the finest entry.
+    """
     attribute = array.attrs.get(STATISTICS_ATTRIBUTE) or {}
-    entries = [e for e in attribute.get("statistics", []) if e["type"] == "minmax"]
+    entries = [e for e in attribute.get("statistics", []) if e["type"] == kind]
+    entries.sort(key=lambda e: int(np.prod(e["block_shape"], dtype=np.int64)))
+    if kind != "minmax" and entries:
+        wanted = entries[0].get("missing") if missing is None else missing
+        entries = [e for e in entries if e.get("missing") == wanted]
     levels = []
     for e in entries:
         block_shape = [int(b) for b in e["block_shape"]]
-        levels.append((block_shape, _LazyStatistics(array, e["path"], block_shape)))
-    return sorted(levels, key=lambda level: int(np.prod(level[0], dtype=np.int64)))
+        levels.append((block_shape, _LazyStatistics(array, e["path"], block_shape, kind)))
+    return levels
+
+
+def _minmax_levels(array: zarr.Array) -> list[tuple[list[int], _LazyStatistics]]:
+    """The array's minmax statistics as (block shape, statistics array), smallest blocks first."""
+    return _levels(array, "minmax")
 
 
 def _nested(levels: list[tuple[list[int], Any]], shape: Sequence[int]) -> list[tuple[list[int], Any]]:
@@ -689,27 +939,19 @@ def searchsorted(
     return int(result) if scalar else result
 
 
-def minmax_range(
-    array: zarr.Array, start: int, stop: int, *, max_bytes: int = DEFAULT_MAX_BYTES
-) -> tuple[Any, Any]:
-    """The exact minimum and maximum of array[start:stop] along the first dimension.
+def _range(array, start: int, stop: int, levels, max_bytes: int, name: str, reduce_data, reduce_level):
+    """Pieces of array[start:stop] along the first dimension, each reduced, for combining.
 
-    Uses the array's minmax levels: whole blocks of the coarsest level that
-    fit inside the range, then finer levels toward its edges, and the data
-    itself only for the parts of the finest blocks at the two ends. Along the
-    other dimensions the result has one value per block, so a block size of
-    1 there gives a value per element (per channel), and the whole size one
-    value. Those block sizes must be 1 or the whole dimension. NaN is ignored.
-    It starts at the finest level whose blocks in the range take at most
-    max_bytes, so coarser levels are read only when they save reading more
-    than that. Without statistics the range is read whole.
+    Uses whole blocks of the coarsest useful level inside the range, finer
+    levels toward its edges, and the data only for the partial blocks at the
+    two ends. reduce_data(data, reduce_axes) and reduce_level(values) turn a
+    piece into its contribution. All pieces are read in parallel.
     """
     shape = [int(x) for x in array.shape]
     n = shape[0]
     start, stop = int(start), int(stop)
     if not 0 <= start < stop <= n:
         raise ValueError(f"Need 0 <= start < stop <= {n}, not {start}, {stop}")
-    levels = _minmax_levels(array)
     if levels:
         # The levels that share the finest level's blocks along the other dimensions
         others = levels[0][0][1:]
@@ -718,7 +960,7 @@ def minmax_range(
         others = [1] * (len(shape) - 1)
     for size, block in zip(shape[1:], others):
         if block != 1 and block < size:
-            raise ValueError("minmax_range needs blocks of 1 or the whole size along the other dimensions")
+            raise ValueError(f"{name} needs blocks of 1 or the whole size along the other dimensions")
     reduce_axes = tuple(d for d, (size, block) in enumerate(zip(shape[1:], others)) if block != 1 and size > 1)
     # The finest level whose blocks inside the range fit in max_bytes, and finer ones for the edges
     for k, level in enumerate(levels):
@@ -726,25 +968,7 @@ def minmax_range(
             levels = levels[: k + 1]
             break
 
-    def reduce_data(data: np.ndarray):
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            low = np.nanmin(data, axis=0) if data.dtype.kind == "f" else data.min(axis=0)
-            high = np.nanmax(data, axis=0) if data.dtype.kind == "f" else data.max(axis=0)
-            if reduce_axes:
-                low = (np.nanmin if data.dtype.kind == "f" else np.min)(low, axis=reduce_axes, keepdims=True)
-                high = (np.nanmax if data.dtype.kind == "f" else np.max)(high, axis=reduce_axes, keepdims=True)
-        return low, high
-
-    def reduce_level(values: np.ndarray):
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            if values.dtype.kind == "f":
-                return np.nanmin(values[..., 0], axis=0), np.nanmax(values[..., 1], axis=0)
-            return values[..., 0].min(axis=0), values[..., 1].max(axis=0)
-
-    # Which pieces to read depends only on start and stop, so plan them all,
-    # then read them together
+    # Which pieces to read depends only on start and stop, so plan them all, then read them together
     plan: list[tuple[int, int, int]] = []  # (level, or -1 for the data; first; last)
 
     def cover(lo: int, hi: int, k: int) -> None:
@@ -766,14 +990,123 @@ def minmax_range(
     cover(start, stop, len(levels) - 1)
     reads = [(array if k < 0 else levels[k][1].open(), (slice(a, z),)) for k, a, z in plan]
     values = _read_all(reads)
-    parts = [reduce_data(v) if k < 0 else reduce_level(v) for (k, _, _), v in zip(plan, values)]
-    low = parts[0][0]
-    high = parts[0][1]
+    return [reduce_data(v, reduce_axes) if k < 0 else reduce_level(v) for (k, _, _), v in zip(plan, values)]
+
+
+def minmax_range(
+    array: zarr.Array, start: int, stop: int, *, max_bytes: int = DEFAULT_MAX_BYTES
+) -> tuple[Any, Any]:
+    """The exact minimum and maximum of array[start:stop] along the first dimension.
+
+    Uses the array's minmax levels: whole blocks of the coarsest level that
+    fit inside the range, then finer levels toward its edges, and the data
+    itself only for the parts of the finest blocks at the two ends. Along the
+    other dimensions the result has one value per block, so a block size of
+    1 there gives a value per element (per channel), and the whole size one
+    value. Those block sizes must be 1 or the whole dimension. NaN is ignored.
+    It starts at the finest level whose blocks in the range take at most
+    max_bytes, so coarser levels are read only when they save reading more
+    than that. Without statistics the range is read whole.
+    """
+
+    def reduce_data(data: np.ndarray, reduce_axes):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            low = np.nanmin(data, axis=0) if data.dtype.kind == "f" else data.min(axis=0)
+            high = np.nanmax(data, axis=0) if data.dtype.kind == "f" else data.max(axis=0)
+            if reduce_axes:
+                low = (np.nanmin if data.dtype.kind == "f" else np.min)(low, axis=reduce_axes, keepdims=True)
+                high = (np.nanmax if data.dtype.kind == "f" else np.max)(high, axis=reduce_axes, keepdims=True)
+        return low, high
+
+    def reduce_level(values: np.ndarray):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            if values.dtype.kind == "f":
+                return np.nanmin(values[..., 0], axis=0), np.nanmax(values[..., 1], axis=0)
+            return values[..., 0].min(axis=0), values[..., 1].max(axis=0)
+
+    parts = _range(array, start, stop, _minmax_levels(array), max_bytes, "minmax_range", reduce_data, reduce_level)
+    low, high = parts[0]
     for part_low, part_high in parts[1:]:
         low, high = np.fmin(low, part_low), np.fmax(high, part_high)
-    if len(shape) == 1:
+    if array.ndim == 1:
         return low[()], high[()]
     return low, high
+
+
+def moments_range(
+    array: zarr.Array,
+    start: int,
+    stop: int,
+    *,
+    ddof: int = 0,
+    missing: Sequence[Any] | None = None,
+    max_bytes: int = DEFAULT_MAX_BYTES,
+) -> dict[str, Any]:
+    """The count of valid values, mean and variance of array[start:stop] along the first dimension.
+
+    Like minmax_range, from the array's moments levels and the data only at
+    the two ends of the range; per channel with blocks of [n, 1]. Missing
+    values are left out: those the statistics were computed with, or missing
+    (see resolve_missing) to pick statistics computed with those. Returns
+    {"count", "mean", "variance"}, the variance with ddof delta degrees of
+    freedom. Integer data of up to 16 bits gives the exact result of its
+    integer sums.
+    """
+    wanted = None if missing is None else _missing_json(resolve_missing(array.dtype, missing))
+    levels = _levels(array, "moments", wanted)
+    if levels:
+        attribute = array.attrs.get(STATISTICS_ATTRIBUTE) or {}
+        entry = next(e for e in attribute["statistics"] if e["type"] == "moments" and e["path"] == levels[0][1]._path)
+        used = resolve_missing(array.dtype, entry.get("missing"))
+    else:
+        used = resolve_missing(array.dtype, missing)
+    exact = moments_dtype(array.dtype).kind == "i"
+
+    def reduce_data(data: np.ndarray, reduce_axes):
+        keep = _valid(data, used)
+        axes = (0,) + tuple(a + 1 for a in reduce_axes)
+        count = keep.sum(axis=axes, keepdims=True)
+        if exact:
+            values = np.where(keep, data, 0).astype(np.int64)
+            result = np.stack([count, values.sum(axis=axes, keepdims=True),
+                               (values * values).sum(axis=axes, keepdims=True)], axis=-1)
+        else:
+            values = np.where(keep, data, 0).astype(np.float64)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                mean = values.sum(axis=axes, keepdims=True) / count
+                m2 = np.where(keep, values - mean, 0.0)
+                m2 = (m2 * m2).sum(axis=axes, keepdims=True)
+            result = np.stack([count.astype(np.float64), np.where(count > 0, mean, np.nan),
+                               np.where(count > 0, m2, np.nan)], axis=-1)
+        return result[0]
+
+    def reduce_level(values: np.ndarray):
+        return _merge_moments(values, (0,))
+
+    parts = _range(array, start, stop, levels, max_bytes, "moments_range", reduce_data, reduce_level)
+    merged = _merge_moments(np.stack(parts), (0,))
+    if exact:
+        flat = merged.reshape(-1, 3)
+        count = np.array([int(c) for c in flat[:, 0]], dtype=np.int64)
+        mean = np.empty(len(flat))
+        variance = np.empty(len(flat))
+        for i, (c, total, squares) in enumerate(flat.tolist()):
+            mean[i] = total / c if c else np.nan
+            variance[i] = (squares * c - total * total) / (c * (c - ddof)) if c > ddof else np.nan
+        shape = merged.shape[:-1]
+        count, mean, variance = count.reshape(shape), mean.reshape(shape), variance.reshape(shape)
+    else:
+        count = merged[..., 0].astype(np.int64)
+        mean = merged[..., 1]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            variance = np.where(count > ddof, merged[..., 2] / (count - ddof), np.nan)
+    if array.ndim == 1:
+        return {"count": int(count[()]), "mean": float(mean[()]), "variance": float(variance[()])}
+    return {"count": count, "mean": mean, "variance": variance}
 
 
 def find_range(
