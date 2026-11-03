@@ -418,6 +418,33 @@ Apart from the attributes above, a virtual NWB file written into a repository re
 
 `icechunk_to_rfs` reads the repository with VirtualiZarr's `IcechunkParser`. A virtual chunk becomes a reference to the same byte range, and an array with more than 1,000 chunks in one file gets a chunk index. The chunks the repository stores itself are copied into the references, which suits repositories where those are small, such as strings and coordinates. Pass `native_chunks_prefix`, the location of the repository's `chunks` directory, to reference them where they are instead. `RfsStore` reads local paths and http(s) URLs, so virtual chunks at other locations, such as `s3://`, need `url_for` to map them. A `gen` entry does not come back as one: its chunks return listed in `refs` or in a chunk index.
 
+## Block Statistics
+
+Finding a time window in an irregularly sampled NWB series normally means reading its whole `timestamps` array. `shadowzarr.block_statistics` stores the minimum and maximum of every block of an array next to it, so a reader can bisect that small array and read only the one or two blocks the window falls in. The convention, a draft, is in [docs/block-statistics.md](docs/block-statistics.md).
+
+```python
+from shadowzarr import generate_rfs, open_rfs
+from shadowzarr.block_statistics import add_block_statistics, find_range
+
+path = "acquisition/probe_729445652_lfp/probe_729445652_lfp_data/timestamps"
+rfs = generate_rfs("https://api.dandiarchive.org/api/assets/86db184c-6fad-4005-85cc-98d9a400d39c/download/")
+rfs = add_block_statistics(rfs, {path: {"sorted": "ascending"}})  # one block per chunk
+
+root = open_rfs(rfs)
+window = find_range(root[path], 1200.0, 1202.0, root=root)  # slice of the samples in [1200, 1202] s
+```
+
+- `add_block_statistics` reads each listed array once and adds its statistics to the references as inline chunks at `.stats/<array path>/minmax`, so `write_rfs` and `rfs_to_icechunk` carry them. The array's `block_statistics` attribute lists them.
+- `block_shape` is in elements. Along each dimension it must divide the chunk size, be a multiple of it, or cover the whole dimension. A size of 1 keeps a dimension, so `[30000, 1]` on `(time, channel)` data gives a value per channel per 30,000 samples. `granularity=N` means N chunks per block.
+- `write_block_statistics` does the same for an array in a writable Zarr store, and `load_block_statistics` returns an array's statistics.
+- `find_range` bisects only arrays marked `sorted: "ascending"`. Without statistics it reads the whole array.
+
+On the Allen Visual Coding LFP timestamps above (12.1 million values, 97 MB in 1,024 chunks), finding a 2 s window took 0.13 s, 3 requests and 0.14 MB, against 7.4 s, 1,024 requests and 63 MB to read the whole array. The statistics are 16 KB and took 7 s to compute. `scripts/block_statistics_benchmark.py` measures this for any file and also compares the 1 s index temporaldata uses.
+
+hdmf-zarr reads every group, so `NWBZarrIO` warns once for each array under `.stats`; the file otherwise reads as before.
+
+Only `minmax` is defined so far.
+
 ## Materializing
 
 `materialize` reads the bytes a reference file system points at and writes them into an ordinary Zarr store, which then no longer depends on the source files.
