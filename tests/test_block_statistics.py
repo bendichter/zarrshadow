@@ -12,7 +12,10 @@ from shadowzarr import generate_rfs, open_rfs, write_rfs
 from shadowzarr.block_statistics import (
     add_block_statistics,
     compute_minmax,
+    compute_block_statistics_levels,
     find_range,
+    minmax_range,
+    rollup_minmax,
     searchsorted,
     load_block_statistics,
     resolve_block_shape,
@@ -367,3 +370,185 @@ def test_nwb_with_block_statistics_reads_with_hdmf_zarr(tmp_path):
     group = open_rfs(rfs)
     found = find_range(group["acquisition/ts/timestamps"], 10.0, 11.0)
     assert found == slice(int(np.searchsorted(times, 10.0)), int(np.searchsorted(times, 11.0, "right")))
+
+
+# -- Levels --
+
+
+@pytest.mark.parametrize(
+    "fine, coarse",
+    [([100, 1], [300, 1]), ([100, 1], [1050, 1]), ([50, 2], [200, 8]), ([25, 1], [100, 4]), ([100, 4], [100, 8])],
+)
+def test_rollup_equals_computing_from_the_data(fine, coarse):
+    """1050 rows leave short last blocks at both levels; [.., 8] covers the whole second dimension."""
+    data = np.random.default_rng(7).integers(-30000, 30000, (1050, 8)).astype("int16")
+    array = _zarr(data, (100, 4))
+    rolled = rollup_minmax(compute_minmax(array, fine), fine, coarse, data.shape)
+    np.testing.assert_array_equal(rolled, _expected_minmax(data, coarse))
+
+
+def test_rollup_with_nan():
+    data = np.arange(80, dtype="float64").reshape(40, 2)
+    data[0:10] = np.nan
+    data[15, 0] = np.nan
+    array = _zarr(data, (10, 2))
+    rolled = rollup_minmax(compute_minmax(array, [5, 1]), [5, 1], [10, 1], data.shape)
+    np.testing.assert_array_equal(rolled, _expected_minmax(data, [10, 1]))
+    assert np.isnan(rolled[0]).all()
+
+
+def test_rollup_needs_nested_blocks():
+    with pytest.raises(ValueError, match="whole numbers"):
+        rollup_minmax(np.zeros((10, 2)), [100], [150], [1000])
+
+
+def test_levels_read_the_data_once():
+    times = _sorted_times()
+    store = zarr.storage.MemoryStore()
+    root = zarr.open_group(store, mode="w", zarr_format=3)
+    array = root.create_array("t", shape=times.shape, dtype=times.dtype, chunks=(1000,))
+    array[...] = times
+    read = []
+
+    class Counting(zarr.storage.WrapperStore):
+        async def get(self, key, prototype, byte_range=None):
+            read.append(key)
+            return await super().get(key, prototype, byte_range)
+
+    counted = zarr.open_array(Counting(store), path="t", mode="r")
+    levels = compute_block_statistics_levels(counted, ["minmax"], [[10_000], [1000], [50_000], [3000]])
+    assert [b for b, _ in levels] == [[10_000], [1000], [50_000], [3000]]
+    for block, values in levels:
+        np.testing.assert_array_equal(values["minmax"], _expected_minmax(times, block))
+    data_chunks = [k for k in read if k.startswith("t/c/")]
+    # 1000 is read from the data; 3000 and 10,000 are rolled up from it, and 50,000 from 10,000
+    assert len(data_chunks) == len(set(data_chunks)) == 50
+
+
+def test_write_levels(tmp_path):
+    root = zarr.open_group(str(tmp_path / "a.zarr"), mode="w", zarr_format=3)
+    data = np.random.default_rng(8).normal(size=(3000, 4))
+    array = root.create_array("es/data", shape=data.shape, dtype=data.dtype, chunks=(500, 4))
+    array[...] = data
+    attribute = write_block_statistics(array, levels=[[100, 1], [500, 1], [None, 1]])
+    assert [e["path"] for e in attribute["statistics"]] == [
+        ".stats/data/minmax/100x1", ".stats/data/minmax/500x1", ".stats/data/minmax/3000x1"
+    ]
+    for block in ([100, 1], [500, 1], [3000, 1]):
+        np.testing.assert_array_equal(load_block_statistics(array, block_shape=block)[1], _expected_minmax(data, block))
+    with pytest.raises(ValueError, match="not both"):
+        write_block_statistics(array, levels=[[100, 1]], block_shape=[100, 1])
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_searchsorted_through_levels(side):
+    times = _sorted_times()
+    store = zarr.storage.MemoryStore()
+    root = zarr.open_group(store, mode="w", zarr_format=3)
+    array = root.create_array("t", shape=times.shape, dtype=times.dtype, chunks=(1000,))
+    array[...] = times
+    # 4000 doesn't nest in 3000, so it is skipped; 1000 -> 3000 -> 9000 -> whole array
+    write_block_statistics(array, levels=[[1000], [3000], [9000], [4000], [None]], sorted="ascending")
+    rng = np.random.default_rng(9)
+    values = np.concatenate([rng.uniform(times[0] - 1, times[-1] + 1, 500), times[[0, 999, 1000, 1009, 8999, 9000, -1]]])
+    np.testing.assert_array_equal(searchsorted(array, values, side), np.searchsorted(times, values, side))
+
+    read = []
+
+    class Counting(zarr.storage.WrapperStore):
+        async def get(self, key, prototype, byte_range=None):
+            read.append(key)
+            return await super().get(key, prototype, byte_range)
+
+    counted = zarr.open_array(Counting(store), path="t", mode="r")
+    assert searchsorted(counted, 123.0, side) == np.searchsorted(times, 123.0, side)
+    assert len([k for k in read if k.startswith("t/c/")]) == 1
+
+
+@pytest.mark.parametrize("levels", [None, [[100, 1]], [[100, 1], [500, 1], [2000, 1]], [[50, 4], [500, 4]]])
+def test_minmax_range_matches_numpy(levels):
+    data = np.random.default_rng(10).normal(size=(5050, 4))
+    data[700:760, 2] = np.nan
+    array = _zarr(data, (100, 4))
+    if levels:
+        write_block_statistics(array, levels=levels)
+    rng = np.random.default_rng(11)
+    ranges = [(0, 5050), (0, 1), (5049, 5050), (99, 101), (100, 2000), (700, 760)]
+    ranges += [tuple(sorted(rng.integers(0, 5051, 2))) for _ in range(30)]
+    whole = bool(levels) and levels[0][1] == 4
+    for start, stop in ranges:
+        if start == stop:
+            continue
+        low, high = minmax_range(array, start, stop)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            part = data[start:stop]
+            want_low, want_high = np.nanmin(part, axis=0), np.nanmax(part, axis=0)
+            if whole:
+                want_low, want_high = np.nanmin(part, keepdims=True)[0], np.nanmax(part, keepdims=True)[0]
+        np.testing.assert_array_equal(low, want_low, err_msg=f"{start}:{stop}")
+        np.testing.assert_array_equal(high, want_high, err_msg=f"{start}:{stop}")
+
+
+def test_minmax_range_reads_only_the_edges():
+    data = np.random.default_rng(12).integers(-1000, 1000, (100_000, 3)).astype("int16")
+    store = zarr.storage.MemoryStore()
+    root = zarr.open_group(store, mode="w", zarr_format=3)
+    array = root.create_array("es", shape=data.shape, dtype=data.dtype, chunks=(1000, 1))
+    array[...] = data
+    write_block_statistics(array, levels=[[1000, 1], [10_000, 1]])
+    read = []
+
+    class Counting(zarr.storage.WrapperStore):
+        async def get(self, key, prototype, byte_range=None):
+            read.append(key)
+            return await super().get(key, prototype, byte_range)
+
+    counted = zarr.open_array(Counting(store), path="es", mode="r")
+    low, high = minmax_range(counted, 1500, 98_700)
+    np.testing.assert_array_equal(low, data[1500:98_700].min(axis=0))
+    np.testing.assert_array_equal(high, data[1500:98_700].max(axis=0))
+    # Only the partial first and last chunk of each channel are read from the data
+    assert len([k for k in read if k.startswith("es/c/")]) == 2 * 3
+
+
+def test_minmax_range_one_dimensional_and_errors():
+    times = _sorted_times(10_000)
+    array = _zarr(times, (1000,))
+    write_block_statistics(array, levels=[[1000], [5000]])
+    assert minmax_range(array, 10, 9_990) == (times[10], times[9_989])
+    with pytest.raises(ValueError, match="start < stop"):
+        minmax_range(array, 5, 5)
+    wide = _zarr(np.zeros((100, 8)), (10, 4))
+    write_block_statistics(wide, block_shape=[10, 4])
+    with pytest.raises(ValueError, match="whole size"):
+        minmax_range(wide, 0, 50)
+
+
+def test_readers_skip_coarse_levels_when_a_finer_one_is_small():
+    data = np.random.default_rng(13).integers(-1000, 1000, (100_000, 3)).astype("int16")
+    times = np.sort(np.random.default_rng(14).uniform(0, 1000, 100_000))
+    store = zarr.storage.MemoryStore()
+    root = zarr.open_group(store, mode="w", zarr_format=3)
+    es = root.create_array("es", shape=data.shape, dtype=data.dtype, chunks=(1000, 1))
+    es[...] = data
+    ts = root.create_array("ts", shape=times.shape, dtype=times.dtype, chunks=(1000,))
+    ts[...] = times
+    write_block_statistics(es, levels=[[1000, 1], [10_000, 1]])
+    write_block_statistics(ts, levels=[[1000], [10_000]], sorted="ascending")
+    read = []
+
+    class Counting(zarr.storage.WrapperStore):
+        async def get(self, key, prototype, byte_range=None):
+            read.append(key)
+            return await super().get(key, prototype, byte_range)
+
+    counted = zarr.open_group(Counting(store), mode="r")
+    for max_bytes, coarse_read in [(2**20, False), (0, True)]:
+        read.clear()
+        low, _ = minmax_range(counted["es"], 1500, 98_700, max_bytes=max_bytes)
+        np.testing.assert_array_equal(low, data[1500:98_700].min(axis=0))
+        assert any("minmax/10000x1/" in k for k in read) == coarse_read
+        read.clear()
+        assert searchsorted(counted["ts"], 500.0, max_bytes=max_bytes) == np.searchsorted(times, 500.0)
+        assert any("minmax/10000/" in k for k in read) == coarse_read
