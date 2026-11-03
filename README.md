@@ -438,7 +438,8 @@ window = find_range(root[path], 1200.0, 1202.0)  # slice of the samples in [1200
 - `block_shape` is in elements. Along each dimension it must divide the chunk size, be a multiple of it, or cover the whole dimension. A size of 1 keeps a dimension, so `[30000, 1]` on `(time, channel)` data gives a value per channel per 30,000 samples. `granularity=N` means N chunks per block.
 - A list of option sets for one array adds several levels, one array per block shape.
 - `write_block_statistics` does the same for an array in a writable Zarr store, and `load_block_statistics` returns an array's statistics.
-- `find_range` bisects only arrays marked `sorted: "ascending"`. Without statistics it reads the whole array.
+- `searchsorted(array, values, side)` gives what `np.searchsorted` gives. `values` may be a scalar or an array in any order; each block they fall in is read once. `find_range(array, low, high)` is the slice between two of them.
+- Both bisect only arrays marked `sorted: "ascending"`. Without statistics they read the whole array.
 
 On the Allen Visual Coding LFP timestamps above (12.1 million values, 97 MB in 1,024 chunks), finding a 2 s window took 0.13 s, 3 requests and 0.14 MB, against 7.4 s, 1,024 requests and 63 MB to read the whole array. The statistics are 16 KB and took 7 s to compute. `scripts/block_statistics_benchmark.py` measures this for any file and also compares the 1 s index temporaldata uses.
 

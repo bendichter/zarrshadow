@@ -13,6 +13,7 @@ from shadowzarr.block_statistics import (
     add_block_statistics,
     compute_minmax,
     find_range,
+    searchsorted,
     load_block_statistics,
     resolve_block_shape,
     write_block_statistics,
@@ -130,6 +131,54 @@ def test_find_range_matches_searchsorted(block):
         expected = slice(int(np.searchsorted(times, low, "left")), int(np.searchsorted(times, high, "right")))
         found = find_range(array, low, high)
         assert (found.start, found.stop) == (expected.start, max(expected.start, expected.stop)), (low, high)
+
+
+@pytest.mark.parametrize("block", [1000, 5000, 50_000])
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_searchsorted_matches_numpy(block, side):
+    times = _sorted_times()
+    array = _zarr(times, (5000,))
+    write_block_statistics(array, block_shape=[block], sorted="ascending")
+    rng = np.random.default_rng(5)
+    values = np.concatenate([
+        rng.uniform(times[0] - 1, times[-1] + 1, 300),
+        times[[0, 999, 1000, 1005, 1009, 1010, 4999, 5000, len(times) - 1]],  # values in the array, repeats, block edges
+        [-np.inf, np.inf],
+    ])
+    np.testing.assert_array_equal(searchsorted(array, values, side), np.searchsorted(times, values, side))
+    np.testing.assert_array_equal(
+        searchsorted(array, values[:310].reshape(-1, 31), side), np.searchsorted(times, values[:310].reshape(-1, 31), side)
+    )
+    for value in values[:20]:
+        found = searchsorted(array, value, side)
+        assert isinstance(found, int) and found == np.searchsorted(times, value, side)
+
+
+def test_searchsorted_reads_each_block_once():
+    times = _sorted_times()
+    store = zarr.storage.MemoryStore()
+    root = zarr.open_group(store, mode="w", zarr_format=3)
+    array = root.create_array("t", shape=times.shape, dtype=times.dtype, chunks=(1000,))
+    array[...] = times
+    write_block_statistics(array, sorted="ascending")
+    read = []
+
+    class Counting(zarr.storage.WrapperStore):
+        async def get(self, key, prototype, byte_range=None):
+            read.append(key)
+            return await super().get(key, prototype, byte_range)
+
+    counted = zarr.open_array(Counting(store), path="t", mode="r")
+    values = np.sort(np.random.default_rng(6).uniform(times[0], times[-1], 2000))
+    np.testing.assert_array_equal(searchsorted(counted, values), np.searchsorted(times, values))
+    data_chunks = [k for k in read if k.startswith("t/c/")]
+    assert len(data_chunks) == len(set(data_chunks)) <= 50
+
+
+def test_searchsorted_rejects_a_bad_side():
+    array = _zarr(np.arange(10.0), (5,))
+    with pytest.raises(ValueError, match="side"):
+        searchsorted(array, 3.0, "middle")
 
 
 def test_find_range_reads_only_the_statistics_and_two_blocks():

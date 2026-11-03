@@ -437,6 +437,46 @@ def load_block_statistics(array: zarr.Array, name: str = "minmax", block_shape: 
     return [int(b) for b in entry["block_shape"]], np.asarray(parent[entry["path"]][...])
 
 
+def searchsorted(array: zarr.Array, values: Any, side: str = "left") -> int | np.ndarray:
+    """Where values would go in a sorted one-dimensional array, as np.searchsorted gives.
+
+    With the array's minmax statistics, it reads only those and the blocks
+    the values fall in: each block once, and runs of neighbouring blocks in
+    one read. An array without them, or not marked sorted, is read whole.
+    A scalar gives an int, an array of values an int64 array of their shape.
+    """
+    if side not in ("left", "right"):
+        raise ValueError(f"side must be 'left' or 'right', not {side!r}")
+    if len(array.shape) != 1:
+        raise ValueError("searchsorted needs a one-dimensional array")
+    scalar = np.ndim(values) == 0
+    values = np.asarray(values)
+    attribute = array.attrs.get(STATISTICS_ATTRIBUTE) or {}
+    loaded = load_block_statistics(array, "minmax") if attribute.get("sorted") == "ascending" else None
+    if loaded is None:
+        result = np.searchsorted(np.asarray(array[...]), values, side).astype(np.int64)
+        return int(result) if scalar else result
+    (block,), minmax = loaded
+    n = int(array.shape[0])
+    flat = values.ravel()
+    # Every block before b is entirely before the value's position, which is in block b
+    blocks = np.searchsorted(minmax[:, 1], flat, side)
+    result = np.full(flat.shape, n, dtype=np.int64)
+    needed = np.unique(blocks[blocks < len(minmax)])
+    # Read runs of neighbouring blocks together
+    runs = np.split(needed, np.flatnonzero(np.diff(needed) != 1) + 1) if len(needed) else []
+    for run in runs:
+        start, stop = int(run[0]) * block, min((int(run[-1]) + 1) * block, n)
+        data = np.asarray(array[start:stop])
+        for b in run:
+            which = blocks == b
+            lo = int(b) * block - start
+            part = data[lo:lo + block]
+            result[which] = int(b) * block + np.searchsorted(part, flat[which], side)
+    result = result.reshape(values.shape)
+    return int(result) if scalar else result
+
+
 def find_range(
     array: zarr.Array,
     low: Any,
@@ -444,31 +484,10 @@ def find_range(
 ) -> slice:
     """The slice of a sorted one-dimensional array holding the values from low to high.
 
-    Equal to slice(np.searchsorted(a, low, "left"), np.searchsorted(a, high,
-    "right")), but with the array's minmax statistics it reads only those
-    and the one or two blocks where the range starts and ends. An array
-    without them, or not marked sorted, is read whole.
+    Equal to slice(searchsorted(a, low, "left"), searchsorted(a, high,
+    "right")): with the array's minmax statistics it reads only those and
+    the one or two blocks where the range starts and ends.
     """
-    if len(array.shape) != 1:
-        raise ValueError("find_range needs a one-dimensional array")
-    attribute = array.attrs.get(STATISTICS_ATTRIBUTE) or {}
-    loaded = load_block_statistics(array, "minmax") if attribute.get("sorted") == "ascending" else None
-    if loaded is None:
-        data = np.asarray(array[...])
-        return slice(int(np.searchsorted(data, low, "left")), int(np.searchsorted(data, high, "right")))
-    (block,), minmax = loaded
-    maxima = minmax[:, 1]
-    n = int(array.shape[0])
-
-    def position(value: Any, side: str) -> int:
-        # Every block before b is entirely before value; the position is in block b
-        b = int(np.searchsorted(maxima, value, "left" if side == "left" else "right"))
-        if b >= len(maxima):
-            return n
-        start = b * block
-        data = np.asarray(array[start:min(start + block, n)])
-        return start + int(np.searchsorted(data, value, side))
-
-    start = position(low, "left")
-    stop = position(high, "right")
+    start = searchsorted(array, low, "left")
+    stop = searchsorted(array, high, "right")
     return slice(start, max(start, stop))
