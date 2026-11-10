@@ -448,7 +448,13 @@ On the Allen Visual Coding LFP timestamps above (12.1 million values, 97 MB in 1
 
 hdmf-zarr reads every group, so `NWBZarrIO` warns once for each array under `.stats`; the file otherwise reads as before.
 
-Only `minmax` is defined so far.
+Three statistic types are defined, given in the `"statistics"` option (default `["minmax"]`):
+
+- `minmax`: each block's minimum and maximum.
+- `missing_count`: how many values in each block are missing: NaN for floats by default, or the values given in `"missing"`, such as a sentinel.
+- `moments`: each block's count of valid values with `sum` and `sum_sq` (int64, exact, for integers of up to 16 bits) or `mean` and `M2` (float64). `moments_range(array, start, stop)` gives the count, mean and variance over a range, per channel, the same way `minmax_range` gives the minimum and maximum.
+
+All the statistics of a block shape are computed in one pass over the data.
 
 ## Materializing
 

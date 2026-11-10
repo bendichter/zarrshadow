@@ -1,7 +1,7 @@
 # Block statistics (draft)
 
-Status: draft, implemented in `shadowzarr.block_statistics`. Only the `minmax`
-statistic is defined so far. Feedback welcome on
+Status: draft, implemented in `shadowzarr.block_statistics`. The `minmax`,
+`missing_count` and `moments` statistics are defined so far. Feedback welcome on
 [zarr-specs#319](https://github.com/zarr-developers/zarr-specs/issues/319).
 
 ## Purpose
@@ -108,18 +108,36 @@ the data type of the array it describes, so integer values are exact. NaN is
 ignored, and a block holding only NaN has NaN for both values. Chunks that
 aren't stored count as their fill value.
 
+### `missing_count`
+
+An int64 array of the block grid's shape, holding the number of missing values
+in each block. The entry's `missing` lists the values that count as missing,
+with NaN written as the string `"NaN"`. For floating-point arrays the default
+is `["NaN"]`; for other arrays nothing is missing unless values are named, such
+as a sentinel like `-32768`, or the array's fill value when it marks data that
+was never written. A fill value is not missing by default, since for many
+arrays, such as int16 recordings with a fill value of 0, it is also an
+ordinary value.
+
+### `moments`
+
+The block grid's shape plus a last dimension of 3, leaving out missing values
+as `missing_count` does (the entry records `missing` the same way):
+
+- For integer arrays of up to 16 bits: int64 `count`, `sum` and `sum_sq` (the
+  sum of squares), which are exact.
+- For other arrays: float64 `count`, `mean` and `M2`, the sum of squared
+  deviations from the block's mean. Blocks merge exactly: for two blocks,
+  `n = n_a + n_b`, `mean = (n_a mean_a + n_b mean_b) / n` and
+  `M2 = M2_a + M2_b + n_a n_b (mean_b - mean_a)^2 / n`. A block with no valid
+  values has a count of 0 and NaN for the others.
+
+The type holds its own count so that a mean or variance needs only this type.
+The variance of a block or a range is `M2 / (count - ddof)`, or
+`(sum_sq - sum^2 / count) / (count - ddof)` for the exact form.
+
 ## Planned
 
-Each type holds everything one kind of query needs at one block shape, so a
-reader never combines two types:
-
-- `nan_count`: the number of NaN values in each block.
-- `moments`: a last dimension of 2 holding `sum` and `sum_sq` as int64 for
-  integer data, which is exact, or `mean` and `M2` (the sum of squared
-  deviations from the block mean) as float64 for floating-point data, which
-  merge exactly between blocks without the precision lost in
-  `sum_sq - sum**2 / n`.
-- `set` and `bloom_filter` for categorical data.
-
-A shorthand for several levels, such as a base block shape with a factor and
-a count, may follow if people need it.
+`set` and `bloom_filter` for categorical data, and a shorthand for several
+levels, such as a base block shape with a factor and a count, may follow if
+people need them.

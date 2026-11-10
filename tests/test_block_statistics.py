@@ -14,7 +14,12 @@ from shadowzarr.block_statistics import (
     compute_minmax,
     compute_block_statistics_levels,
     find_range,
+    compute_missing_count,
+    compute_moments,
     minmax_range,
+    moments_range,
+    rollup_missing_count,
+    rollup_moments,
     rollup_minmax,
     searchsorted,
     load_block_statistics,
@@ -552,3 +557,158 @@ def test_readers_skip_coarse_levels_when_a_finer_one_is_small():
         read.clear()
         assert searchsorted(counted["ts"], 500.0, max_bytes=max_bytes) == np.searchsorted(times, 500.0)
         assert any("minmax/10000/" in k for k in read) == coarse_read
+
+
+# -- missing_count and moments --
+
+
+def _blocks(data, block_shape):
+    grid = [-(-s // b) for s, b in zip(data.shape, block_shape)]
+    for coords in np.ndindex(*grid):
+        yield coords, data[tuple(slice(i * b, (i + 1) * b) for i, b in zip(coords, block_shape))]
+
+
+def _expected_moments(data, block_shape, missing):
+    grid = [-(-s // b) for s, b in zip(data.shape, block_shape)]
+    out = np.empty(grid + [3])
+    for coords, block in _blocks(data, block_shape):
+        keep = np.ones(block.shape, bool)
+        for m in missing:
+            keep &= ~np.isnan(block) if isinstance(m, float) and np.isnan(m) else block != m
+        values = block[keep].astype(np.float64)
+        out[coords] = (len(values), values.mean() if len(values) else np.nan,
+                       ((values - values.mean()) ** 2).sum() if len(values) else np.nan)
+    return out
+
+
+@pytest.mark.parametrize("block_shape", [[100, 4], [50, 1], [300, 8], [1050, 1], [1, 8]])
+def test_missing_count_and_moments_of_floats(block_shape):
+    rng = np.random.default_rng(15)
+    data = (1e6 + rng.normal(size=(1050, 8))).astype("float64")  # a large offset tests precision
+    data[rng.random(data.shape) < 0.05] = np.nan
+    data[0:50, 0] = np.nan
+    array = _zarr(data, (100, 4))
+    count = compute_missing_count(array, block_shape)
+    for coords, block in _blocks(data, block_shape):
+        assert count[coords] == np.isnan(block).sum()
+    moments = compute_moments(array, block_shape, read_bytes=2000)
+    np.testing.assert_allclose(moments, _expected_moments(data, block_shape, [float("nan")]), rtol=1e-9, atol=1e-6)
+
+
+def test_moments_of_int16_are_exact():
+    data = np.random.default_rng(16).integers(-32768, 32768, (2000, 3)).astype("int16")
+    data[::7, 1] = -32768
+    array = _zarr(data, (500, 1))
+    moments = compute_moments(array, [500, 1], missing=[-32768])
+    assert moments.dtype == np.int64
+    for coords, block in _blocks(data, [500, 1]):
+        values = block[block != -32768].astype(np.int64)
+        assert list(moments[coords]) == [len(values), values.sum(), (values * values).sum()]
+    count = compute_missing_count(array, [500, 1], missing=[-32768])
+    assert count[:, 1].sum() == (data[:, 1] == -32768).sum() and count[:, 0].sum() == (data[:, 0] == -32768).sum()
+
+
+@pytest.mark.parametrize("fine, coarse", [([100, 1], [300, 1]), ([100, 1], [1050, 1]), ([50, 2], [200, 8])])
+def test_rollups_of_missing_count_and_moments(fine, coarse):
+    rng = np.random.default_rng(17)
+    data = rng.normal(5.0, 2.0, (1050, 8))
+    data[rng.random(data.shape) < 0.1] = np.nan
+    array = _zarr(data, (100, 4))
+    np.testing.assert_array_equal(
+        rollup_missing_count(compute_missing_count(array, fine), fine, coarse, data.shape),
+        compute_missing_count(array, coarse),
+    )
+    np.testing.assert_allclose(
+        rollup_moments(compute_moments(array, fine), fine, coarse, data.shape), compute_moments(array, coarse),
+        rtol=1e-10,
+    )
+    ints = rng.integers(-1000, 1000, (1050, 8)).astype("int16")
+    iarray = _zarr(ints, (100, 4))
+    np.testing.assert_array_equal(
+        rollup_moments(compute_moments(iarray, fine), fine, coarse, ints.shape), compute_moments(iarray, coarse)
+    )
+
+
+@pytest.mark.parametrize("dtype", ["float32", "int16"])
+@pytest.mark.parametrize("levels", [None, [[100, 1]], [[100, 1], [500, 1], [2000, 1]]])
+def test_moments_range_matches_numpy(dtype, levels):
+    rng = np.random.default_rng(18)
+    data = (rng.normal(100, 30, (5050, 4))).astype(dtype)
+    missing = None
+    if dtype == "float32":
+        data[700:760, 2] = np.nan
+    else:
+        data[::11, 3] = -32768
+        missing = [-32768]
+    array = _zarr(data, (100, 4))
+    if levels:
+        write_block_statistics(array, ["moments"], levels=levels, missing=missing)
+    ranges = [(0, 5050), (0, 1), (99, 101), (100, 2000), (700, 760)]
+    ranges += [tuple(sorted(rng.integers(0, 5051, 2))) for _ in range(20)]
+    for start, stop in ranges:
+        if start == stop:
+            continue
+        result = moments_range(array, start, stop, ddof=1, missing=missing)
+        part = data[start:stop].astype(np.float64)
+        if dtype == "int16":
+            part[data[start:stop] == -32768] = np.nan
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            np.testing.assert_array_equal(result["count"], (~np.isnan(part)).sum(axis=0))
+            np.testing.assert_allclose(result["mean"], np.nanmean(part, axis=0), rtol=1e-9, err_msg=f"{start}:{stop}")
+            np.testing.assert_allclose(result["variance"], np.nanvar(part, axis=0, ddof=1), rtol=1e-7,
+                                       err_msg=f"{start}:{stop}")
+
+
+def test_moments_range_one_dimensional():
+    times = _sorted_times(10_000)
+    array = _zarr(times, (1000,))
+    write_block_statistics(array, ["moments", "missing_count"], levels=[[1000], [5000]])
+    result = moments_range(array, 10, 9_990)
+    assert result["count"] == 9_980
+    assert np.isclose(result["mean"], times[10:9_990].mean())
+    assert np.isclose(result["variance"], times[10:9_990].var())
+    entries = array.attrs["block_statistics"]["statistics"]
+    assert {e["type"] for e in entries} == {"moments", "missing_count"}
+    assert all(e["missing"] == ["NaN"] for e in entries)
+
+
+def test_all_statistics_in_one_pass_over_the_data():
+    data = np.random.default_rng(19).normal(size=(20_000, 2))
+    store = zarr.storage.MemoryStore()
+    root = zarr.open_group(store, mode="w", zarr_format=3)
+    array = root.create_array("a", shape=data.shape, dtype=data.dtype, chunks=(1000, 1))
+    array[...] = data
+    read = []
+
+    class Counting(zarr.storage.WrapperStore):
+        async def get(self, key, prototype, byte_range=None):
+            read.append(key)
+            return await super().get(key, prototype, byte_range)
+
+    counted = zarr.open_array(Counting(store), path="a", mode="r")
+    levels = compute_block_statistics_levels(counted, ["minmax", "missing_count", "moments"], [[1000, 1], [5000, 1]])
+    chunks = [k for k in read if k.startswith("a/c/")]
+    assert len(chunks) == len(set(chunks)) == 40
+    np.testing.assert_array_equal(levels[1][1]["minmax"], _expected_minmax(data, [5000, 1]))
+
+
+def test_moments_through_references(h5_times, tmp_path):
+    path, times = h5_times
+    rfs = add_block_statistics(generate_rfs(path), {
+        "signal": [{"statistics": ["moments", "missing_count"], "block_shape": [500, 1], "missing": [-32768]},
+                   {"statistics": ["moments", "missing_count"], "block_shape": [3000, 1], "missing": [-32768]}],
+    })
+    out = str(tmp_path / "refs.json")
+    write_rfs(rfs, out)
+    group = open_rfs(load_rfs(out))
+    signal = group["signal"][...]
+    result = moments_range(group["signal"], 100, 11_000)
+    np.testing.assert_array_equal(result["count"], np.full(4, 10_900))
+    np.testing.assert_allclose(result["mean"], signal[100:11_000].mean(axis=0))
+    np.testing.assert_allclose(result["variance"], signal[100:11_000].var(axis=0))
+    entries = group["signal"].attrs["block_statistics"]["statistics"]
+    assert {(e["type"], tuple(e["block_shape"])) for e in entries} == {
+        ("moments", (500, 1)), ("missing_count", (500, 1)), ("moments", (3000, 1)), ("missing_count", (3000, 1))
+    }
+    assert all(e["missing"] == [-32768] for e in entries)
