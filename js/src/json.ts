@@ -6,7 +6,7 @@
  *
  * Reference files now store such attributes following the Non-Finite
  * Attributes Zarr convention
- * (https://github.com/catalystneuro/zarr-non-finite-attributes): the number is
+ * (https://github.com/hdmf-dev/zarr-non-finite-attributes): the number is
  * written as the string "NaN", "Infinity", or "-Infinity", a string with the
  * same characters is written with the prefix "_str_", and the group or array
  * registers the convention in its "zarr_conventions" attribute. The store
@@ -46,8 +46,8 @@ export const NON_FINITE_ATTRIBUTES_UUID = "2adc9aac-d676-4e93-8feb-903b6ae9e08a"
 const CONVENTIONS = "zarr_conventions";
 const CONVENTION = {
   uuid: NON_FINITE_ATTRIBUTES_UUID,
-  schema_url: "https://raw.githubusercontent.com/catalystneuro/zarr-non-finite-attributes/refs/tags/v1/schema.json",
-  spec_url: "https://github.com/catalystneuro/zarr-non-finite-attributes/blob/v1/README.md",
+  schema_url: "https://raw.githubusercontent.com/hdmf-dev/zarr-non-finite-attributes/refs/tags/v1/schema.json",
+  spec_url: "https://github.com/hdmf-dev/zarr-non-finite-attributes/blob/v1/README.md",
   name: "non-finite-attributes",
   description: "Non-finite numbers in attributes are written as strings",
 };
@@ -99,7 +99,7 @@ function decodeNonFiniteAttributes(attributes: Json): Json {
 
 /**
  * Bytes in attributes are stored following the Bytes Attributes Zarr
- * convention (https://github.com/catalystneuro/zarr-bytes-attributes): bytes
+ * convention (https://github.com/hdmf-dev/zarr-bytes-attributes): bytes
  * are written as "base64:" followed by the bytes in base64, a string that
  * begins with "base64:" after any "_str_" prefixes is written with one more
  * "_str_", and the group or array registers the convention. It uses the same

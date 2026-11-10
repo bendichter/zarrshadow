@@ -6,7 +6,7 @@ so a group or array with one such attribute cannot be opened by most Zarr
 implementations outside Python.
 
 Reference file systems store these attributes following the Non-Finite
-Attributes Zarr convention (https://github.com/catalystneuro/zarr-non-finite-attributes):
+Attributes Zarr convention (https://github.com/hdmf-dev/zarr-non-finite-attributes):
 
 - A number that is not finite is written as the string "NaN", "Infinity", or
   "-Infinity", the forms Zarr v3 defines for fill values.
@@ -34,8 +34,8 @@ CONVENTIONS_ATTR = "zarr_conventions"
 UUID = "2adc9aac-d676-4e93-8feb-903b6ae9e08a"
 CONVENTION = {
     "uuid": UUID,
-    "schema_url": "https://raw.githubusercontent.com/catalystneuro/zarr-non-finite-attributes/refs/tags/v1/schema.json",
-    "spec_url": "https://github.com/catalystneuro/zarr-non-finite-attributes/blob/v1/README.md",
+    "schema_url": "https://raw.githubusercontent.com/hdmf-dev/zarr-non-finite-attributes/refs/tags/v1/schema.json",
+    "spec_url": "https://github.com/hdmf-dev/zarr-non-finite-attributes/blob/v1/README.md",
     "name": "non-finite-attributes",
     "description": "Non-finite numbers in attributes are written as strings",
 }
