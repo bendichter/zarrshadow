@@ -5,7 +5,7 @@ that is not valid UTF-8, such as text in another encoding, or opaque binary
 data such as a digest, and these could not be written to zarr.json.
 
 Reference file systems store these attributes following the Bytes Attributes
-Zarr convention (https://github.com/catalystneuro/zarr-bytes-attributes):
+Zarr convention (https://github.com/hdmf-dev/zarr-bytes-attributes):
 
 - Bytes are written as the string "base64:" followed by the bytes in standard
   base64 with padding.
@@ -34,8 +34,8 @@ CONVENTIONS_ATTR = "zarr_conventions"
 UUID = "2de6770a-9c00-4432-9e84-dd9e1dfed441"
 CONVENTION = {
     "uuid": UUID,
-    "schema_url": "https://raw.githubusercontent.com/catalystneuro/zarr-bytes-attributes/refs/tags/v1/schema.json",
-    "spec_url": "https://github.com/catalystneuro/zarr-bytes-attributes/blob/v1/README.md",
+    "schema_url": "https://raw.githubusercontent.com/hdmf-dev/zarr-bytes-attributes/refs/tags/v1/schema.json",
+    "spec_url": "https://github.com/hdmf-dev/zarr-bytes-attributes/blob/v1/README.md",
     "name": "bytes-attributes",
     "description": "Bytes in attributes are written as base64 strings",
 }

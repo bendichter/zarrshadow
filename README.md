@@ -532,13 +532,13 @@ The generated JSON follows the [unified Zarr v3 convention](https://github.com/h
 | Spec location | Root `.specloc` attribute holds the plain path `"specifications"` |
 | Cached specifications | Scalar strings. HDMF before 2.0 wrote each as an array of one string, which is stored here as a scalar so that hdmf-zarr reads it |
 | References in attrs | `{"_REFERENCE": {"source": ".", "path": "/target"}}` |
-| NaN/Inf in attrs | Written as the strings `"NaN"`, `"Infinity"`, `"-Infinity"`, following the [Non-Finite Attributes convention](https://github.com/catalystneuro/zarr-non-finite-attributes). See [Attributes That Are Not Finite Numbers](#attributes-that-are-not-finite-numbers) |
-| Bytes in attrs | Byte strings that are not valid UTF-8, and HDF5 opaque values, written as `"base64:..."` following the [Bytes Attributes convention](https://github.com/catalystneuro/zarr-bytes-attributes). See [Attributes That Are Bytes](#attributes-that-are-bytes) |
+| NaN/Inf in attrs | Written as the strings `"NaN"`, `"Infinity"`, `"-Infinity"`, following the [Non-Finite Attributes convention](https://github.com/hdmf-dev/zarr-non-finite-attributes). See [Attributes That Are Not Finite Numbers](#attributes-that-are-not-finite-numbers) |
+| Bytes in attrs | Byte strings that are not valid UTF-8, and HDF5 opaque values, written as `"base64:..."` following the [Bytes Attributes convention](https://github.com/hdmf-dev/zarr-bytes-attributes). See [Attributes That Are Bytes](#attributes-that-are-bytes) |
 | Strings | `data_type: "string"` with `vlen-utf8` codec |
 
 ## Attributes That Are Not Finite Numbers
 
-JSON has no representation for `NaN`, `Infinity`, or `-Infinity`. Python writes them as bare tokens, which zarr-python reads and most other Zarr implementations refuse, so that a group or array with one such attribute cannot be opened by zarrita.js or stored in Icechunk. Reference file systems store these attributes following the [Non-Finite Attributes Zarr convention](https://github.com/catalystneuro/zarr-non-finite-attributes):
+JSON has no representation for `NaN`, `Infinity`, or `-Infinity`. Python writes them as bare tokens, which zarr-python reads and most other Zarr implementations refuse, so that a group or array with one such attribute cannot be opened by zarrita.js or stored in Icechunk. Reference file systems store these attributes following the [Non-Finite Attributes Zarr convention](https://github.com/hdmf-dev/zarr-non-finite-attributes):
 
 - A number that is not finite is written as the string `"NaN"`, `"Infinity"`, or `"-Infinity"`, the forms Zarr v3 defines for fill values.
 - A string with the same characters is written with the prefix `_str_`, so that a float stays distinct from a string holding the same text.
@@ -557,7 +557,7 @@ hdmf-zarr decodes them itself from the version that implements the convention (h
 
 ## Attributes That Are Bytes
 
-JSON has no representation for bytes. An HDF5 attribute that holds text is written as a string, as before. A byte string that is not valid UTF-8, such as text in another encoding, and HDF5 opaque data, such as a digest, used to be dropped. They are now stored following the [Bytes Attributes Zarr convention](https://github.com/catalystneuro/zarr-bytes-attributes), a companion to Non-Finite Attributes:
+JSON has no representation for bytes. An HDF5 attribute that holds text is written as a string, as before. A byte string that is not valid UTF-8, such as text in another encoding, and HDF5 opaque data, such as a digest, used to be dropped. They are now stored following the [Bytes Attributes Zarr convention](https://github.com/hdmf-dev/zarr-bytes-attributes), a companion to Non-Finite Attributes:
 
 - Bytes are written as the string `"base64:"` followed by the bytes in base64.
 - A string that begins with `base64:` is written with the prefix `_str_`, so that it stays distinct from bytes.

@@ -36,7 +36,7 @@ The size limit comes from a measurement: one second of an LFP recording on DANDI
 | 4 MiB | 2 | 1.51 s | 1.30 s |
 | 50 MiB | 1 | 2.29 s | 2.22 s |
 
-JSON has no representation for `NaN`, `Infinity`, or `-Infinity`, and NWB files have such attributes (`resolution` of a TimeSeries, for one). Reference files store them following the [Non-Finite Attributes Zarr convention](https://github.com/catalystneuro/zarr-non-finite-attributes): the number is written as the string `"NaN"`, `"Infinity"`, or `"-Infinity"`, a string with the same characters is written with the prefix `_str_`, and the group or array registers the convention in its `zarr_conventions` attribute. zarrita returns the attributes as they are stored, and `decodeAttributes` turns them back into numbers and strings:
+JSON has no representation for `NaN`, `Infinity`, or `-Infinity`, and NWB files have such attributes (`resolution` of a TimeSeries, for one). Reference files store them following the [Non-Finite Attributes Zarr convention](https://github.com/hdmf-dev/zarr-non-finite-attributes): the number is written as the string `"NaN"`, `"Infinity"`, or `"-Infinity"`, a string with the same characters is written with the prefix `_str_`, and the group or array registers the convention in its `zarr_conventions` attribute. zarrita returns the attributes as they are stored, and `decodeAttributes` turns them back into numbers and strings:
 
 ```ts
 import { decodeAttributes } from "shadowzarr";
@@ -44,7 +44,7 @@ import { decodeAttributes } from "shadowzarr";
 const attributes = decodeAttributes(array.attrs); // { resolution: NaN, ... }
 ```
 
-Bytes that are not valid UTF-8, and HDF5 opaque values, are stored following the [Bytes Attributes Zarr convention](https://github.com/catalystneuro/zarr-bytes-attributes) as `"base64:..."` strings, with the same `_str_` escape. `decodeAttributes` decodes both conventions and returns bytes as a `Uint8Array`.
+Bytes that are not valid UTF-8, and HDF5 opaque values, are stored following the [Bytes Attributes Zarr convention](https://github.com/hdmf-dev/zarr-bytes-attributes) as `"base64:..."` strings, with the same `_str_` escape. `decodeAttributes` decodes both conventions and returns bytes as a `Uint8Array`.
 
 Reference files written before this hold the bare words `NaN` and `Infinity`, which `JSON.parse` refuses. The store gives zarrita their metadata in the form above, so both read the same way. `parseJson` reads the bare words into numbers.
 
